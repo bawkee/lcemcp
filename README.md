@@ -14,6 +14,7 @@ The project is early. Right now the working slice is a Yahoo IMAP probe with loc
 
 ```powershell
 dotnet run --project src/LceMcp -- setup-yahoo --email you@yahoo.com --name Yahoo
+dotnet run --project src/LceMcp -- status
 dotnet run --project src/LceMcp -- accounts
 dotnet run --project src/LceMcp -- credential-test --account yahoo
 dotnet run --project src/LceMcp -- imap-test --account yahoo --limit 5

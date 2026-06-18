@@ -4,10 +4,20 @@ internal sealed class AppPaths
 {
     public string ConfigDirectory { get; }
     public string ConfigPath => Path.Combine(ConfigDirectory, "config.toml");
+    public string DatabasePath => Path.Combine(ConfigDirectory, "email.db");
+    public string AttachmentsDirectory => Path.Combine(ConfigDirectory, "attachments");
+    public string LogsDirectory => Path.Combine(ConfigDirectory, "logs");
 
     private AppPaths(string configDirectory)
     {
         ConfigDirectory = configDirectory;
+    }
+
+    public void EnsureDataDirectories()
+    {
+        Directory.CreateDirectory(ConfigDirectory);
+        Directory.CreateDirectory(AttachmentsDirectory);
+        Directory.CreateDirectory(LogsDirectory);
     }
 
     public static AppPaths FromEnvironment()

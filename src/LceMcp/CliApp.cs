@@ -16,10 +16,12 @@ internal static class CliApp
         var paths = AppPaths.FromEnvironment();
         var configStore = new ConfigStore(paths);
         var credentialStore = new WindowsCredentialStore();
+        var database = new EmailDatabase(paths);
 
         return command switch
         {
             "setup-yahoo" => await SetupYahooAsync(configStore, credentialStore, options, cancellationToken),
+            "status" => Status(configStore, database),
             "accounts" => ListAccounts(configStore, credentialStore),
             "credential-test" => CredentialTest(configStore, credentialStore, options),
             "credential-delete" => CredentialDelete(configStore, credentialStore, options),
@@ -91,6 +93,41 @@ internal static class CliApp
         return 0;
     }
 
+    private static int Status(ConfigStore configStore, EmailDatabase database)
+    {
+        var configExists = File.Exists(configStore.ConfigPath);
+        var config = configStore.Load();
+        var databaseStatus = database.GetStatus();
+
+        Console.WriteLine($"Config: {configStore.ConfigPath} ({(configExists ? "present" : "missing")})");
+        Console.WriteLine($"Database: {database.DatabasePath} ({FormatInitializationKind(databaseStatus.InitializationKind)})");
+        Console.WriteLine($"Configured accounts: {config.Accounts.Count}");
+
+        var configErrors = config.Accounts
+            .SelectMany(account => AccountConfigValidator.ValidateForImap(account)
+                .Select(error => $"{AccountLabel(account)}: {error}"))
+            .ToList();
+
+        if (configErrors.Count == 0)
+        {
+            Console.WriteLine("Config validation: ok");
+        }
+        else
+        {
+            Console.WriteLine($"Config validation: {configErrors.Count} issue(s)");
+            foreach (var error in configErrors)
+                Console.WriteLine($"  {error}");
+        }
+
+        Console.WriteLine($"Schema mode: {databaseStatus.SchemaMode} (migrations_locked={databaseStatus.MigrationsLocked.ToString().ToLowerInvariant()})");
+        Console.WriteLine($"Database schema version: {databaseStatus.SchemaVersion} / target {databaseStatus.TargetSchemaVersion}");
+        Console.WriteLine($"Database accounts: {databaseStatus.AccountCount}");
+        Console.WriteLine($"Database folders: {databaseStatus.FolderCount}");
+        Console.WriteLine($"Last sync state: {FormatSyncState(databaseStatus.LastSyncState)}");
+
+        return 0;
+    }
+
     private static int ListAccounts(ConfigStore configStore, WindowsCredentialStore credentialStore)
     {
         var config = configStore.Load();
@@ -106,8 +143,13 @@ internal static class CliApp
         foreach (var account in config.Accounts)
         {
             var credentialStatus = CredentialStatus(credentialStore, account.CredentialRef);
+            var validationErrors = AccountConfigValidator.ValidateForImap(account);
+            var validationStatus = validationErrors.Count == 0 ? "valid" : "invalid";
             Console.WriteLine($"{account.Id}  {account.EmailAddress}  provider={account.Provider}  enabled={account.Enabled}  credential={credentialStatus}");
-            Console.WriteLine($"  imap={account.ImapHost}:{account.ImapPort}/{account.ImapSecurity}  user={account.Username}  history_days={account.HistoryDays}");
+            Console.WriteLine($"  imap={account.ImapHost}:{account.ImapPort}/{account.ImapSecurity}  user={account.Username}  history_days={account.HistoryDays}  config={validationStatus}");
+
+            foreach (var error in validationErrors)
+                Console.WriteLine($"  config-error: {error}");
         }
 
         return 0;
@@ -154,8 +196,7 @@ internal static class CliApp
         if (!account.Enabled)
             throw new CliException($"Account '{account.Id}' is disabled.", 2);
 
-        if (string.IsNullOrWhiteSpace(account.CredentialRef))
-            throw new CliException($"Account '{account.Id}' has no credential_ref in config.", 2);
+        AccountConfigValidator.ThrowIfInvalidForImap(account);
 
         var password = credentialStore.Read(account.CredentialRef);
         if (password is null)
@@ -250,6 +291,41 @@ internal static class CliApp
         return 0;
     }
 
+    private static string AccountLabel(AccountConfig account)
+    {
+        if (!string.IsNullOrWhiteSpace(account.Id))
+            return account.Id;
+
+        if (!string.IsNullOrWhiteSpace(account.EmailAddress))
+            return account.EmailAddress;
+
+        return "(unnamed account)";
+    }
+
+    private static string FormatSyncState(SyncStateStatus syncState)
+    {
+        if (syncState is null)
+            return "none";
+
+        var success = string.IsNullOrWhiteSpace(syncState.LastSuccessAt) ? "never" : syncState.LastSuccessAt;
+        if (string.IsNullOrWhiteSpace(syncState.LastErrorAt))
+            return $"{syncState.AccountName}/{syncState.FolderPath} last_success={success}";
+
+        return $"{syncState.AccountName}/{syncState.FolderPath} last_success={success} last_error_at={syncState.LastErrorAt} last_error={syncState.LastError}";
+    }
+
+    private static string FormatInitializationKind(DatabaseInitializationKind kind)
+    {
+        return kind switch
+        {
+            DatabaseInitializationKind.Opened => "present",
+            DatabaseInitializationKind.Created => "created",
+            DatabaseInitializationKind.RecreatedPrototype => "recreated for prototype schema",
+            DatabaseInitializationKind.Migrated => "migrated",
+            _ => kind.ToString()
+        };
+    }
+
     private static void PrintHelp()
     {
         Console.WriteLine("""
@@ -257,6 +333,7 @@ internal static class CliApp
 
         Commands:
           setup-yahoo       Configure a Yahoo IMAP account and store its password in Windows Credential Manager.
+          status            Initialize local storage if needed and print config/database status.
           accounts          List configured accounts and whether their credential is present.
           credential-test   Check whether an account credential can be found.
           credential-delete Delete an account credential from Windows Credential Manager.
@@ -264,6 +341,7 @@ internal static class CliApp
 
         Examples:
           dotnet run --project src/LceMcp -- setup-yahoo --email you@yahoo.com --name Yahoo
+          dotnet run --project src/LceMcp -- status
           dotnet run --project src/LceMcp -- accounts
           dotnet run --project src/LceMcp -- credential-test --account yahoo
           dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund processed" --limit 5

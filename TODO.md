@@ -18,10 +18,17 @@ Observed real-account result:
 
 Next work:
 
-- Add validation around loaded account config so required fields fail clearly before network calls.
-- Investigate and explain the 5-requested/4-printed summary mismatch.
-- Prefer discovered folder full names when resolving folders, since Yahoo presents `Inbox`.
-- Capture folder special-use attributes in a shape that can feed the future database schema.
+Completed on 2026-06-18:
+
+- Added account config validation before IMAP network calls; `accounts` and `status` now surface validation issues without hiding other state.
+- The IMAP probe now prints `Fetched summaries: n of m requested` and lists missing requested UIDs, which should explain the prior 5-requested/4-printed Yahoo result on the next live run.
+- Folder resolution now prefers discovered folder full names/names before falling back to `client.Inbox`, so Yahoo's `Inbox` casing is respected.
+- Folder probe output now includes inferred role and selectable state, and the initial `folders` schema has columns for attributes, role, selectable state, UIDVALIDITY, message count, and recent count.
+
+Next work:
+
+- Run another live Yahoo probe and record whether the missing summary was expunged/not returned or a probe-ordering issue.
+- Persist folder special-use attributes during discovery rather than only printing them.
 
 ## 2. Add Walking Skeleton Storage
 
@@ -29,12 +36,25 @@ The spec wants SQLite as the durable local cache, but the first probe intentiona
 
 Next work:
 
-- Add `Microsoft.Data.Sqlite` and `SQLitePCLRaw.bundle_e_sqlite3`.
-- Create an app data layout under `%APPDATA%\lcemcp`.
-- Add `email.db` initialization with `schema_version`.
-- Start with `accounts`, `folders`, `sync_state`, and minimal `audit_log`.
-- Keep SQL explicit; do not add EF Core.
-- Add a `status` command that reports config presence, database path, account count, folder count, and last sync state.
+Completed on 2026-06-18:
+
+- Added `Microsoft.Data.Sqlite` and `SQLitePCLRaw.bundle_e_sqlite3`; no EF Core.
+- Extended app paths with `email.db`, `attachments`, and `logs` under the existing `%APPDATA%\lcemcp`-style config directory.
+- Added SQLite schema initialization for `schema_migrations`, `accounts`, `folders`, `sync_state`, and minimal `audit_log`.
+- Chose `schema_migrations` from `SPEC.md` as the durable schema-version ledger; `status` reports the current schema version from that table.
+- Added `status`, which initializes storage if needed and reports config presence, database path, config validation, database account/folder counts, and last sync state.
+- Added lightweight migration infrastructure, but migrations are intentionally locked during the prototype phase. While `DatabaseMigrations.MigrationsLocked = true`, `DatabaseMigrations.All` must stay empty and schema changes rebuild `email.db` when the prototype schema marker changes. When the MVP schema is stable, remove the lock deliberately, add a complete migration 1, delete/recreate the prototype DB one final time, and then preserve DBs with forward-only migrations.
+
+Test result:
+
+- `dotnet build lcemcp.slnx` succeeded on 2026-06-18.
+- `LCEMCP_CONFIG_DIR=<temp> dotnet run --project src\LceMcp -- status` succeeded, created `email.db`, reported schema version 1, 0 database accounts, 0 folders, and no sync state.
+- Prototype migration-lock smoke test succeeded on 2026-06-18: fresh temp DB reported `created`, a second status reported `present`, and a deliberately invalid `email.db` was deleted/recreated with status `recreated for prototype schema`.
+
+Next work:
+
+- Add an integration test for SQLite schema initialization once the first test project exists.
+- Continue with persisted account and folder discovery.
 
 ## 3. Persist Account And Folder Discovery
 
