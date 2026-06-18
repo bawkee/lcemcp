@@ -20,9 +20,11 @@ internal static class CliApp
 
         return command switch
         {
-            "setup-yahoo" => await SetupYahooAsync(configStore, credentialStore, options, cancellationToken),
+            "setup-yahoo" => await SetupYahooAsync(configStore, credentialStore, database, options, cancellationToken),
             "status" => Status(configStore, database),
             "accounts" => ListAccounts(configStore, credentialStore),
+            "discover-folders" => await DiscoverFoldersAsync(configStore, credentialStore, database, options, cancellationToken),
+            "folders" => ListFolders(database, options),
             "credential-test" => CredentialTest(configStore, credentialStore, options),
             "credential-delete" => CredentialDelete(configStore, credentialStore, options),
             "imap-test" => await ImapTestAsync(configStore, credentialStore, options, cancellationToken),
@@ -34,6 +36,7 @@ internal static class CliApp
     private static async Task<int> SetupYahooAsync(
         ConfigStore configStore,
         WindowsCredentialStore credentialStore,
+        EmailDatabase database,
         CommandOptions options,
         CancellationToken cancellationToken)
     {
@@ -85,9 +88,11 @@ internal static class CliApp
 
         config.UpsertAccount(account);
         configStore.Save(config);
+        var databaseAccountId = database.UpsertConfiguredAccount(account);
         cancellationToken.ThrowIfCancellationRequested();
 
         Console.WriteLine($"Saved account '{account.Id}' to {configStore.ConfigPath}");
+        Console.WriteLine($"Persisted account metadata as database account {databaseAccountId} in {database.DatabasePath}");
         Console.WriteLine("Next test:");
         Console.WriteLine($"  dotnet run --project src/LceMcp -- imap-test --account {account.Id} --limit 5");
         return 0;
@@ -124,6 +129,76 @@ internal static class CliApp
         Console.WriteLine($"Database accounts: {databaseStatus.AccountCount}");
         Console.WriteLine($"Database folders: {databaseStatus.FolderCount}");
         Console.WriteLine($"Last sync state: {FormatSyncState(databaseStatus.LastSyncState)}");
+
+        return 0;
+    }
+
+    private static async Task<int> DiscoverFoldersAsync(
+        ConfigStore configStore,
+        WindowsCredentialStore credentialStore,
+        EmailDatabase database,
+        CommandOptions options,
+        CancellationToken cancellationToken)
+    {
+        var account = ResolveAccount(configStore.Load(), options.Get("--account"));
+
+        if (!account.Enabled)
+            throw new CliException($"Account '{account.Id}' is disabled.", 2);
+
+        AccountConfigValidator.ThrowIfInvalidForImap(account);
+
+        var password = credentialStore.Read(account.CredentialRef);
+        if (password is null)
+            throw new CliException($"Credential not found: {account.CredentialRef}", 3);
+
+        var databaseAccountId = database.UpsertConfiguredAccount(account);
+
+        Console.WriteLine($"Discovering folders for '{account.Id}' via {account.ImapHost}:{account.ImapPort}/{account.ImapSecurity}...");
+        var result = await new ImapFolderDiscovery().DiscoverAsync(account, password, cancellationToken);
+        var persistedCount = database.UpsertFolders(databaseAccountId, result.Folders);
+
+        Console.WriteLine($"Capabilities: {result.Capabilities}");
+        Console.WriteLine($"Discovered folders: {result.Folders.Count}");
+        Console.WriteLine($"Persisted folders: {persistedCount}");
+        PrintDiscoveredFolderSample(result.Folders);
+
+        var statusWarnings = result.Folders
+            .Where(folder => !string.IsNullOrWhiteSpace(folder.StatusError))
+            .ToList();
+
+        if (statusWarnings.Count > 0)
+        {
+            Console.WriteLine($"Folder status warnings: {statusWarnings.Count}");
+            foreach (var folder in statusWarnings.Take(10))
+                Console.WriteLine($"  {folder.FullName}: {folder.StatusError}");
+        }
+
+        Console.WriteLine($"Local folder cache:");
+        Console.WriteLine($"  dotnet run --project src/LceMcp -- folders --account {account.Id}");
+        return 0;
+    }
+
+    private static int ListFolders(EmailDatabase database, CommandOptions options)
+    {
+        var accountFilter = options.Get("--account");
+        var folders = database.ReadFolders(accountFilter);
+
+        Console.WriteLine($"Database: {database.DatabasePath}");
+
+        if (folders.Count == 0)
+        {
+            Console.WriteLine(string.IsNullOrWhiteSpace(accountFilter)
+                ? "No folders are stored yet. Run 'discover-folders' first."
+                : $"No folders are stored for account '{accountFilter}'. Run 'discover-folders --account {accountFilter}' first.");
+            return 0;
+        }
+
+        foreach (var folder in folders)
+        {
+            Console.WriteLine($"{folder.AccountName}  {folder.Path}  role={folder.Role}  selectable={folder.Selectable.ToString().ToLowerInvariant()}  sync={folder.SyncEnabled.ToString().ToLowerInvariant()}");
+            Console.WriteLine($"  id={folder.Id}  name={folder.Name}  delimiter={FormatOptional(folder.Delimiter)}  uidvalidity={FormatOptional(folder.UidValidity)}  messages={FormatOptional(folder.MessageCount)}  recent={FormatOptional(folder.RecentCount)}");
+            Console.WriteLine($"  attrs={FormatOptional(folder.Attributes)}  discovered={FormatOptional(folder.LastDiscoveredAt)}");
+        }
 
         return 0;
     }
@@ -302,6 +377,27 @@ internal static class CliApp
         return "(unnamed account)";
     }
 
+    private static void PrintDiscoveredFolderSample(IReadOnlyCollection<ImapFolderInfo> folders)
+    {
+        foreach (var folder in folders.Take(25))
+        {
+            Console.WriteLine($"  {folder.FullName}  role={folder.Role}  selectable={folder.Selectable.ToString().ToLowerInvariant()}  messages={FormatOptional(folder.MessageCount)}  recent={FormatOptional(folder.RecentCount)}  uidvalidity={FormatOptional(folder.UidValidity)}  attrs={folder.Attributes}");
+        }
+
+        if (folders.Count > 25)
+            Console.WriteLine($"  ... {folders.Count - 25} more");
+    }
+
+    private static string FormatOptional(object value)
+    {
+        return value switch
+        {
+            null => "-",
+            string text when string.IsNullOrWhiteSpace(text) => "-",
+            _ => value.ToString()
+        };
+    }
+
     private static string FormatSyncState(SyncStateStatus syncState)
     {
         if (syncState is null)
@@ -335,6 +431,8 @@ internal static class CliApp
           setup-yahoo       Configure a Yahoo IMAP account and store its password in Windows Credential Manager.
           status            Initialize local storage if needed and print config/database status.
           accounts          List configured accounts and whether their credential is present.
+          discover-folders  Connect to IMAP, discover folders, and persist account/folder metadata locally.
+          folders           List persisted folders from local SQLite storage.
           credential-test   Check whether an account credential can be found.
           credential-delete Delete an account credential from Windows Credential Manager.
           imap-test         Connect to IMAP, list folders, search/fetch message summaries, optionally fetch one body.
@@ -343,6 +441,8 @@ internal static class CliApp
           dotnet run --project src/LceMcp -- setup-yahoo --email you@yahoo.com --name Yahoo
           dotnet run --project src/LceMcp -- status
           dotnet run --project src/LceMcp -- accounts
+          dotnet run --project src/LceMcp -- discover-folders --account yahoo
+          dotnet run --project src/LceMcp -- folders --account yahoo
           dotnet run --project src/LceMcp -- credential-test --account yahoo
           dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund processed" --limit 5
           dotnet run --project src/LceMcp -- imap-test --account yahoo --limit 3 --fetch-first-body
@@ -355,6 +455,9 @@ internal static class CliApp
           --history-days <days>    Stored sync preference. Default: 30 for development.
           --password-stdin         Read password/app password from stdin instead of prompting.
           --skip-password          Write config without storing a credential.
+
+        discover-folders/folders options:
+          --account <id-or-email>  Required when more than one account exists; optional for folders listing.
 
         imap-test options:
           --account <id-or-email>  Required when more than one account exists.

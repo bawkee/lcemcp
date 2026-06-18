@@ -30,6 +30,11 @@ Next work:
 - Run another live Yahoo probe and record whether the missing summary was expunged/not returned or a probe-ordering issue.
 - Persist folder special-use attributes during discovery rather than only printing them.
 
+Follow-up result on 2026-06-18:
+
+- A bounded live Yahoo probe with `--since-days 3 --limit 3` matched 16 UIDs and fetched `3 of 3 requested`; the prior 5-requested/4-returned result did not reproduce in this small window.
+- Keep the older 30-day missing-summary question open until a wider probe or real sync run catches another mismatch.
+
 ## 2. Add Walking Skeleton Storage
 
 The spec wants SQLite as the durable local cache, but the first probe intentionally skipped database work. The next durable step is schema initialization without syncing bodies yet.
@@ -62,10 +67,18 @@ Once SQLite exists, turn the successful IMAP folder probe into persisted account
 
 Next work:
 
-- Upsert configured accounts into the database while keeping secrets only in Windows Credential Manager.
-- Discover folders per account and persist full name, display name, delimiter, attributes, special-use role, selectable/no-select state, UIDVALIDITY, message count, and recent count.
-- Be conservative with Yahoo quirks: do not assume every provider uses the same folder names.
-- Add a CLI command such as `folders --account yahoo` that reads from local storage after discovery.
+Completed on 2026-06-18:
+
+- Added reusable IMAP folder discovery metadata and shared role inference with the existing probe path.
+- Upsert configured account metadata into SQLite from `setup-yahoo` and `discover-folders`, while keeping secrets only in Windows Credential Manager.
+- Added `discover-folders --account <id-or-email>` to connect to IMAP, discover folders, and persist full name, display name, delimiter, attributes, inferred role, selectable state, UIDVALIDITY, message count, recent count, and discovery time.
+- Added `folders --account <id-or-email>` to read persisted folders from local SQLite storage without touching IMAP.
+- Live Yahoo discovery succeeded for `yahoo` on 2026-06-18: 16 folders discovered and persisted; `status` then reported 1 database account and 16 database folders.
+
+Next work:
+
+- Continue with metadata sync.
+- Add focused tests once the first test project exists, especially around account/folder upsert idempotence and folder listing.
 
 ## 4. Implement Metadata Sync
 

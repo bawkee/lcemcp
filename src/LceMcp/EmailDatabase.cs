@@ -39,6 +39,134 @@ internal sealed class EmailDatabase
             InitializationKind: initializationKind);
     }
 
+    public int UpsertConfiguredAccount(AccountConfig account)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        var accountId = UpsertConfiguredAccount(connection, transaction, account, DateTimeOffset.UtcNow.ToString("O"));
+        transaction.Commit();
+        return accountId;
+    }
+
+    public IReadOnlyList<int> UpsertConfiguredAccounts(IEnumerable<AccountConfig> accounts)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        var accountIds = new List<int>();
+
+        foreach (var account in accounts)
+            accountIds.Add(UpsertConfiguredAccount(connection, transaction, account, now));
+
+        transaction.Commit();
+        return accountIds;
+    }
+
+    public int UpsertFolders(int accountId, IReadOnlyCollection<ImapFolderInfo> folders)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        var now = DateTimeOffset.UtcNow.ToString("O");
+
+        foreach (var folder in folders)
+            UpsertFolder(connection, transaction, accountId, folder, now);
+
+        transaction.Commit();
+        return folders.Count;
+    }
+
+    public IReadOnlyList<StoredFolder> ReadFolders(string accountFilter)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+
+        command.CommandText = string.IsNullOrWhiteSpace(accountFilter)
+            ? """
+                SELECT
+                    f.id,
+                    f.account_id,
+                    a.name AS account_name,
+                    a.email_address AS account_email_address,
+                    f.name,
+                    f.path,
+                    f.delimiter,
+                    f.attributes,
+                    f.role,
+                    f.selectable,
+                    f.sync_enabled,
+                    f.uidvalidity,
+                    f.message_count,
+                    f.recent_count,
+                    f.last_discovered_at
+                FROM folders f
+                JOIN accounts a ON a.id = f.account_id
+                ORDER BY a.name COLLATE NOCASE, f.path COLLATE NOCASE;
+                """
+            : """
+                SELECT
+                    f.id,
+                    f.account_id,
+                    a.name AS account_name,
+                    a.email_address AS account_email_address,
+                    f.name,
+                    f.path,
+                    f.delimiter,
+                    f.attributes,
+                    f.role,
+                    f.selectable,
+                    f.sync_enabled,
+                    f.uidvalidity,
+                    f.message_count,
+                    f.recent_count,
+                    f.last_discovered_at
+                FROM folders f
+                JOIN accounts a ON a.id = f.account_id
+                WHERE a.name COLLATE NOCASE = $accountFilter
+                   OR a.email_address COLLATE NOCASE = $accountFilter
+                   OR CAST(a.id AS TEXT) = $accountFilter
+                ORDER BY a.name COLLATE NOCASE, f.path COLLATE NOCASE;
+                """;
+
+        if (!string.IsNullOrWhiteSpace(accountFilter))
+            command.Parameters.AddWithValue("$accountFilter", accountFilter.Trim());
+
+        using var reader = command.ExecuteReader();
+        var folders = new List<StoredFolder>();
+
+        while (reader.Read())
+        {
+            folders.Add(new(
+                Id: reader.GetInt32(reader.GetOrdinal("id")),
+                AccountId: reader.GetInt32(reader.GetOrdinal("account_id")),
+                AccountName: reader.GetString(reader.GetOrdinal("account_name")),
+                AccountEmailAddress: reader.GetString(reader.GetOrdinal("account_email_address")),
+                Name: reader.GetString(reader.GetOrdinal("name")),
+                Path: reader.GetString(reader.GetOrdinal("path")),
+                Delimiter: GetNullableString(reader, "delimiter"),
+                Attributes: GetNullableString(reader, "attributes"),
+                Role: reader.GetString(reader.GetOrdinal("role")),
+                Selectable: reader.GetInt32(reader.GetOrdinal("selectable")) != 0,
+                SyncEnabled: reader.GetInt32(reader.GetOrdinal("sync_enabled")) != 0,
+                UidValidity: GetNullableString(reader, "uidvalidity"),
+                MessageCount: GetNullableInt(reader, "message_count"),
+                RecentCount: GetNullableInt(reader, "recent_count"),
+                LastDiscoveredAt: GetNullableString(reader, "last_discovered_at")));
+        }
+
+        return folders;
+    }
+
     private DatabaseInitializationKind EnsurePrototypeDatabase()
     {
         if (DatabaseMigrations.All.Count > 0)
@@ -186,6 +314,188 @@ internal sealed class EmailDatabase
         return Convert.ToInt32(value);
     }
 
+    private static int UpsertConfiguredAccount(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        AccountConfig account,
+        string now)
+    {
+        var existingAccountId = FindExistingAccountId(connection, transaction, account);
+
+        if (existingAccountId is int accountId)
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                UPDATE accounts
+                SET
+                    name = $name,
+                    email_address = $emailAddress,
+                    provider_preset = $providerPreset,
+                    imap_host = $imapHost,
+                    imap_port = $imapPort,
+                    imap_security = $imapSecurity,
+                    username = $username,
+                    auth_type = $authType,
+                    credential_ref = $credentialRef,
+                    enabled = $enabled
+                WHERE id = $id;
+                """;
+            AddParameter(command, "$id", accountId);
+            AddAccountParameters(command, account);
+            command.ExecuteNonQuery();
+            return accountId;
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO accounts (
+                    name,
+                    email_address,
+                    provider_preset,
+                    imap_host,
+                    imap_port,
+                    imap_security,
+                    username,
+                    auth_type,
+                    credential_ref,
+                    created_at,
+                    enabled
+                )
+                VALUES (
+                    $name,
+                    $emailAddress,
+                    $providerPreset,
+                    $imapHost,
+                    $imapPort,
+                    $imapSecurity,
+                    $username,
+                    $authType,
+                    $credentialRef,
+                    $createdAt,
+                    $enabled
+                );
+                """;
+            AddAccountParameters(command, account);
+            AddParameter(command, "$createdAt", now);
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = "SELECT last_insert_rowid();";
+            return Convert.ToInt32(command.ExecuteScalar());
+        }
+    }
+
+    private static int? FindExistingAccountId(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        AccountConfig account)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT id
+            FROM accounts
+            WHERE name COLLATE NOCASE = $name
+               OR email_address COLLATE NOCASE = $emailAddress
+            ORDER BY CASE WHEN name COLLATE NOCASE = $name THEN 0 ELSE 1 END
+            LIMIT 1;
+            """;
+        AddParameter(command, "$name", account.Id);
+        AddParameter(command, "$emailAddress", account.EmailAddress);
+
+        var value = command.ExecuteScalar();
+        return value is null ? null : Convert.ToInt32(value);
+    }
+
+    private static void AddAccountParameters(SqliteCommand command, AccountConfig account)
+    {
+        AddParameter(command, "$name", account.Id);
+        AddParameter(command, "$emailAddress", account.EmailAddress);
+        AddParameter(command, "$providerPreset", BlankToNull(account.Provider));
+        AddParameter(command, "$imapHost", account.ImapHost);
+        AddParameter(command, "$imapPort", account.ImapPort);
+        AddParameter(command, "$imapSecurity", account.ImapSecurity);
+        AddParameter(command, "$username", account.Username);
+        AddParameter(command, "$authType", "password");
+        AddParameter(command, "$credentialRef", BlankToNull(account.CredentialRef));
+        AddParameter(command, "$enabled", account.Enabled ? 1 : 0);
+    }
+
+    private static void UpsertFolder(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int accountId,
+        ImapFolderInfo folder,
+        string now)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO folders (
+                account_id,
+                name,
+                path,
+                delimiter,
+                attributes,
+                role,
+                selectable,
+                uidvalidity,
+                message_count,
+                recent_count,
+                last_discovered_at
+            )
+            VALUES (
+                $accountId,
+                $name,
+                $path,
+                $delimiter,
+                $attributes,
+                $role,
+                $selectable,
+                $uidValidity,
+                $messageCount,
+                $recentCount,
+                $lastDiscoveredAt
+            )
+            ON CONFLICT(account_id, path) DO UPDATE SET
+                name = excluded.name,
+                delimiter = excluded.delimiter,
+                attributes = excluded.attributes,
+                role = excluded.role,
+                selectable = excluded.selectable,
+                uidvalidity = excluded.uidvalidity,
+                message_count = excluded.message_count,
+                recent_count = excluded.recent_count,
+                last_discovered_at = excluded.last_discovered_at;
+            """;
+        AddParameter(command, "$accountId", accountId);
+        AddParameter(command, "$name", folder.Name);
+        AddParameter(command, "$path", folder.FullName);
+        AddParameter(command, "$delimiter", folder.Delimiter);
+        AddParameter(command, "$attributes", folder.Attributes);
+        AddParameter(command, "$role", folder.Role);
+        AddParameter(command, "$selectable", folder.Selectable ? 1 : 0);
+        AddParameter(command, "$uidValidity", folder.UidValidity);
+        AddParameter(command, "$messageCount", folder.MessageCount);
+        AddParameter(command, "$recentCount", folder.RecentCount);
+        AddParameter(command, "$lastDiscoveredAt", now);
+        command.ExecuteNonQuery();
+    }
+
+    private static void AddParameter(SqliteCommand command, string name, object value)
+    {
+        command.Parameters.AddWithValue(name, value ?? DBNull.Value);
+    }
+
+    private static string BlankToNull(string value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value;
+
     private static bool TableExists(SqliteConnection connection, string tableName)
     {
         using var command = connection.CreateCommand();
@@ -317,6 +627,12 @@ internal sealed class EmailDatabase
     {
         var ordinal = reader.GetOrdinal(name);
         return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+    }
+
+    private static int? GetNullableInt(SqliteDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal);
     }
 
     private const string MigrationTableSql = """

@@ -1,7 +1,6 @@
 using MailKit;
 using MailKit.Net.Imap;
 using MailKit.Search;
-using MailKit.Security;
 using MimeKit;
 
 namespace LceMcp;
@@ -23,7 +22,7 @@ internal sealed class ImapProbe
         using var client = new ImapClient();
         client.Timeout = 30_000;
 
-        var socketOptions = ResolveSocketOptions(account.ImapSecurity);
+        var socketOptions = ImapFolderDiscovery.ResolveSocketOptions(account.ImapSecurity);
         Console.WriteLine($"Connecting to {account.ImapHost}:{account.ImapPort} ({account.ImapSecurity})...");
         await client.ConnectAsync(account.ImapHost, account.ImapPort, socketOptions, cancellationToken);
         Console.WriteLine($"Connected. Capabilities: {client.Capabilities}");
@@ -34,10 +33,10 @@ internal sealed class ImapProbe
         await client.AuthenticateAsync(account.Username, password, cancellationToken);
         Console.WriteLine("Authenticated.");
 
-        var folders = await GetFoldersAsync(client, cancellationToken);
+        var folders = await ImapFolderDiscovery.GetFoldersAsync(client, cancellationToken);
         PrintFolders(folders);
 
-        var folder = await ResolveFolderAsync(client, folders, options.Folder, cancellationToken);
+        var folder = await ImapFolderDiscovery.ResolveFolderAsync(client, folders, options.Folder, cancellationToken);
         await folder.OpenAsync(FolderAccess.ReadOnly, cancellationToken);
         Console.WriteLine($"Opened folder: {folder.FullName}");
         Console.WriteLine($"Messages: {folder.Count}; Recent: {folder.Recent}; UID validity: {folder.UidValidity}");
@@ -93,31 +92,6 @@ internal sealed class ImapProbe
         Console.WriteLine("Disconnected.");
     }
 
-    private static SecureSocketOptions ResolveSocketOptions(string security)
-    {
-        return security.ToLowerInvariant() switch
-        {
-            "ssl" or "ssl/tls" => SecureSocketOptions.SslOnConnect,
-            "starttls" => SecureSocketOptions.StartTls,
-            "none" => SecureSocketOptions.None,
-            _ => throw new CliException($"Unsupported IMAP security value: {security}", 2)
-        };
-    }
-
-    private static async Task<List<IMailFolder>> GetFoldersAsync(ImapClient client, CancellationToken cancellationToken)
-    {
-        var folders = new List<IMailFolder>();
-        foreach (var ns in client.PersonalNamespaces)
-        {
-            var namespaceFolders = await client.GetFoldersAsync(ns, subscribedOnly: false, cancellationToken);
-            folders.AddRange(namespaceFolders);
-        }
-
-        return folders
-            .OrderBy(folder => folder.FullName, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-    }
-
     private static void PrintFolders(IReadOnlyCollection<IMailFolder> folders)
     {
         Console.WriteLine($"Folders discovered: {folders.Count}");
@@ -125,30 +99,11 @@ internal sealed class ImapProbe
         foreach (var folder in folders.Take(25))
         {
             var selectable = !folder.Attributes.HasFlag(FolderAttributes.NoSelect);
-            Console.WriteLine($"  {folder.FullName}  role={InferRole(folder)}  selectable={selectable}  attrs={string.Join(",", folder.Attributes)}");
+            Console.WriteLine($"  {folder.FullName}  role={ImapFolderRoles.Infer(folder.Attributes)}  selectable={selectable}  attrs={folder.Attributes}");
         }
 
         if (folders.Count > 25)
             Console.WriteLine($"  ... {folders.Count - 25} more");
-    }
-
-    private static async Task<IMailFolder> ResolveFolderAsync(
-        ImapClient client,
-        IReadOnlyCollection<IMailFolder> folders,
-        string folderPath,
-        CancellationToken cancellationToken)
-    {
-        var discovered = folders.FirstOrDefault(folder =>
-            folder.FullName.Equals(folderPath, StringComparison.OrdinalIgnoreCase)
-            || folder.Name.Equals(folderPath, StringComparison.OrdinalIgnoreCase));
-
-        if (discovered is not null)
-            return discovered;
-
-        if (folderPath.Equals("INBOX", StringComparison.OrdinalIgnoreCase))
-            return client.Inbox;
-
-        return await client.GetFolderAsync(folderPath, cancellationToken);
     }
 
     private static SearchQuery BuildSearchQuery(ImapProbeOptions options)
@@ -195,34 +150,6 @@ internal sealed class ImapProbe
 
         if (missingUidIds.Count > 0)
             Console.WriteLine($"Missing requested UIDs: {string.Join(", ", missingUidIds)}");
-    }
-
-    private static string InferRole(IMailFolder folder)
-    {
-        var attributes = folder.Attributes;
-
-        if (attributes.HasFlag(FolderAttributes.Inbox))
-            return "inbox";
-
-        if (attributes.HasFlag(FolderAttributes.Sent))
-            return "sent";
-
-        if (attributes.HasFlag(FolderAttributes.Archive))
-            return "archive";
-
-        if (attributes.HasFlag(FolderAttributes.All))
-            return "all_mail";
-
-        if (attributes.HasFlag(FolderAttributes.Drafts))
-            return "drafts";
-
-        if (attributes.HasFlag(FolderAttributes.Trash))
-            return "trash";
-
-        if (attributes.HasFlag(FolderAttributes.Junk))
-            return "spam";
-
-        return "custom";
     }
 
     private static void PrintSummary(IMessageSummary summary)
