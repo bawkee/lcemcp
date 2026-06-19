@@ -13,30 +13,38 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Created, status.InitializationKind);
-        Assert.Equal(1, status.SchemaVersion);
-        Assert.Equal(1, status.TargetSchemaVersion);
+        Assert.Equal(2, status.SchemaVersion);
+        Assert.Equal(2, status.TargetSchemaVersion);
         Assert.Equal(0, status.AccountCount);
         Assert.Equal(0, status.FolderCount);
         Assert.Equal(0, status.MessageCount);
         Assert.Equal(0, status.MessageLocationCount);
+        Assert.Equal(0, status.MessageBodyCount);
+        Assert.Equal(0, status.MessageSearchDocCount);
         Assert.Null(status.LastSyncState);
         Assert.True(File.Exists(temp.Paths.DatabasePath));
         Assert.True(Directory.Exists(temp.Paths.AttachmentsDirectory));
         Assert.True(Directory.Exists(temp.Paths.LogsDirectory));
 
-        Assert.Equal(
-            [
-                "accounts",
-                "audit_log",
-                "folders",
-                "message_locations",
-                "messages",
-                "schema_migrations",
-                "sync_state"
-            ],
-            ReadNames(
-                temp.Paths.DatabasePath,
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"));
+        var tableNames = ReadNames(
+            temp.Paths.DatabasePath,
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;").ToHashSet();
+
+        foreach (var tableName in new[]
+        {
+            "accounts",
+            "audit_log",
+            "folders",
+            "message_bodies",
+            "message_locations",
+            "message_recipients",
+            "message_search_docs",
+            "messages",
+            "messages_fts",
+            "schema_migrations",
+            "sync_state"
+        })
+            Assert.Contains(tableName, tableNames);
     }
 
     [Fact]
@@ -49,10 +57,44 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Opened, status.InitializationKind);
-        Assert.Equal(1, status.SchemaVersion);
-        Assert.Equal(["initial_metadata_cache"], ReadNames(
+        Assert.Equal(2, status.SchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
+    }
+
+    [Fact]
+    public void GetStatusMigratesVersionOneDatabaseToBodySearchSchema()
+    {
+        using var temp = TempWorkspace.Create();
+        temp.Paths.EnsureDataDirectories();
+
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (1, 'initial_metadata_cache', '2026-06-19T00:00:00.0000000+00:00');
+            """);
+        ExecuteNonQuery(temp.Paths.DatabasePath, DatabaseMigrations.InitialSchemaSql);
+
+        var database = new EmailDatabase(temp.Paths);
+        var status = database.GetStatus();
+
+        Assert.Equal(DatabaseInitializationKind.Migrated, status.InitializationKind);
+        Assert.Equal(2, status.SchemaVersion);
+        Assert.Equal(2, status.TargetSchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search"], ReadNames(
+            temp.Paths.DatabasePath,
+            "SELECT name FROM schema_migrations ORDER BY version;"));
+        Assert.Contains("message_search_docs", ReadNames(
+            temp.Paths.DatabasePath,
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;"));
     }
 
     [Fact]
@@ -173,6 +215,85 @@ public sealed class EmailDatabaseTests
         Assert.Null(status.LastSyncState);
     }
 
+    [Fact]
+    public void UpsertMessageBodyRefreshesSearchIndex()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:abc",
+                subject: "Refund update")
+        ], """{"batch":1}""", 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Hello, the refund processed yesterday.",
+            HtmlText: null,
+            NormalizedText: "Hello, the refund processed yesterday.",
+            Recipients: [
+                new("to", "Customer", "customer@example.com")
+            ]));
+
+        var firstStatus = database.GetStatus();
+        var refundResults = database.SearchMessages(new(
+            Query: "\"refund processed\"",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 10,
+            SnippetChars: 1024));
+        var recipientResults = database.SearchMessages(new(
+            Query: "customer@example.com",
+            AccountFilters: null,
+            FromEmail: null,
+            FolderRoles: null,
+            HasAttachment: false,
+            Limit: 10,
+            SnippetChars: 1024));
+
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Chargeback closed with no refund mention.",
+            HtmlText: null,
+            NormalizedText: "Chargeback closed with no refund mention.",
+            Recipients: []));
+
+        var staleResults = database.SearchMessages(new(
+            Query: "\"refund processed\"",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 10,
+            SnippetChars: 1024));
+        var updatedResults = database.SearchMessages(new(
+            Query: "chargeback",
+            AccountFilters: ["person@yahoo.com"],
+            FromEmail: "sender@example.com",
+            FolderRoles: ["inbox"],
+            HasAttachment: false,
+            Limit: 10,
+            SnippetChars: 1024));
+
+        var refundResult = Assert.Single(refundResults);
+        Assert.Equal(1, firstStatus.MessageBodyCount);
+        Assert.Equal(1, firstStatus.MessageSearchDocCount);
+        Assert.Contains("refund", refundResult.Snippet, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(recipientResults);
+        Assert.Empty(staleResults);
+        Assert.Single(updatedResults);
+    }
+
     private static string[] ReadNames(string databasePath, string sql)
     {
         using var connection = OpenReadConnection(databasePath);
@@ -215,12 +336,34 @@ public sealed class EmailDatabaseTests
         return [.. values];
     }
 
+    private static int[] ReadInts(string databasePath, string sql)
+    {
+        using var connection = OpenReadConnection(databasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        using var reader = command.ExecuteReader();
+        var values = new List<int>();
+
+        while (reader.Read())
+            values.Add(reader.GetInt32(0));
+
+        return [.. values];
+    }
+
+    private static void ExecuteNonQuery(string databasePath, string sql)
+    {
+        using var connection = OpenReadConnection(databasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
     private static SqliteConnection OpenReadConnection(string databasePath)
     {
         var connectionString = new SqliteConnectionStringBuilder
         {
             DataSource = databasePath,
-            Mode = SqliteOpenMode.ReadOnly,
+            Mode = SqliteOpenMode.ReadWriteCreate,
             Pooling = false
         }.ToString();
         var connection = new SqliteConnection(connectionString);

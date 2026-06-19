@@ -4,7 +4,8 @@ internal static class DatabaseMigrations
 {
     public static IReadOnlyList<DatabaseMigration> All { get; } =
     [
-        new(1, "initial_metadata_cache", InitialSchemaSql)
+        new(1, "initial_metadata_cache", InitialSchemaSql),
+        new(2, "message_bodies_and_search", BodySearchSchemaSql)
     ];
 
     public static int TargetVersion => All.Select(migration => migration.Version).DefaultIfEmpty(0).Max();
@@ -129,5 +130,67 @@ internal static class DatabaseMigrations
         CREATE INDEX IF NOT EXISTS idx_message_locations_message ON message_locations(message_id);
         CREATE INDEX IF NOT EXISTS idx_message_locations_folder_uid ON message_locations(folder_id, provider_uid);
         CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+        """;
+
+    public const string BodySearchSchemaSql = """
+        CREATE TABLE IF NOT EXISTS message_bodies (
+            message_id INTEGER PRIMARY KEY,
+            plain_text TEXT,
+            html_text TEXT,
+            normalized_text TEXT,
+            detected_language TEXT,
+            normalized_at TEXT,
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS message_recipients (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            name TEXT,
+            email TEXT,
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS message_search_docs (
+            message_id INTEGER PRIMARY KEY,
+            subject TEXT,
+            from_email TEXT,
+            from_name TEXT,
+            recipients TEXT,
+            body TEXT,
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            subject,
+            from_email,
+            from_name,
+            recipients,
+            body,
+            content='message_search_docs',
+            content_rowid='message_id',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS message_search_docs_ai AFTER INSERT ON message_search_docs BEGIN
+            INSERT INTO messages_fts(rowid, subject, from_email, from_name, recipients, body)
+            VALUES (new.message_id, new.subject, new.from_email, new.from_name, new.recipients, new.body);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS message_search_docs_ad AFTER DELETE ON message_search_docs BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, subject, from_email, from_name, recipients, body)
+            VALUES('delete', old.message_id, old.subject, old.from_email, old.from_name, old.recipients, old.body);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS message_search_docs_au AFTER UPDATE ON message_search_docs BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, subject, from_email, from_name, recipients, body)
+            VALUES('delete', old.message_id, old.subject, old.from_email, old.from_name, old.recipients, old.body);
+            INSERT INTO messages_fts(rowid, subject, from_email, from_name, recipients, body)
+            VALUES (new.message_id, new.subject, new.from_email, new.from_name, new.recipients, new.body);
+        END;
+
+        CREATE INDEX IF NOT EXISTS idx_message_recipients_message ON message_recipients(message_id);
+        CREATE INDEX IF NOT EXISTS idx_message_recipients_email ON message_recipients(email);
         """;
 }

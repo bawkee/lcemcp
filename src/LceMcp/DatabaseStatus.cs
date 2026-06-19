@@ -7,6 +7,8 @@ internal sealed record DatabaseStatus(
     int FolderCount,
     int MessageCount,
     int MessageLocationCount,
+    int MessageBodyCount,
+    int MessageSearchDocCount,
     SyncStateStatus LastSyncState,
     DatabaseInitializationKind InitializationKind);
 

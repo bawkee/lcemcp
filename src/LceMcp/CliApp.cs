@@ -26,6 +26,8 @@ internal static class CliApp
             "discover-folders" => await DiscoverFoldersAsync(configStore, credentialStore, database, options, cancellationToken),
             "folders" => ListFolders(database, options),
             "sync" => await SyncAsync(configStore, credentialStore, database, options, cancellationToken),
+            "sync-bodies" => await SyncBodiesAsync(configStore, credentialStore, database, options, cancellationToken),
+            "search" => Search(database, options),
             "credential-test" => CredentialTest(configStore, credentialStore, options),
             "credential-delete" => CredentialDelete(configStore, credentialStore, options),
             "imap-test" => await ImapTestAsync(configStore, credentialStore, options, cancellationToken),
@@ -130,6 +132,8 @@ internal static class CliApp
         Console.WriteLine($"Database folders: {databaseStatus.FolderCount}");
         Console.WriteLine($"Database messages: {databaseStatus.MessageCount}");
         Console.WriteLine($"Database message locations: {databaseStatus.MessageLocationCount}");
+        Console.WriteLine($"Database message bodies: {databaseStatus.MessageBodyCount}");
+        Console.WriteLine($"Database message search docs: {databaseStatus.MessageSearchDocCount}");
         Console.WriteLine($"Last sync state: {FormatSyncState(databaseStatus.LastSyncState)}");
 
         return 0;
@@ -273,6 +277,83 @@ internal static class CliApp
 
             PrintMetadataSyncResult(result);
         }
+
+        return 0;
+    }
+
+    private static async Task<int> SyncBodiesAsync(
+        ConfigStore configStore,
+        WindowsCredentialStore credentialStore,
+        EmailDatabase database,
+        CommandOptions options,
+        CancellationToken cancellationToken)
+    {
+        var config = configStore.Load();
+        var accounts = ResolveAccountsForSync(config, options.Get("--account"));
+        var folderFilter = options.Get("--folder");
+        var maxPerFolder = options.GetInt("--max-per-folder", 50);
+        var batchSize = options.GetInt("--batch-size", 10);
+
+        if (maxPerFolder < 0)
+            throw new CliException("--max-per-folder must be 0 or greater. Use 0 for no per-folder cap.", 2);
+
+        if (batchSize < 1 || batchSize > 100)
+            throw new CliException("--batch-size must be between 1 and 100.", 2);
+
+        foreach (var account in accounts)
+        {
+            if (!account.Enabled)
+                throw new CliException($"Account '{account.Id}' is disabled.", 2);
+
+            AccountConfigValidator.ThrowIfInvalidForImap(account);
+
+            var password = credentialStore.Read(account.CredentialRef);
+            if (password is null)
+                throw new CliException($"Credential not found: {account.CredentialRef}", 3);
+
+            database.UpsertConfiguredAccount(account);
+
+            Console.WriteLine($"Syncing bodies for '{account.Id}', max_per_folder={FormatMaxPerFolder(maxPerFolder)}, batch_size={batchSize}...");
+
+            var result = await new ImapBodySync(database).SyncAccountAsync(
+                account,
+                password,
+                folderFilter,
+                maxPerFolder,
+                batchSize,
+                cancellationToken);
+
+            PrintBodySyncResult(result);
+        }
+
+        return 0;
+    }
+
+    private static int Search(EmailDatabase database, CommandOptions options)
+    {
+        var query = options.GetRequired("--query").Trim();
+        var request = new EmailSearchRequest(
+            Query: query,
+            AccountFilters: SplitOption(options.Get("--account")),
+            FromEmail: options.Get("--from"),
+            FolderRoles: SplitOption(options.Get("--folder-role")),
+            HasAttachment: ParseNullableBool(options.Get("--has-attachment"), "--has-attachment"),
+            Limit: options.GetInt("--limit", 20),
+            SnippetChars: options.GetInt("--snippet-chars", 1024));
+
+        if (request.Limit < 1 || request.Limit > 100)
+            throw new CliException("--limit must be between 1 and 100.", 2);
+
+        if (request.SnippetChars < 160 || request.SnippetChars > 4096)
+            throw new CliException("--snippet-chars must be between 160 and 4096.", 2);
+
+        var results = database.SearchMessages(request);
+
+        Console.WriteLine($"Database: {database.DatabasePath}");
+        Console.WriteLine($"Search results: {results.Count}");
+
+        foreach (var result in results)
+            PrintSearchResult(result);
 
         return 0;
     }
@@ -530,8 +611,80 @@ internal static class CliApp
         Console.WriteLine($"Metadata sync summary for '{result.AccountId}': folders_ok={succeeded} folders_failed={failed} persisted={persisted}");
     }
 
+    private static void PrintBodySyncResult(BodyAccountSyncResult result)
+    {
+        if (result.Folders.Count == 0)
+        {
+            Console.WriteLine($"Body sync summary for '{result.AccountId}': no pending message bodies.");
+            return;
+        }
+
+        foreach (var folder in result.Folders)
+        {
+            if (folder.Succeeded)
+                Console.WriteLine($"{folder.FolderPath}: selected={folder.SelectedCount} fetched={folder.FetchedCount} persisted={folder.PersistedCount} missing={folder.MissingCount}");
+            else
+                Console.WriteLine($"{folder.FolderPath}: selected={folder.SelectedCount} fetched={folder.FetchedCount} persisted={folder.PersistedCount} missing={folder.MissingCount} error={folder.Error}");
+        }
+
+        var succeeded = result.Folders.Count(folder => folder.Succeeded);
+        var persisted = result.Folders.Sum(folder => folder.PersistedCount);
+        var failed = result.Folders.Count - succeeded;
+
+        Console.WriteLine($"Body sync summary for '{result.AccountId}': folders_ok={succeeded} folders_failed={failed} persisted={persisted}");
+    }
+
+    private static void PrintSearchResult(EmailSearchResult result)
+    {
+        var from = string.IsNullOrWhiteSpace(result.FromEmail)
+            ? "(unknown sender)"
+            : string.IsNullOrWhiteSpace(result.FromName)
+                ? result.FromEmail
+                : $"{result.FromName} <{result.FromEmail}>";
+        var subject = string.IsNullOrWhiteSpace(result.Subject) ? "(no subject)" : result.Subject;
+
+        Console.WriteLine();
+        Console.WriteLine($"message_id={result.MessageId} account={result.AccountName} score={result.Score:0.###}");
+        Console.WriteLine($"date={FormatOptional(result.Date)} folders={FormatOptional(result.Folders)} attachments={result.HasAttachments.ToString().ToLowerInvariant()}");
+        Console.WriteLine($"from={from}");
+        Console.WriteLine($"subject={subject}");
+
+        if (!string.IsNullOrWhiteSpace(result.Snippet))
+            Console.WriteLine($"snippet={result.Snippet}");
+    }
+
     private static string FormatMaxPerFolder(int maxPerFolder) =>
         maxPerFolder == 0 ? "unbounded" : maxPerFolder.ToString();
+
+    private static IReadOnlyList<string> SplitOption(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return [];
+
+        return value
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .ToList();
+    }
+
+    private static bool? ParseNullableBool(string value, string optionName)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        if (bool.TryParse(value, out var parsed))
+            return parsed;
+
+        if (value.Equals("1", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("yes", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (value.Equals("0", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("no", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        throw new CliException($"{optionName} must be true or false.", 2);
+    }
 
     private static void PrintHelp()
     {
@@ -545,6 +698,8 @@ internal static class CliApp
           discover-folders  Connect to IMAP, discover folders, and persist account/folder metadata locally.
           folders           List persisted folders from local SQLite storage.
           sync              Sync bounded message envelope metadata into local SQLite storage.
+          sync-bodies       Download body text for already-synced message metadata and index it locally.
+          search            Search local indexed message metadata and body text.
           credential-test   Check whether an account credential can be found.
           credential-delete Delete an account credential from Windows Credential Manager.
           imap-test         Connect to IMAP, list folders, search/fetch message summaries, optionally fetch one body.
@@ -556,6 +711,8 @@ internal static class CliApp
           dotnet run --project src/LceMcp -- discover-folders --account yahoo
           dotnet run --project src/LceMcp -- folders --account yahoo
           dotnet run --project src/LceMcp -- sync --account yahoo --folder Inbox --max-per-folder 50
+          dotnet run --project src/LceMcp -- sync-bodies --account yahoo --folder Inbox --max-per-folder 10
+          dotnet run --project src/LceMcp -- search --query "refund processed" --account yahoo
           dotnet run --project src/LceMcp -- credential-test --account yahoo
           dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund processed" --limit 5
           dotnet run --project src/LceMcp -- imap-test --account yahoo --limit 3 --fetch-first-body
@@ -578,6 +735,21 @@ internal static class CliApp
           --since-days <days>      Default: account history_days. Use 0 for no date bound.
           --max-per-folder <n>     Default: 200 newest messages per folder. Use 0 for no cap.
           --batch-size <n>         Default: 50. Commits each fetched batch.
+
+        sync-bodies options:
+          --account <id-or-email>  Optional. Default: all enabled accounts.
+          --folder <path-or-name>  Optional. Default: all cached selectable sync-enabled folders.
+          --max-per-folder <n>     Default: 50 pending bodies per folder. Use 0 for no cap.
+          --batch-size <n>         Default: 10. Fetches bodies in bounded loops.
+
+        search options:
+          --query <text>           Required. Local FTS query text; quoted phrases and OR are supported.
+          --account <id-or-email>  Optional. Comma-separated values are accepted.
+          --from <email>           Optional sender email filter.
+          --folder-role <role>     Optional. Comma-separated roles, e.g. inbox,sent,archive.
+          --has-attachment <bool>  Optional true/false metadata filter.
+          --limit <n>              Default: 20. Maximum 100.
+          --snippet-chars <n>      Default: 1024. Range 160 to 4096.
 
         imap-test options:
           --account <id-or-email>  Required when more than one account exists.

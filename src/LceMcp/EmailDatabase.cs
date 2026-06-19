@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using SqlBinder;
 
 namespace LceMcp;
 
@@ -32,6 +33,8 @@ internal sealed class EmailDatabase
             FolderCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM folders;"),
             MessageCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM messages;"),
             MessageLocationCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM message_locations;"),
+            MessageBodyCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM message_bodies;"),
+            MessageSearchDocCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM message_search_docs;"),
             LastSyncState: ReadLastSyncState(connection),
             InitializationKind: initializationKind);
     }
@@ -181,6 +184,131 @@ internal sealed class EmailDatabase
         return folders
             .OrderBy(folder => folder.Path, StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    public IReadOnlyList<BodySyncTarget> ReadPendingBodySyncTargets(
+        string accountFilter,
+        string folderFilter,
+        int maxPerFolder)
+    {
+        EnsureInitialized();
+
+        var folders = ReadSyncFolders(accountFilter, folderFilter);
+        if (folders.Count == 0)
+            return [];
+
+        using var connection = OpenConnection();
+        var targets = new List<BodySyncTarget>();
+        var limit = maxPerFolder > 0 ? maxPerFolder : int.MaxValue;
+
+        foreach (var folder in folders)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT
+                    m.id AS message_id,
+                    ml.folder_id,
+                    f.path AS folder_path,
+                    ml.provider_uid,
+                    m.subject
+                FROM message_locations ml
+                JOIN messages m ON m.id = ml.message_id
+                JOIN folders f ON f.id = ml.folder_id
+                WHERE ml.folder_id = $folderId
+                  AND m.body_downloaded = 0
+                  AND ml.deleted_locally = 0
+                  AND ml.expunged = 0
+                ORDER BY COALESCE(m.date_sent, m.date_received, '') DESC,
+                         CAST(ml.provider_uid AS INTEGER) DESC
+                LIMIT $limit;
+                """;
+            AddParameter(command, "$folderId", folder.Id);
+            AddParameter(command, "$limit", limit);
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                targets.Add(new(
+                    MessageId: reader.GetInt32(reader.GetOrdinal("message_id")),
+                    FolderId: reader.GetInt32(reader.GetOrdinal("folder_id")),
+                    FolderPath: reader.GetString(reader.GetOrdinal("folder_path")),
+                    ProviderUid: reader.GetString(reader.GetOrdinal("provider_uid")),
+                    Subject: GetNullableString(reader, "subject")));
+            }
+        }
+
+        return targets;
+    }
+
+    public void UpsertMessageBody(MessageBodyContent body)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        var now = DateTimeOffset.UtcNow.ToString("O");
+
+        UpsertMessageBody(connection, transaction, body, now);
+        transaction.Commit();
+    }
+
+    public IReadOnlyList<EmailSearchResult> SearchMessages(EmailSearchRequest request)
+    {
+        EnsureInitialized();
+
+        var fts = FtsQueryBuilder.Build(request.Query);
+        var limit = Math.Clamp(request.Limit <= 0 ? 20 : request.Limit, 1, 100);
+        var snippetTokens = Math.Clamp(request.SnippetChars <= 0 ? 32 : request.SnippetChars / 6, 16, 64);
+
+        using var connection = OpenConnection();
+        var accountIds = ResolveAccountIds(connection, request.AccountFilters);
+
+        if (HasValues(request.AccountFilters) && accountIds.Count == 0)
+            return [];
+
+        var query = new Query(SearchMessagesSql);
+
+        if (accountIds.Count > 0)
+            query.SetCondition("accountIds", accountIds);
+
+        query.SetCondition("fromEmail", BlankToNull(request.FromEmail), StringOperator.Is, ignoreIfNull: true);
+
+        if (HasValues(request.FolderRoles))
+            query.SetCondition("folderRoles", request.FolderRoles.Select(role => role.Trim().ToLowerInvariant()).ToList());
+
+        if (request.HasAttachment is bool hasAttachment)
+            query.SetCondition("hasAttachments", hasAttachment ? 1 : 0);
+
+        using var command = connection.CreateCommand();
+        command.CommandText = query.GetSql();
+
+        foreach (var parameter in query.SqlParameters)
+            AddParameter(command, $":{parameter.Key}", parameter.Value);
+
+        AddParameter(command, "$fts", fts);
+        AddParameter(command, "$limit", limit);
+        AddParameter(command, "$snippetTokens", snippetTokens);
+
+        using var reader = command.ExecuteReader();
+        var results = new List<EmailSearchResult>();
+
+        while (reader.Read())
+        {
+            results.Add(new(
+                MessageId: reader.GetInt32(reader.GetOrdinal("message_id")),
+                AccountName: reader.GetString(reader.GetOrdinal("account_name")),
+                Folders: GetNullableString(reader, "folders"),
+                Date: GetNullableString(reader, "message_date"),
+                FromName: GetNullableString(reader, "from_name"),
+                FromEmail: GetNullableString(reader, "from_email"),
+                Subject: GetNullableString(reader, "subject"),
+                HasAttachments: reader.GetInt32(reader.GetOrdinal("has_attachments")) != 0,
+                Snippet: GetNullableString(reader, "snippet"),
+                Score: reader.GetDouble(reader.GetOrdinal("score"))));
+        }
+
+        return results;
     }
 
     public int UpsertMessageMetadataBatch(
@@ -791,6 +919,148 @@ internal sealed class EmailDatabase
         command.ExecuteNonQuery();
     }
 
+    private static void UpsertMessageBody(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        MessageBodyContent body,
+        string now)
+    {
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO message_bodies (
+                    message_id,
+                    plain_text,
+                    html_text,
+                    normalized_text,
+                    detected_language,
+                    normalized_at
+                )
+                VALUES (
+                    $messageId,
+                    $plainText,
+                    $htmlText,
+                    $normalizedText,
+                    NULL,
+                    $normalizedAt
+                )
+                ON CONFLICT(message_id) DO UPDATE SET
+                    plain_text = excluded.plain_text,
+                    html_text = excluded.html_text,
+                    normalized_text = excluded.normalized_text,
+                    detected_language = excluded.detected_language,
+                    normalized_at = excluded.normalized_at;
+                """;
+            AddParameter(command, "$messageId", body.MessageId);
+            AddParameter(command, "$plainText", BlankToNull(body.PlainText));
+            AddParameter(command, "$htmlText", BlankToNull(body.HtmlText));
+            AddParameter(command, "$normalizedText", BlankToNull(body.NormalizedText));
+            AddParameter(command, "$normalizedAt", now);
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = "DELETE FROM message_recipients WHERE message_id = $messageId;";
+            AddParameter(command, "$messageId", body.MessageId);
+            command.ExecuteNonQuery();
+        }
+
+        foreach (var recipient in body.Recipients)
+            InsertMessageRecipient(connection, transaction, body.MessageId, recipient);
+
+        RefreshMessageSearchDocument(connection, transaction, body.MessageId);
+
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                UPDATE messages
+                SET
+                    body_downloaded = 1,
+                    updated_at = $updatedAt
+                WHERE id = $messageId;
+                """;
+            AddParameter(command, "$messageId", body.MessageId);
+            AddParameter(command, "$updatedAt", now);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static void InsertMessageRecipient(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int messageId,
+        MessageRecipient recipient)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO message_recipients (
+                message_id,
+                type,
+                name,
+                email
+            )
+            VALUES (
+                $messageId,
+                $type,
+                $name,
+                $email
+            );
+            """;
+        AddParameter(command, "$messageId", messageId);
+        AddParameter(command, "$type", recipient.Type);
+        AddParameter(command, "$name", BlankToNull(recipient.Name));
+        AddParameter(command, "$email", BlankToNull(recipient.Email));
+        command.ExecuteNonQuery();
+    }
+
+    private static void RefreshMessageSearchDocument(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int messageId)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO message_search_docs (
+                message_id,
+                subject,
+                from_email,
+                from_name,
+                recipients,
+                body
+            )
+            VALUES (
+                $messageId,
+                (SELECT subject FROM messages WHERE id = $messageId),
+                (SELECT from_email FROM messages WHERE id = $messageId),
+                (SELECT from_name FROM messages WHERE id = $messageId),
+                (
+                    SELECT group_concat(recipient_text, ' ')
+                    FROM (
+                        SELECT TRIM(COALESCE(name, '') || ' ' || COALESCE(email, '')) AS recipient_text
+                        FROM message_recipients
+                        WHERE message_id = $messageId
+                        ORDER BY type, id
+                    )
+                ),
+                (SELECT normalized_text FROM message_bodies WHERE message_id = $messageId)
+            )
+            ON CONFLICT(message_id) DO UPDATE SET
+                subject = excluded.subject,
+                from_email = excluded.from_email,
+                from_name = excluded.from_name,
+                recipients = excluded.recipients,
+                body = excluded.body;
+            """;
+        AddParameter(command, "$messageId", messageId);
+        command.ExecuteNonQuery();
+    }
+
     private static void MarkFolderSyncSucceeded(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -882,6 +1152,38 @@ internal sealed class EmailDatabase
         var value = command.ExecuteScalar();
         return value is null || value is DBNull ? null : Convert.ToInt32(value);
     }
+
+    private static IReadOnlyList<int> ResolveAccountIds(
+        SqliteConnection connection,
+        IReadOnlyList<string> accountFilters)
+    {
+        if (!HasValues(accountFilters))
+            return [];
+
+        var accountIds = new HashSet<int>();
+
+        foreach (var filter in accountFilters.Where(value => !string.IsNullOrWhiteSpace(value)))
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT id
+                FROM accounts
+                WHERE name COLLATE NOCASE = $accountFilter
+                   OR email_address COLLATE NOCASE = $accountFilter
+                   OR CAST(id AS TEXT) = $accountFilter;
+                """;
+            AddParameter(command, "$accountFilter", filter.Trim());
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+                accountIds.Add(reader.GetInt32(0));
+        }
+
+        return accountIds.Order().ToList();
+    }
+
+    private static bool HasValues(IReadOnlyList<string> values) =>
+        values is not null && values.Any(value => !string.IsNullOrWhiteSpace(value));
 
     private static void AddParameter(SqliteCommand command, string name, object value)
     {
@@ -1036,5 +1338,50 @@ internal sealed class EmailDatabase
             name TEXT NOT NULL,
             applied_at TEXT NOT NULL
         );
+        """;
+
+    private const string SearchMessagesSql = """
+        SELECT
+            m.id AS message_id,
+            a.name AS account_name,
+            (
+                SELECT group_concat(folder_path, ', ')
+                FROM (
+                    SELECT DISTINCT f.path AS folder_path
+                    FROM message_locations ml
+                    JOIN folders f ON f.id = ml.folder_id
+                    WHERE ml.message_id = m.id
+                      AND ml.deleted_locally = 0
+                      AND ml.expunged = 0
+                    ORDER BY f.path COLLATE NOCASE
+                )
+            ) AS folders,
+            COALESCE(m.date_sent, m.date_received) AS message_date,
+            m.from_name,
+            m.from_email,
+            m.subject,
+            m.has_attachments,
+            snippet(messages_fts, -1, '[', ']', ' ... ', $snippetTokens) AS snippet,
+            bm25(messages_fts) AS score
+        FROM messages_fts
+        JOIN message_search_docs d ON d.message_id = messages_fts.rowid
+        JOIN messages m ON m.id = d.message_id
+        JOIN accounts a ON a.id = m.account_id
+        WHERE messages_fts MATCH $fts
+        {AND
+            {m.account_id :accountIds}
+            {m.from_email COLLATE NOCASE :fromEmail}
+            {m.has_attachments :hasAttachments}
+            {EXISTS (
+                SELECT 1
+                FROM message_locations ml_filter
+                JOIN folders f_filter ON f_filter.id = ml_filter.folder_id
+                WHERE ml_filter.message_id = m.id
+                  AND ml_filter.deleted_locally = 0
+                  AND ml_filter.expunged = 0
+                  {AND {f_filter.role :folderRoles}}
+            )}}
+        ORDER BY score, COALESCE(m.date_sent, m.date_received, '') DESC
+        LIMIT $limit;
         """;
 }

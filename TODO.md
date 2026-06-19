@@ -126,10 +126,30 @@ After metadata sync works, fetch bodies and build the first local search path.
 
 Next work:
 
-- Add `message_bodies`, `message_recipients`, `message_search_docs`, and SQLite FTS5 index tables.
-- Normalize plain text and HTML-to-text enough for reliable search snippets.
-- Implement hit-centered snippets instead of returning message beginnings.
-- Add local `email_search` behavior behind CLI first, then expose via MCP.
+Completed on 2026-06-19:
+
+- Added migration 2, `message_bodies_and_search`, with `message_bodies`, `message_recipients`, `message_search_docs`, and the external-content SQLite FTS5 table `messages_fts`.
+- Added triggers on `message_search_docs` so app-maintained search documents keep `messages_fts` current on insert/update/delete.
+- Added lightweight body normalization: prefer plain text, fall back to readable HTML-to-text, collapse noisy whitespace, and persist To/CC/BCC/Reply-To recipients.
+- Added `sync-bodies` CLI to fetch full message bodies for already-synced message locations and persist bodies/recipients/search docs without exposing message content in command output.
+- Added local `search` CLI as the first `email_search` behavior over message metadata/body FTS. It supports bounded result limits, account filter, sender filter, folder-role filter, attachment metadata filter, sanitized terms/phrases/OR, and SQLite FTS hit-centered snippets.
+- Added `SqlBinder` 1.0.0 for optional search filters, with FTS query text still parsed separately and bound as a normal SQLite parameter.
+- `status` now reports message body and message search-doc counts.
+
+Test result:
+
+- `dotnet build lcemcp.slnx` succeeded on 2026-06-19.
+- `dotnet test lcemcp.slnx` passed with 12 tests on 2026-06-19. Coverage now includes fresh schema v2 initialization, v1-to-v2 migration, already-migrated database preservation, body/search-doc upsert, FTS search, recipient search, stale FTS entry removal on body update, and the prior config/storage idempotence tests.
+- Temp-config CLI `status` smoke test succeeded on 2026-06-19 and created schema version 2 with 0 messages, 0 bodies, and 0 search docs.
+- Bounded live Yahoo body sync succeeded on 2026-06-19 with `sync-bodies --account yahoo --folder Inbox --max-per-folder 3 --batch-size 2`: selected 3, fetched 3, persisted 3, missing 0. Follow-up `status` reported schema version `2 / target 2`, 50 messages, 50 message locations, 3 message bodies, and 3 message search docs.
+- CLI `search` smoke test with a random non-matching token and `--account yahoo --limit 5` succeeded on 2026-06-19 and returned 0 results without printing private snippets.
+
+Next work:
+
+- Run a few local searches against the live indexed Yahoo bodies without recording private snippets in TODO, just counts and whether snippets are usefully hit-centered.
+- Add a local `get-message`/debug read command if needed before MCP exposure, so a synced message can be inspected through bounded, cited local storage rather than ad hoc database queries.
+- Expand body sync after a small live soak: larger bounded runs, body re-fetch/reindex behavior, and error-state handling for messages whose body fetch repeatedly fails.
+- Expose read-only local search through MCP after the stdio walking skeleton lands.
 
 ## 6. Add MCP Walking Skeleton
 
@@ -152,6 +172,7 @@ Next work:
 - Completed on 2026-06-19: Added `tests/LceMcp.Tests` with unit tests for config load/save round trips, config validation errors, and credential target generation without touching the OS credential store.
 - Completed on 2026-06-19: Added SQLite integration tests for schema v2 initialization, prototype rebuild, account/folder upsert idempotence, message metadata upsert idempotence, Message-ID fallback matching, and rollback on failed message-location insert.
 - Completed on 2026-06-19: Updated SQLite integration tests for migration mode. `dotnet test lcemcp.slnx` passed with 10 tests covering fresh migration initialization, already-migrated database preservation, and the previous storage idempotence/rollback behavior.
+- Completed on 2026-06-19: Added migration/search tests for schema version 2 body/search migration, v1-to-v2 migration preservation, body/recipient/search-doc persistence, FTS search, recipient search, and FTS cleanup on body updates. `dotnet test lcemcp.slnx` passed with 12 tests.
 - Add an optional manual IMAP smoke test path that requires a configured real account and is not run by default.
 
 ## 8. Later Milestones
