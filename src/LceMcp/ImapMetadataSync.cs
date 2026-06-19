@@ -25,7 +25,8 @@ internal sealed class ImapMetadataSync
         int maxPerFolder,
         int batchSize,
         CancellationToken cancellationToken,
-        Action<int, int> progress = null)
+        Action<int, int> progress = null,
+        Action beforePersist = null)
     {
         using var client = new ImapClient();
         client.Timeout = 30_000;
@@ -54,7 +55,8 @@ internal sealed class ImapMetadataSync
                 sinceDays,
                 maxPerFolder,
                 batchSize,
-                cancellationToken));
+                cancellationToken,
+                beforePersist));
             completedFolders++;
             progress?.Invoke(completedFolders, folders.Count);
         }
@@ -71,7 +73,8 @@ internal sealed class ImapMetadataSync
         int sinceDays,
         int maxPerFolder,
         int batchSize,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action beforePersist)
     {
         var fetchedCount = 0;
         var missingCount = 0;
@@ -101,6 +104,7 @@ internal sealed class ImapMetadataSync
 
             if (selectedCount == 0)
             {
+                beforePersist?.Invoke();
                 _database.MarkFolderSyncSucceeded(
                     accountId,
                     storedFolder.Id,
@@ -131,6 +135,7 @@ internal sealed class ImapMetadataSync
                 if (batchHighestUid is uint uid && (highestUid is null || uid > highestUid.Value))
                     highestUid = uid;
 
+                beforePersist?.Invoke();
                 persistedCount += _database.UpsertMessageMetadataBatch(
                     accountId,
                     storedFolder.Id,
@@ -162,6 +167,7 @@ internal sealed class ImapMetadataSync
         }
         catch (Exception ex)
         {
+            beforePersist?.Invoke();
             _database.MarkFolderSyncFailed(accountId, storedFolder.Id, ex.Message);
             return new(
                 storedFolder.Path,

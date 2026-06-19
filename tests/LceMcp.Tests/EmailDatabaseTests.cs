@@ -14,8 +14,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Created, status.InitializationKind);
-        Assert.Equal(3, status.SchemaVersion);
-        Assert.Equal(3, status.TargetSchemaVersion);
+        Assert.Equal(4, status.SchemaVersion);
+        Assert.Equal(4, status.TargetSchemaVersion);
         Assert.Equal(0, status.AccountCount);
         Assert.Equal(0, status.FolderCount);
         Assert.Equal(0, status.MessageCount);
@@ -43,6 +43,7 @@ public sealed class EmailDatabaseTests
             "messages",
             "messages_fts",
             "schema_migrations",
+            "sync_leases",
             "sync_runs",
             "sync_state"
         })
@@ -59,8 +60,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Opened, status.InitializationKind);
-        Assert.Equal(3, status.SchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness"], ReadNames(
+        Assert.Equal(4, status.SchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
     }
@@ -89,15 +90,18 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Migrated, status.InitializationKind);
-        Assert.Equal(3, status.SchemaVersion);
-        Assert.Equal(3, status.TargetSchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness"], ReadNames(
+        Assert.Equal(4, status.SchemaVersion);
+        Assert.Equal(4, status.TargetSchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
         Assert.Contains("message_search_docs", ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;"));
         Assert.Contains("sync_runs", ReadNames(
+            temp.Paths.DatabasePath,
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;"));
+        Assert.Contains("sync_leases", ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;"));
     }
@@ -398,15 +402,16 @@ public sealed class EmailDatabaseTests
         var database = new EmailDatabase(temp.Paths);
         var accountId = database.UpsertConfiguredAccount(TestData.Account());
 
-        var syncRunId = database.StartSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
+        var syncRun = database.StartOrQueueSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
         var active = database.ReadActiveSyncRun();
 
-        database.UpdateSyncRunProgress(syncRunId, done: 3, total: 10);
+        database.UpdateSyncRunProgress(syncRun.Id, syncRun.OwnerId, done: 3, total: 10);
         var progressed = database.ReadActiveSyncRun();
 
-        database.CompleteSyncRun(syncRunId, succeeded: true, done: 10, total: 10, lastError: null);
+        database.CompleteSyncRun(syncRun.Id, syncRun.OwnerId, succeeded: true, done: 10, total: 10, lastError: null);
 
-        Assert.Equal(syncRunId, active.Id);
+        Assert.True(syncRun.Acquired);
+        Assert.Equal(syncRun.Id, active.Id);
         Assert.Equal("running", active.Status);
         Assert.Equal("syncing_bodies", active.Phase);
         Assert.Equal(10, active.Total);
@@ -416,31 +421,216 @@ public sealed class EmailDatabaseTests
     }
 
     [Fact]
-    public void ReadActiveSyncRunMarksStaleRunsFailed()
+    public void SecondSyncRunQueuesUntilActiveLeaseCompletes()
     {
         using var temp = TempWorkspace.Create();
         var database = new EmailDatabase(temp.Paths);
         var accountId = database.UpsertConfiguredAccount(TestData.Account());
-        var syncRunId = database.StartSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
+
+        var first = database.StartOrQueueSyncRun(accountId, "yahoo", "Inbox", "syncing_metadata", total: 1);
+        var second = database.StartOrQueueSyncRun(accountId, "yahoo", "Sent", "syncing_metadata", total: 1);
+        var prematureClaim = database.TryClaimQueuedSyncRun(second.Id, second.OwnerId);
+
+        database.CompleteSyncRun(first.Id, first.OwnerId, succeeded: true, done: 1, total: 1, lastError: null);
+        var claimed = database.TryClaimQueuedSyncRun(second.Id, second.OwnerId);
+
+        Assert.True(first.Acquired);
+        Assert.False(second.Acquired);
+        Assert.Equal("queued", second.Status);
+        Assert.False(prematureClaim.Acquired);
+        Assert.True(claimed.Acquired);
+        Assert.Equal(second.Id, claimed.Id);
+        Assert.Equal("running", database.ReadActiveSyncRun().Status);
+    }
+
+    [Fact]
+    public void OldProgressDoesNotFailRunWhileLeaseIsAlive()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        var syncRun = database.StartOrQueueSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
         var staleTimestamp = DateTimeOffset.UtcNow.AddHours(-7).ToString("O");
 
         ExecuteNonQuery(
             temp.Paths.DatabasePath,
             $"""
             UPDATE sync_runs
-            SET
-                started_at = '{staleTimestamp}',
-                last_progress_at = '{staleTimestamp}'
-            WHERE id = '{syncRunId}';
+            SET last_progress_at = '{staleTimestamp}'
+            WHERE id = '{syncRun.Id}';
             """);
 
         var active = database.ReadActiveSyncRun();
         var row = ReadNullableNames(
             temp.Paths.DatabasePath,
-            "SELECT status || '|' || COALESCE(last_error, '') FROM sync_runs WHERE id = (SELECT id FROM sync_runs LIMIT 1);").Single();
+            $"SELECT status || '|' || COALESCE(last_error, '') FROM sync_runs WHERE id = '{syncRun.Id}';").Single();
+
+        Assert.Equal(syncRun.Id, active.Id);
+        Assert.Equal("running", active.Status);
+        Assert.Equal("running|", row);
+    }
+
+    [Fact]
+    public void ExpiredLeaseMarksRunningSyncFailed()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        var syncRun = database.StartOrQueueSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
+        var expiredTimestamp = DateTimeOffset.UtcNow.AddMinutes(-5).ToString("O");
+
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE sync_leases
+            SET lease_expires_at = '{expiredTimestamp}'
+            WHERE sync_run_id = '{syncRun.Id}';
+            """);
+
+        var active = database.ReadActiveSyncRun();
+        var row = ReadNullableNames(
+            temp.Paths.DatabasePath,
+            $"SELECT status || '|' || COALESCE(last_error, '') FROM sync_runs WHERE id = '{syncRun.Id}';").Single();
 
         Assert.Null(active);
-        Assert.StartsWith("failed|Sync run became stale", row);
+        Assert.StartsWith("failed|Sync lease expired", row);
+    }
+
+    [Fact]
+    public void ExpiredRunningLeaseAllowsQueuedRunToClaim()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        var first = database.StartOrQueueSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
+        var second = database.StartOrQueueSyncRun(accountId, "yahoo", "Sent", "syncing_bodies", total: 5);
+        var expiredTimestamp = DateTimeOffset.UtcNow.AddMinutes(-5).ToString("O");
+
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE sync_leases
+            SET lease_expires_at = '{expiredTimestamp}'
+            WHERE sync_run_id = '{first.Id}';
+            """);
+
+        var claimed = database.TryClaimQueuedSyncRun(second.Id, second.OwnerId);
+        var rows = ReadNullableNames(
+            temp.Paths.DatabasePath,
+            $"""
+            SELECT id || '|' || status || '|' || COALESCE(last_error, '')
+            FROM sync_runs
+            WHERE id IN ('{first.Id}', '{second.Id}')
+            ORDER BY id;
+            """);
+
+        Assert.True(claimed.Acquired);
+        Assert.Equal(second.Id, claimed.Id);
+        Assert.Contains(rows, row => row.StartsWith($"{first.Id}|failed|Sync lease expired"));
+        Assert.Contains(rows, row => row == $"{second.Id}|running|");
+    }
+
+    [Fact]
+    public void ExpiredHeartbeatCannotReviveLease()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        var syncRun = database.StartOrQueueSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
+        var expiredTimestamp = DateTimeOffset.UtcNow.AddMinutes(-5).ToString("O");
+
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE sync_leases
+            SET lease_expires_at = '{expiredTimestamp}'
+            WHERE sync_run_id = '{syncRun.Id}';
+            """);
+
+        var heartbeat = database.HeartbeatSyncLease(syncRun.Id, syncRun.OwnerId);
+        var ownsLease = database.OwnsActiveSyncLease(syncRun.Id, syncRun.OwnerId);
+
+        Assert.False(heartbeat);
+        Assert.False(ownsLease);
+    }
+
+    [Fact]
+    public void AbandonedQueuedRunDoesNotBlockLaterQueuedRunAfterStaleWindow()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        var first = database.StartOrQueueSyncRun(accountId, "yahoo", "Inbox", "syncing_metadata", total: 1);
+        var abandoned = database.StartOrQueueSyncRun(accountId, "yahoo", "Archive", "syncing_metadata", total: 1);
+        var later = database.StartOrQueueSyncRun(accountId, "yahoo", "Sent", "syncing_metadata", total: 1);
+        var staleQueuedTimestamp = DateTimeOffset.UtcNow.AddMinutes(-10).ToString("O");
+
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE sync_runs
+            SET last_progress_at = '{staleQueuedTimestamp}'
+            WHERE id = '{abandoned.Id}';
+            """);
+
+        database.CompleteSyncRun(first.Id, first.OwnerId, succeeded: true, done: 1, total: 1, lastError: null);
+        var claimed = database.TryClaimQueuedSyncRun(later.Id, later.OwnerId);
+        var abandonedRow = ReadNullableNames(
+            temp.Paths.DatabasePath,
+            $"SELECT status || '|' || COALESCE(last_error, '') FROM sync_runs WHERE id = '{abandoned.Id}';").Single();
+
+        Assert.True(claimed.Acquired);
+        Assert.Equal(later.Id, claimed.Id);
+        Assert.StartsWith("failed|Queued sync run became stale", abandonedRow);
+    }
+
+    [Fact]
+    public void WrongOwnerCannotHeartbeatProgressOrCompleteRun()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        var syncRun = database.StartOrQueueSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
+        var wrongOwner = $"{syncRun.OwnerId}-wrong";
+
+        var heartbeat = database.HeartbeatSyncLease(syncRun.Id, wrongOwner);
+        var progressed = database.UpdateSyncRunProgress(syncRun.Id, wrongOwner, done: 5, total: 10);
+        var completed = database.CompleteSyncRun(syncRun.Id, wrongOwner, succeeded: true, done: 10, total: 10, lastError: null);
+        var active = database.ReadActiveSyncRun();
+
+        Assert.False(heartbeat);
+        Assert.False(progressed);
+        Assert.False(completed);
+        Assert.Equal(syncRun.Id, active.Id);
+        Assert.Equal("running", active.Status);
+        Assert.Equal(0, active.Done);
+    }
+
+    [Fact]
+    public void StaleOwnerCannotCompleteRunAfterLeaseExpires()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        var syncRun = database.StartOrQueueSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
+        var expiredTimestamp = DateTimeOffset.UtcNow.AddMinutes(-5).ToString("O");
+
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE sync_leases
+            SET lease_expires_at = '{expiredTimestamp}'
+            WHERE sync_run_id = '{syncRun.Id}';
+            """);
+
+        database.ReadActiveSyncRun();
+        var completed = database.CompleteSyncRun(syncRun.Id, syncRun.OwnerId, succeeded: true, done: 10, total: 10, lastError: null);
+        var row = ReadNullableNames(
+            temp.Paths.DatabasePath,
+            $"SELECT status || '|' || COALESCE(last_error, '') FROM sync_runs WHERE id = '{syncRun.Id}';").Single();
+
+        Assert.False(completed);
+        Assert.StartsWith("failed|Sync lease expired", row);
     }
 
     private static string[] ReadNames(string databasePath, string sql)

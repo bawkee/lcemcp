@@ -6,7 +6,8 @@ internal static class DatabaseMigrations
     [
         new(1, "initial_metadata_cache", InitialSchemaSql),
         new(2, "message_bodies_and_search", BodySearchSchemaSql),
-        new(3, "sync_runs_and_search_readiness", SyncRunsAndReadinessSql)
+        new(3, "sync_runs_and_search_readiness", SyncRunsAndReadinessSql),
+        new(4, "sync_queue_and_leases", SyncQueueAndLeasesSql)
     ];
 
     public static int TargetVersion => All.Select(migration => migration.Version).DefaultIfEmpty(0).Max();
@@ -216,5 +217,27 @@ internal static class DatabaseMigrations
 
         CREATE INDEX IF NOT EXISTS idx_sync_runs_status_progress ON sync_runs(status, last_progress_at);
         CREATE INDEX IF NOT EXISTS idx_sync_runs_account_progress ON sync_runs(account_id, last_progress_at);
+        """;
+
+    public const string SyncQueueAndLeasesSql = """
+        ALTER TABLE sync_runs ADD COLUMN scope_key TEXT NOT NULL DEFAULT 'global';
+        ALTER TABLE sync_runs ADD COLUMN requested_at TEXT;
+        ALTER TABLE sync_runs ADD COLUMN owner_id TEXT;
+
+        UPDATE sync_runs
+        SET requested_at = started_at
+        WHERE requested_at IS NULL;
+
+        CREATE TABLE IF NOT EXISTS sync_leases (
+            scope_key TEXT PRIMARY KEY,
+            sync_run_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            FOREIGN KEY(sync_run_id) REFERENCES sync_runs(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sync_runs_scope_status ON sync_runs(scope_key, status, requested_at);
+        CREATE INDEX IF NOT EXISTS idx_sync_leases_expires ON sync_leases(lease_expires_at);
         """;
 }

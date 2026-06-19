@@ -749,7 +749,51 @@ CREATE TABLE sync_state (
 );
 ```
 
-### 11.10 drafts
+### 11.10 sync_runs and sync_leases
+
+`sync_runs` is durable user-visible job history. It is not itself the concurrency primitive.
+
+```sql
+CREATE TABLE sync_runs (
+    id TEXT PRIMARY KEY,
+    scope_key TEXT NOT NULL DEFAULT 'global',
+    account_id INTEGER,
+    account_name TEXT NOT NULL,
+    folder_filter TEXT,
+    owner_id TEXT,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0,
+    requested_at TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    last_progress_at TEXT NOT NULL,
+    completed_at TEXT,
+    last_error TEXT,
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_sync_runs_scope_status ON sync_runs(scope_key, status, requested_at);
+CREATE INDEX idx_sync_runs_status_progress ON sync_runs(status, last_progress_at);
+CREATE INDEX idx_sync_runs_account_progress ON sync_runs(account_id, last_progress_at);
+```
+
+`sync_leases` is the authority for who may perform sync work. For v1, use a single global sync scope so only one sync operation runs at a time. Parallel per-account sync can be added later by changing the scope key without changing the client-facing MCP contract.
+
+```sql
+CREATE TABLE sync_leases (
+    scope_key TEXT PRIMARY KEY,
+    sync_run_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    FOREIGN KEY(sync_run_id) REFERENCES sync_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_sync_leases_expires ON sync_leases(lease_expires_at);
+```
+
+### 11.11 drafts
 
 Drafts are not required in v1.
 
@@ -772,7 +816,7 @@ CREATE TABLE drafts (
 );
 ```
 
-### 11.11 audit_log
+### 11.12 audit_log
 
 ```sql
 CREATE TABLE audit_log (
@@ -1171,7 +1215,45 @@ When an MCP client provides a progress token and the server stack supports progr
 
 ETA values are best-effort. They should be calculated from observed progress over time and should expose low confidence early in a run or when provider throttling/body sizes make throughput unstable.
 
-#### 14.3.3 LLM Client Guidance
+#### 14.3.3 Sync Queue And Lease Ownership
+
+MCP stdio clients commonly launch the server as a subprocess. Multiple harnesses, windows, or chat sessions may therefore create multiple local server processes that point at the same SQLite database and provider accounts. The sync engine must not rely on there being only one process.
+
+For v1, sync coordination should be deliberately conservative:
+
+```text
+one global sync scope
+one active sync lease at a time
+queued sync runs wait behind the active lease
+heartbeat-based crash recovery
+owner-checked progress/completion
+```
+
+`sync_runs` records user-visible work and progress. It may contain `queued`, `running`, `succeeded`, `failed`, and `canceled` rows. A `queued` or `running` row alone does not prove ownership.
+
+`sync_leases` is the authority. A process may perform sync work only while it owns an unexpired lease for the relevant scope. The first implementation should use a single `global` scope because safety and user experience matter more than parallelism. Later, per-account scopes may be introduced if provider behavior and DB contention are understood.
+
+Lease acquisition must be atomic:
+
+```text
+1. Open SQLite with a busy timeout.
+2. Start an immediate write transaction.
+3. Mark expired leases as failed and release them.
+4. If an unexpired lease exists, enqueue or return the existing queued/running run.
+5. If no lease exists, claim the oldest queued run or create a new running run.
+6. Insert/update the lease with owner_id, heartbeat_at, and lease_expires_at.
+7. Commit.
+```
+
+The owner should heartbeat the lease independently from user-visible progress. A slow IMAP call may delay progress counts, but liveness should be based on the lease heartbeat rather than `sync_runs.last_progress_at`.
+
+Completion and cancellation must be owner-checked. A process that lost its lease due to expiry must not later mark the run succeeded or overwrite a newer owner's state. Stale owners should be allowed to finish their in-memory cleanup, but database completion should be ignored unless the lease still matches the same `sync_run_id` and `owner_id`.
+
+Crash recovery should operate on leases, not on progress rows. If a process dies, its heartbeat stops; after the lease expires, another process may mark that run failed and claim the next queued run. Do not infer that a live run crashed merely because progress counts have not changed recently.
+
+`email_sync_now` should not block indefinitely. If it starts work, it returns the running run ID. If another process already owns the lease, it returns the active or queued run ID plus progress/status so the client can poll `email_get_sync_status`.
+
+#### 14.3.4 LLM Client Guidance
 
 Tool descriptions and MCP documentation should instruct LLM clients to:
 
@@ -1745,6 +1827,24 @@ Output:
     "elapsed_seconds": 60,
     "estimated_remaining_seconds": 540,
     "estimate_confidence": "low"
+  }
+}
+```
+
+If another process already owns the sync lease, the tool should return the active or queued run rather than starting duplicate provider work:
+
+```json
+{
+  "accepted": true,
+  "sync_run_id": "sync-20260617-172500",
+  "status": "queued",
+  "active_sync_run_id": "sync-20260617-172100",
+  "message": "A sync is already running; this request is queued.",
+  "progress": {
+    "phase": "syncing_metadata",
+    "done": 3,
+    "total": 16,
+    "percent": 19
   }
 }
 ```

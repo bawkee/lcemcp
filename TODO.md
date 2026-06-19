@@ -139,9 +139,12 @@ Completed on 2026-06-19:
 - Added message-search readiness computation for account/sender/folder-role/attachment scopes. It reports metadata messages, indexed bodies, search-doc rows, FTS rows, pending bodies, complete metadata folders, and active sync-run progress.
 - CLI `search` now returns `not_synced` and does not run FTS when the requested corpus is incomplete. `--allow-partial` is available as an explicit debug opt-in.
 - CLI `sync` and `sync-bodies` now create durable sync-run records with phase, status, progress counts, elapsed/ETA fields, last error, and cancellation cleanup. Metadata sync updates progress by folder; body sync updates progress by pending message body target.
-- Stale `queued`/`running` sync runs are reconciled to `failed` after 6 hours without progress when status/readiness paths inspect sync state. This prevents crash-abandoned runs from looking active forever without killing a legitimate sync that another process is still updating.
 - Refactored SqlBinder usage from manual `Query.GetSql()` / `SqlParameters` copying to `DbQuery.CreateCommand()` with custom bracket placeholders. Raw SQLite parameters such as `$fts`, `$limit`, and `$snippetTokens` remain explicit app-owned parameters.
 - `status` now prints message-search readiness and active sync-run progress.
+- Added migration 4, `sync_queue_and_leases`, to replace naive progress-staleness cleanup with a lease-backed global sync queue. `sync_runs` now records scope/request/owner metadata, while `sync_leases` is the authority for who may sync.
+- `sync` and `sync-bodies` now acquire a global sync lease before touching IMAP. A second process queues and waits its turn instead of starting duplicate provider work. Running syncs heartbeat the lease independently from progress counters.
+- Expired sync leases are marked failed and released for crash recovery. Old `last_progress_at` alone no longer fails a run, and stale owners cannot mark a run succeeded after losing their lease.
+- Follow-up sanity review tightened lease enforcement: expired leases cannot be heartbeated back to life, progress/completion failures now stop CLI success reporting, and IMAP sync paths check lease ownership before persisting fetched data or folder failure state.
 
 Test result:
 
@@ -155,6 +158,10 @@ Test result:
 - Temp-config CLI `status` smoke test succeeded on 2026-06-19 and created schema version 3 with message search readiness `not_synced` for an empty config.
 - Temp-config CLI `search --query smoke --limit 5` smoke test succeeded on 2026-06-19 and returned `Search status: not_synced` / `Search results: not run`, without treating the empty incomplete corpus as a normal empty result.
 - Temp-config CLI `search --query smoke --limit 5 --allow-partial` smoke test succeeded on 2026-06-19 after the `DbQuery` refactor and executed the FTS path with 0 results.
+- `dotnet build lcemcp.slnx` succeeded on 2026-06-19 after sync lease/queue changes.
+- `dotnet test lcemcp.slnx` passed with 19 tests on 2026-06-19. New coverage includes schema v4 initialization/migration, queued second sync runs, old progress with a live lease, expired lease recovery, and stale-owner completion refusal.
+- Temp-config CLI `status` smoke test succeeded on 2026-06-19 and created schema version `4 / target 4` with no configured accounts.
+- Sync lease sanity review on 2026-06-19 found and fixed two safety gaps: expired heartbeat revival and ignored owner-check failures in CLI progress/completion. `dotnet test lcemcp.slnx` passed with 23 tests, adding coverage for expired-running-lease crash recovery into a queued successor, expired heartbeat refusal, abandoned queued-run recovery, and wrong-owner heartbeat/progress/completion refusal. A temp-config CLI `status` smoke test still created schema version `4 / target 4`.
 
 Design decision on 2026-06-19:
 
@@ -162,6 +169,7 @@ Design decision on 2026-06-19:
 - Do not rely on partial search as default behavior. Partial search may exist later only as an explicit/debug opt-in such as `allow_partial: true`, and must label results as incomplete.
 - Long-running sync should be durable and observable. `email_sync_now` should start/resume a sync run, return a `sync_run_id`, and expose phase/progress/elapsed/ETA/estimate-confidence through `email_get_sync_status`. MCP progress notifications can be used when available, but pollable status is the real contract because LLM harness support varies.
 - LLM-facing tool descriptions should tell clients to check `email_get_sync_status`, trigger sync if needed, poll at reasonable intervals, and treat `not_synced` as "search not ready", never as evidence that no matching email exists.
+- Sync liveness is based on `sync_leases` heartbeat/expiry, not `sync_runs.last_progress_at`. For v1, use one global sync scope for safety; per-account concurrent sync can be considered later after the MCP surface and provider behavior are better understood.
 
 Next work:
 
@@ -179,10 +187,9 @@ Next work:
 - Add the MCP stdio server command: `serve`.
 - Ensure diagnostics/logging go to stderr so JSON-RPC stdout stays clean.
 - Start with `email_get_sync_status`, including binary search readiness and sync-run progress fields before exposing search.
-- Add cross-process sync coordination before exposing `email_sync_now`. Stdio MCP clients can launch separate server processes, and current `sync_runs` rows are observable status, not a lease/mutex. A second process should return the active run or claim an expired lease instead of starting overlapping IMAP sync for the same account/scope.
 - Add read-only tools in this order: `email_list_accounts`, `email_list_folders`, `email_search`, `email_get_message`, `email_sync_now`.
 - `email_search` must return `not_synced` rather than empty results when the requested corpus is not fully indexed.
-- `email_sync_now` should return a durable run/status id and progress instead of blocking indefinitely.
+- `email_sync_now` should use the lease-backed queue but return a durable queued/running run/status id and progress instead of waiting like the CLI commands do.
 - Log every MCP call to `audit_log`.
 
 ## 7. Add Focused Tests
@@ -196,6 +203,8 @@ Next work:
 - Completed on 2026-06-19: Updated SQLite integration tests for migration mode. `dotnet test lcemcp.slnx` passed with 10 tests covering fresh migration initialization, already-migrated database preservation, and the previous storage idempotence/rollback behavior.
 - Completed on 2026-06-19: Added migration/search tests for schema version 2 body/search migration, v1-to-v2 migration preservation, body/recipient/search-doc persistence, FTS search, recipient search, and FTS cleanup on body updates. `dotnet test lcemcp.slnx` passed with 12 tests.
 - Completed on 2026-06-19: Added readiness/sync-run tests for schema version 3, binary search readiness, capped metadata detection, active sync-run progress, and stale sync-run reconciliation. `dotnet test lcemcp.slnx` passed with 16 tests.
+- Completed on 2026-06-19: Added sync lease/queue tests for schema version 4, queued second run behavior, old progress with live lease, expired lease recovery, and stale owner completion refusal. `dotnet test lcemcp.slnx` passed with 19 tests.
+- Completed on 2026-06-19: Expanded sync lease tests after review to cover expired heartbeat refusal, queued successor claim after a crashed running owner, abandoned queued-run cleanup, and wrong-owner heartbeat/progress/completion refusal. `dotnet test lcemcp.slnx` passed with 23 tests.
 - Add an optional manual IMAP smoke test path that requires a configured real account and is not run by default.
 
 ## 8. Later Milestones

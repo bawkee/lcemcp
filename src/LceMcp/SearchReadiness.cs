@@ -23,6 +23,7 @@ internal sealed record MessageSearchReadiness(
 
 internal sealed record SyncRunSnapshot(
     string Id,
+    string ScopeKey,
     string AccountName,
     string FolderFilter,
     string Status,
@@ -37,3 +38,11 @@ internal sealed record SyncRunSnapshot(
     string LastProgressAt,
     string CompletedAt,
     string LastError);
+
+internal sealed record SyncRunStartResult(
+    string Id,
+    string ScopeKey,
+    string OwnerId,
+    string Status,
+    bool Acquired,
+    SyncRunSnapshot ActiveRun);

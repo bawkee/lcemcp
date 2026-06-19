@@ -19,7 +19,8 @@ internal sealed class ImapBodySync
         int maxPerFolder,
         int batchSize,
         CancellationToken cancellationToken,
-        Action<int, int> progress = null)
+        Action<int, int> progress = null,
+        Action beforePersist = null)
     {
         var targets = _database.ReadPendingBodySyncTargets(account.Id, folderFilter, maxPerFolder);
         if (targets.Count == 0)
@@ -51,6 +52,7 @@ internal sealed class ImapBodySync
                 folderTargets,
                 batchSize,
                 cancellationToken,
+                beforePersist,
                 () =>
                 {
                     completedTargets++;
@@ -69,6 +71,7 @@ internal sealed class ImapBodySync
         IReadOnlyList<BodySyncTarget> targets,
         int batchSize,
         CancellationToken cancellationToken,
+        Action beforePersist,
         Action progress)
     {
         var fetchedCount = 0;
@@ -104,6 +107,7 @@ internal sealed class ImapBodySync
                         fetchedCount++;
 
                         var body = MessageBodyNormalizer.FromMimeMessage(target.MessageId, message);
+                        beforePersist?.Invoke();
                         _database.UpsertMessageBody(body);
                         persistedCount++;
                     }

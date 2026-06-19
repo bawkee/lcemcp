@@ -8,6 +8,7 @@ namespace LceMcp;
 internal sealed class EmailDatabase
 {
     private readonly AppPaths _paths;
+    private const string GlobalSyncScopeKey = "global";
 
     public EmailDatabase(AppPaths paths)
     {
@@ -304,7 +305,7 @@ internal sealed class EmailDatabase
 
         using var connection = OpenConnection();
         var accountIds = ResolveAccountIds(connection, request.AccountFilters);
-        ReconcileStaleSyncRuns(connection);
+        ReconcileExpiredSyncWork(connection, DateTimeOffset.UtcNow);
         var activeSyncRun = ReadActiveSyncRun(connection);
 
         if (HasValues(request.AccountFilters) && accountIds.Count == 0)
@@ -354,7 +355,7 @@ internal sealed class EmailDatabase
             ActiveSyncRun: activeSyncRun);
     }
 
-    public string StartSyncRun(
+    public SyncRunStartResult StartOrQueueSyncRun(
         int? accountId,
         string accountName,
         string folderFilter,
@@ -364,51 +365,133 @@ internal sealed class EmailDatabase
         EnsureInitialized();
 
         using var connection = OpenConnection();
-        ReconcileStaleSyncRuns(connection);
-        var now = DateTimeOffset.UtcNow.ToString("O");
-        var syncRunId = BuildSyncRunId();
+        var ownerId = BuildSyncOwnerId();
 
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO sync_runs (
-                id,
-                account_id,
-                account_name,
-                folder_filter,
-                status,
+        return RunInImmediateTransaction(connection, () =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            ReconcileExpiredSyncWork(connection, now);
+
+            var hasActiveLease = HasActiveSyncLease(connection, GlobalSyncScopeKey, now);
+            var hasQueuedRun = HasQueuedSyncRun(connection, GlobalSyncScopeKey);
+            var status = hasActiveLease || hasQueuedRun ? "queued" : "running";
+            var syncRunId = InsertSyncRun(
+                connection,
+                accountId,
+                accountName,
+                folderFilter,
                 phase,
-                done,
-                total,
-                started_at,
-                last_progress_at
-            )
-            VALUES (
-                $id,
-                $accountId,
-                $accountName,
-                $folderFilter,
-                'running',
-                $phase,
-                0,
-                $total,
-                $startedAt,
-                $lastProgressAt
-            );
-            """;
-        AddParameter(command, "$id", syncRunId);
-        AddParameter(command, "$accountId", accountId);
-        AddParameter(command, "$accountName", BlankToNull(accountName) ?? "(unknown)");
-        AddParameter(command, "$folderFilter", BlankToNull(folderFilter));
-        AddParameter(command, "$phase", phase);
-        AddParameter(command, "$total", Math.Max(0, total));
-        AddParameter(command, "$startedAt", now);
-        AddParameter(command, "$lastProgressAt", now);
-        command.ExecuteNonQuery();
+                Math.Max(0, total),
+                ownerId,
+                GlobalSyncScopeKey,
+                status,
+                now);
 
-        return syncRunId;
+            if (status == "running")
+                InsertSyncLease(connection, GlobalSyncScopeKey, syncRunId, ownerId, now);
+
+            return new SyncRunStartResult(
+                syncRunId,
+                GlobalSyncScopeKey,
+                ownerId,
+                status,
+                Acquired: status == "running",
+                ActiveRun: ReadActiveSyncRun(connection));
+        });
     }
 
-    public void UpdateSyncRunProgress(string syncRunId, int done, int total)
+    public SyncRunStartResult TryClaimQueuedSyncRun(string syncRunId, string ownerId)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+
+        return RunInImmediateTransaction(connection, () =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            ReconcileExpiredSyncWork(connection, now);
+            HeartbeatQueuedSyncRun(connection, syncRunId, ownerId, now);
+
+            var run = ReadSyncRunSnapshot(connection, syncRunId);
+            if (run is null)
+            {
+                return new SyncRunStartResult(
+                    syncRunId,
+                    GlobalSyncScopeKey,
+                    ownerId,
+                    "missing",
+                    Acquired: false,
+                    ActiveRun: ReadActiveSyncRun(connection));
+            }
+
+            if (!run.Status.Equals("queued", StringComparison.OrdinalIgnoreCase))
+            {
+                return new SyncRunStartResult(
+                    syncRunId,
+                    run.ScopeKey,
+                    ownerId,
+                    run.Status,
+                    Acquired: HasMatchingSyncLease(connection, run.ScopeKey, syncRunId, ownerId, now),
+                    ActiveRun: ReadActiveSyncRun(connection));
+            }
+
+            if (HasActiveSyncLease(connection, run.ScopeKey, now)
+                || !IsOldestQueuedSyncRun(connection, run.ScopeKey, syncRunId))
+            {
+                return new SyncRunStartResult(
+                    syncRunId,
+                    run.ScopeKey,
+                    ownerId,
+                    "queued",
+                    Acquired: false,
+                    ActiveRun: ReadActiveSyncRun(connection));
+            }
+
+            MarkSyncRunRunning(connection, syncRunId, ownerId, now);
+            InsertSyncLease(connection, run.ScopeKey, syncRunId, ownerId, now);
+
+            return new SyncRunStartResult(
+                syncRunId,
+                run.ScopeKey,
+                ownerId,
+                "running",
+                Acquired: true,
+                ActiveRun: ReadSyncRunSnapshot(connection, syncRunId));
+        });
+    }
+
+    public bool HeartbeatSyncLease(string syncRunId, string ownerId)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        var now = DateTimeOffset.UtcNow;
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE sync_leases
+            SET
+                heartbeat_at = $heartbeatAt,
+                lease_expires_at = $leaseExpiresAt
+            WHERE sync_run_id = $syncRunId
+              AND owner_id = $ownerId
+              AND lease_expires_at >= $heartbeatAt;
+            """;
+        AddParameter(command, "$syncRunId", syncRunId);
+        AddParameter(command, "$ownerId", ownerId);
+        AddParameter(command, "$heartbeatAt", now.ToString("O"));
+        AddParameter(command, "$leaseExpiresAt", now.Add(SyncLeaseDuration).ToString("O"));
+        return command.ExecuteNonQuery() > 0;
+    }
+
+    public bool OwnsActiveSyncLease(string syncRunId, string ownerId)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        return HasMatchingSyncLease(connection, GlobalSyncScopeKey, syncRunId, ownerId, DateTimeOffset.UtcNow);
+    }
+
+    public bool UpdateSyncRunProgress(string syncRunId, string ownerId, int done, int total)
     {
         EnsureInitialized();
 
@@ -420,32 +503,44 @@ internal sealed class EmailDatabase
                 done = $done,
                 total = $total,
                 last_progress_at = $lastProgressAt
-            WHERE id = $id;
+            WHERE id = $id
+              AND status = 'running'
+              AND EXISTS (
+                  SELECT 1
+                  FROM sync_leases
+                  WHERE sync_leases.scope_key = sync_runs.scope_key
+                    AND sync_leases.sync_run_id = sync_runs.id
+                    AND sync_leases.owner_id = $ownerId
+                    AND sync_leases.lease_expires_at >= $lastProgressAt
+              );
             """;
         AddParameter(command, "$id", syncRunId);
+        AddParameter(command, "$ownerId", ownerId);
         AddParameter(command, "$done", Math.Max(0, done));
         AddParameter(command, "$total", Math.Max(0, total));
         AddParameter(command, "$lastProgressAt", DateTimeOffset.UtcNow.ToString("O"));
-        command.ExecuteNonQuery();
+        return command.ExecuteNonQuery() > 0;
     }
 
-    public void CompleteSyncRun(
+    public bool CompleteSyncRun(
         string syncRunId,
+        string ownerId,
         bool succeeded,
         int done,
         int total,
         string lastError)
     {
-        FinishSyncRun(syncRunId, succeeded ? "succeeded" : "failed", done, total, lastError);
+        return FinishSyncRun(syncRunId, ownerId, succeeded ? "succeeded" : "failed", done, total, lastError);
     }
 
-    public void CancelSyncRun(string syncRunId, int done, int total)
+    public bool CancelSyncRun(string syncRunId, string ownerId, int done, int total)
     {
-        FinishSyncRun(syncRunId, "canceled", done, total, "canceled");
+        return FinishSyncRun(syncRunId, ownerId, "canceled", done, total, "canceled");
     }
 
-    private void FinishSyncRun(
+    private bool FinishSyncRun(
         string syncRunId,
+        string ownerId,
         string status,
         int done,
         int total,
@@ -454,27 +549,60 @@ internal sealed class EmailDatabase
         EnsureInitialized();
 
         using var connection = OpenConnection();
-        using var command = connection.CreateCommand();
-        var now = DateTimeOffset.UtcNow.ToString("O");
-        command.CommandText = """
-            UPDATE sync_runs
-            SET
-                status = $status,
-                done = $done,
-                total = $total,
-                last_progress_at = $lastProgressAt,
-                completed_at = $completedAt,
-                last_error = $lastError
-            WHERE id = $id;
-            """;
-        AddParameter(command, "$id", syncRunId);
-        AddParameter(command, "$status", status);
-        AddParameter(command, "$done", Math.Max(0, done));
-        AddParameter(command, "$total", Math.Max(0, total));
-        AddParameter(command, "$lastProgressAt", now);
-        AddParameter(command, "$completedAt", now);
-        AddParameter(command, "$lastError", BlankToNull(lastError));
-        command.ExecuteNonQuery();
+        return RunInImmediateTransaction(connection, () =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            ReconcileExpiredSyncWork(connection, now);
+            var run = ReadSyncRunSnapshot(connection, syncRunId);
+            if (run is null)
+                return false;
+
+            var ownsRunningLease = HasMatchingSyncLease(connection, run.ScopeKey, syncRunId, ownerId, now);
+            var ownsQueuedRun = run.Status.Equals("queued", StringComparison.OrdinalIgnoreCase)
+                && run.LastError is null
+                && IsQueuedSyncRunOwner(connection, syncRunId, ownerId);
+
+            if (!ownsRunningLease && !(status == "canceled" && ownsQueuedRun))
+                return false;
+
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = """
+                    UPDATE sync_runs
+                    SET
+                        status = $status,
+                        done = $done,
+                        total = $total,
+                        last_progress_at = $lastProgressAt,
+                        completed_at = $completedAt,
+                        last_error = $lastError
+                    WHERE id = $id
+                      AND status IN ('queued', 'running');
+                    """;
+                AddParameter(command, "$id", syncRunId);
+                AddParameter(command, "$status", status);
+                AddParameter(command, "$done", Math.Max(0, done));
+                AddParameter(command, "$total", Math.Max(0, total));
+                AddParameter(command, "$lastProgressAt", now.ToString("O"));
+                AddParameter(command, "$completedAt", now.ToString("O"));
+                AddParameter(command, "$lastError", BlankToNull(lastError));
+                command.ExecuteNonQuery();
+            }
+
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = """
+                    DELETE FROM sync_leases
+                    WHERE sync_run_id = $syncRunId
+                      AND owner_id = $ownerId;
+                    """;
+                AddParameter(command, "$syncRunId", syncRunId);
+                AddParameter(command, "$ownerId", ownerId);
+                command.ExecuteNonQuery();
+            }
+
+            return true;
+        });
     }
 
     public SyncRunSnapshot ReadActiveSyncRun()
@@ -482,7 +610,7 @@ internal sealed class EmailDatabase
         EnsureInitialized();
 
         using var connection = OpenConnection();
-        ReconcileStaleSyncRuns(connection);
+        ReconcileExpiredSyncWork(connection, DateTimeOffset.UtcNow);
         return ReadActiveSyncRun(connection);
     }
 
@@ -622,9 +750,23 @@ internal sealed class EmailDatabase
         var connection = new SqliteConnection(connectionString);
         connection.Open();
 
-        using var command = connection.CreateCommand();
-        command.CommandText = "PRAGMA foreign_keys = ON;";
-        command.ExecuteNonQuery();
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "PRAGMA busy_timeout = 5000;";
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "PRAGMA journal_mode = WAL;";
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "PRAGMA foreign_keys = ON;";
+            command.ExecuteNonQuery();
+        }
 
         return connection;
     }
@@ -1521,6 +1663,7 @@ internal sealed class EmailDatabase
         command.CommandText = """
             SELECT
                 id,
+                scope_key,
                 account_name,
                 folder_filter,
                 status,
@@ -1533,7 +1676,10 @@ internal sealed class EmailDatabase
                 last_error
             FROM sync_runs
             WHERE status IN ('queued', 'running')
-            ORDER BY last_progress_at DESC
+            ORDER BY
+                CASE status WHEN 'running' THEN 0 ELSE 1 END,
+                COALESCE(requested_at, started_at),
+                id
             LIMIT 1;
             """;
 
@@ -1541,33 +1687,329 @@ internal sealed class EmailDatabase
         return reader.Read() ? ReadSyncRunSnapshot(reader) : null;
     }
 
-    private static void ReconcileStaleSyncRuns(SqliteConnection connection)
+    private static SyncRunSnapshot ReadSyncRunSnapshot(SqliteConnection connection, string syncRunId)
     {
-        var now = DateTimeOffset.UtcNow;
-        var staleBefore = now.Subtract(StaleSyncRunAfter);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                id,
+                scope_key,
+                account_name,
+                folder_filter,
+                status,
+                phase,
+                done,
+                total,
+                started_at,
+                last_progress_at,
+                completed_at,
+                last_error
+            FROM sync_runs
+            WHERE id = $id
+            LIMIT 1;
+            """;
+        AddParameter(command, "$id", syncRunId);
 
+        using var reader = command.ExecuteReader();
+        return reader.Read() ? ReadSyncRunSnapshot(reader) : null;
+    }
+
+    private static void ReconcileExpiredSyncWork(SqliteConnection connection, DateTimeOffset now)
+    {
+        var nowText = now.ToString("O");
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE sync_runs
+                SET
+                    status = 'failed',
+                    last_progress_at = $lastProgressAt,
+                    completed_at = $completedAt,
+                    last_error = $lastError
+                WHERE status = 'running'
+                  AND id IN (
+                      SELECT sync_run_id
+                      FROM sync_leases
+                      WHERE lease_expires_at < $now
+                  );
+                """;
+            AddParameter(command, "$lastProgressAt", nowText);
+            AddParameter(command, "$completedAt", nowText);
+            AddParameter(
+                command,
+                "$lastError",
+                $"Sync lease expired after no heartbeat for {SyncLeaseDuration.TotalMinutes:0.#} minutes; marking failed.");
+            AddParameter(command, "$now", nowText);
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                DELETE FROM sync_leases
+                WHERE lease_expires_at < $now;
+                """;
+            AddParameter(command, "$now", nowText);
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE sync_runs
+                SET
+                    status = 'failed',
+                    last_progress_at = $lastProgressAt,
+                    completed_at = $completedAt,
+                    last_error = $lastError
+                WHERE status = 'queued'
+                  AND owner_id IS NOT NULL
+                  AND last_progress_at < $staleBefore;
+                """;
+            AddParameter(command, "$lastProgressAt", nowText);
+            AddParameter(command, "$completedAt", nowText);
+            AddParameter(
+                command,
+                "$lastError",
+                $"Queued sync run became stale after no heartbeat for {QueuedSyncRunAfter.TotalMinutes:0.#} minutes; marking failed.");
+            AddParameter(command, "$staleBefore", now.Subtract(QueuedSyncRunAfter).ToString("O"));
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static bool HasActiveSyncLease(SqliteConnection connection, string scopeKey, DateTimeOffset now)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT 1
+            FROM sync_leases
+            WHERE scope_key = $scopeKey
+              AND lease_expires_at >= $now
+            LIMIT 1;
+            """;
+        AddParameter(command, "$scopeKey", scopeKey);
+        AddParameter(command, "$now", now.ToString("O"));
+        return command.ExecuteScalar() is not null;
+    }
+
+    private static bool HasMatchingSyncLease(
+        SqliteConnection connection,
+        string scopeKey,
+        string syncRunId,
+        string ownerId,
+        DateTimeOffset now)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT 1
+            FROM sync_leases
+            WHERE scope_key = $scopeKey
+              AND sync_run_id = $syncRunId
+              AND owner_id = $ownerId
+              AND lease_expires_at >= $now
+            LIMIT 1;
+            """;
+        AddParameter(command, "$scopeKey", scopeKey);
+        AddParameter(command, "$syncRunId", syncRunId);
+        AddParameter(command, "$ownerId", ownerId);
+        AddParameter(command, "$now", now.ToString("O"));
+        return command.ExecuteScalar() is not null;
+    }
+
+    private static bool HasQueuedSyncRun(SqliteConnection connection, string scopeKey)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT 1
+            FROM sync_runs
+            WHERE scope_key = $scopeKey
+              AND status = 'queued'
+            LIMIT 1;
+            """;
+        AddParameter(command, "$scopeKey", scopeKey);
+        return command.ExecuteScalar() is not null;
+    }
+
+    private static bool IsOldestQueuedSyncRun(SqliteConnection connection, string scopeKey, string syncRunId)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT id
+            FROM sync_runs
+            WHERE scope_key = $scopeKey
+              AND status = 'queued'
+            ORDER BY COALESCE(requested_at, started_at), id
+            LIMIT 1;
+            """;
+        AddParameter(command, "$scopeKey", scopeKey);
+        var oldest = command.ExecuteScalar() as string;
+        return string.Equals(oldest, syncRunId, StringComparison.Ordinal);
+    }
+
+    private static bool IsQueuedSyncRunOwner(SqliteConnection connection, string syncRunId, string ownerId)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT 1
+            FROM sync_runs
+            WHERE id = $syncRunId
+              AND owner_id = $ownerId
+              AND status = 'queued'
+            LIMIT 1;
+            """;
+        AddParameter(command, "$syncRunId", syncRunId);
+        AddParameter(command, "$ownerId", ownerId);
+        return command.ExecuteScalar() is not null;
+    }
+
+    private static string InsertSyncRun(
+        SqliteConnection connection,
+        int? accountId,
+        string accountName,
+        string folderFilter,
+        string phase,
+        int total,
+        string ownerId,
+        string scopeKey,
+        string status,
+        DateTimeOffset now)
+    {
+        var syncRunId = BuildSyncRunId();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO sync_runs (
+                id,
+                scope_key,
+                account_id,
+                account_name,
+                folder_filter,
+                owner_id,
+                status,
+                phase,
+                done,
+                total,
+                requested_at,
+                started_at,
+                last_progress_at
+            )
+            VALUES (
+                $id,
+                $scopeKey,
+                $accountId,
+                $accountName,
+                $folderFilter,
+                $ownerId,
+                $status,
+                $phase,
+                0,
+                $total,
+                $requestedAt,
+                $startedAt,
+                $lastProgressAt
+            );
+            """;
+        AddParameter(command, "$id", syncRunId);
+        AddParameter(command, "$scopeKey", scopeKey);
+        AddParameter(command, "$accountId", accountId);
+        AddParameter(command, "$accountName", BlankToNull(accountName) ?? "(unknown)");
+        AddParameter(command, "$folderFilter", BlankToNull(folderFilter));
+        AddParameter(command, "$ownerId", ownerId);
+        AddParameter(command, "$status", status);
+        AddParameter(command, "$phase", phase);
+        AddParameter(command, "$total", Math.Max(0, total));
+        AddParameter(command, "$requestedAt", now.ToString("O"));
+        AddParameter(command, "$startedAt", now.ToString("O"));
+        AddParameter(command, "$lastProgressAt", now.ToString("O"));
+        command.ExecuteNonQuery();
+        return syncRunId;
+    }
+
+    private static void MarkSyncRunRunning(
+        SqliteConnection connection,
+        string syncRunId,
+        string ownerId,
+        DateTimeOffset now)
+    {
         using var command = connection.CreateCommand();
         command.CommandText = """
             UPDATE sync_runs
             SET
-                status = 'failed',
+                status = 'running',
+                owner_id = $ownerId,
+                started_at = $startedAt,
                 last_progress_at = $lastProgressAt,
-                completed_at = $completedAt,
-                last_error = $lastError
-            WHERE status IN ('queued', 'running')
-              AND last_progress_at < $staleBefore;
+                completed_at = NULL,
+                last_error = NULL
+            WHERE id = $id
+              AND status = 'queued';
             """;
+        AddParameter(command, "$id", syncRunId);
+        AddParameter(command, "$ownerId", ownerId);
+        AddParameter(command, "$startedAt", now.ToString("O"));
         AddParameter(command, "$lastProgressAt", now.ToString("O"));
-        AddParameter(command, "$completedAt", now.ToString("O"));
-        AddParameter(
-            command,
-            "$lastError",
-            $"Sync run became stale after no progress for {StaleSyncRunAfter.TotalHours:0.#} hours; marking failed.");
-        AddParameter(command, "$staleBefore", staleBefore.ToString("O"));
         command.ExecuteNonQuery();
     }
 
-    private static readonly TimeSpan StaleSyncRunAfter = TimeSpan.FromHours(6);
+    private static void InsertSyncLease(
+        SqliteConnection connection,
+        string scopeKey,
+        string syncRunId,
+        string ownerId,
+        DateTimeOffset now)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO sync_leases (
+                scope_key,
+                sync_run_id,
+                owner_id,
+                heartbeat_at,
+                lease_expires_at
+            )
+            VALUES (
+                $scopeKey,
+                $syncRunId,
+                $ownerId,
+                $heartbeatAt,
+                $leaseExpiresAt
+            )
+            ON CONFLICT(scope_key) DO UPDATE SET
+                sync_run_id = excluded.sync_run_id,
+                owner_id = excluded.owner_id,
+                heartbeat_at = excluded.heartbeat_at,
+                lease_expires_at = excluded.lease_expires_at;
+            """;
+        AddParameter(command, "$scopeKey", scopeKey);
+        AddParameter(command, "$syncRunId", syncRunId);
+        AddParameter(command, "$ownerId", ownerId);
+        AddParameter(command, "$heartbeatAt", now.ToString("O"));
+        AddParameter(command, "$leaseExpiresAt", now.Add(SyncLeaseDuration).ToString("O"));
+        command.ExecuteNonQuery();
+    }
+
+    private static void HeartbeatQueuedSyncRun(
+        SqliteConnection connection,
+        string syncRunId,
+        string ownerId,
+        DateTimeOffset now)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE sync_runs
+            SET last_progress_at = $lastProgressAt
+            WHERE id = $id
+              AND owner_id = $ownerId
+              AND status = 'queued';
+            """;
+        AddParameter(command, "$id", syncRunId);
+        AddParameter(command, "$ownerId", ownerId);
+        AddParameter(command, "$lastProgressAt", now.ToString("O"));
+        command.ExecuteNonQuery();
+    }
+
+    private static readonly TimeSpan SyncLeaseDuration = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan QueuedSyncRunAfter = TimeSpan.FromMinutes(5);
 
     private static SyncRunSnapshot ReadSyncRunSnapshot(SqliteDataReader reader)
     {
@@ -1582,6 +2024,7 @@ internal sealed class EmailDatabase
 
         return new(
             Id: reader.GetString(reader.GetOrdinal("id")),
+            ScopeKey: reader.GetString(reader.GetOrdinal("scope_key")),
             AccountName: reader.GetString(reader.GetOrdinal("account_name")),
             FolderFilter: GetNullableString(reader, "folder_filter"),
             Status: status,
@@ -1642,6 +2085,30 @@ internal sealed class EmailDatabase
         var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmssfff");
         var suffix = Guid.NewGuid().ToString("N")[..8];
         return $"sync-{timestamp}-{suffix}";
+    }
+
+    private static string BuildSyncOwnerId()
+    {
+        var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmssfff");
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        return $"owner-{Environment.ProcessId}-{timestamp}-{suffix}";
+    }
+
+    private static T RunInImmediateTransaction<T>(SqliteConnection connection, Func<T> action)
+    {
+        ExecuteNonQuery(connection, transaction: null, "BEGIN IMMEDIATE;");
+
+        try
+        {
+            var result = action();
+            ExecuteNonQuery(connection, transaction: null, "COMMIT;");
+            return result;
+        }
+        catch
+        {
+            ExecuteNonQuery(connection, transaction: null, "ROLLBACK;");
+            throw;
+        }
     }
 
     private static bool HasValues(IReadOnlyList<string> values) =>

@@ -270,40 +270,51 @@ internal static class CliApp
 
             Console.WriteLine($"Syncing metadata for '{account.Id}' from {folders.Count} folder(s), since_days={sinceDays}, max_per_folder={FormatMaxPerFolder(maxPerFolder)}, batch_size={batchSize}...");
 
-            var syncRunId = database.StartSyncRun(databaseAccountId, account.Id, folderFilter, "syncing_metadata", folders.Count);
-            Console.WriteLine($"Sync run: {syncRunId}");
+            var syncRun = database.StartOrQueueSyncRun(databaseAccountId, account.Id, folderFilter, "syncing_metadata", folders.Count);
+            Console.WriteLine($"Sync run: {syncRun.Id} status={syncRun.Status}");
 
             try
             {
-                var result = await new ImapMetadataSync(database).SyncAccountAsync(
-                    account,
-                    password,
-                    databaseAccountId,
-                    folders,
-                    sinceDays,
-                    maxPerFolder,
-                    batchSize,
-                    cancellationToken,
-                    (done, total) => database.UpdateSyncRunProgress(syncRunId, done, total));
+                syncRun = await WaitForSyncRunLeaseAsync(database, syncRun, cancellationToken);
 
-                var failed = result.Folders.Where(folder => !folder.Succeeded).ToList();
-                database.CompleteSyncRun(
-                    syncRunId,
-                    succeeded: failed.Count == 0,
-                    done: result.Folders.Sum(folder => folder.FetchedCount),
-                    total: result.Folders.Sum(folder => folder.SelectedCount),
-                    lastError: failed.Count == 0 ? null : string.Join("; ", failed.Select(folder => $"{folder.FolderPath}: {folder.Error}")));
+                var result = await RunWithSyncLeaseHeartbeatAsync(database, syncRun, cancellationToken, async () =>
+                {
+                    var syncResult = await new ImapMetadataSync(database).SyncAccountAsync(
+                        account,
+                        password,
+                        databaseAccountId,
+                        folders,
+                        sinceDays,
+                        maxPerFolder,
+                        batchSize,
+                        cancellationToken,
+                        (done, total) => UpdateSyncRunProgressOrThrow(database, syncRun, done, total),
+                        () => ThrowIfSyncLeaseLost(database, syncRun));
+
+                    var failed = syncResult.Folders.Where(folder => !folder.Succeeded).ToList();
+                    var completed = database.CompleteSyncRun(
+                        syncRun.Id,
+                        syncRun.OwnerId,
+                        succeeded: failed.Count == 0,
+                        done: syncResult.Folders.Sum(folder => folder.FetchedCount),
+                        total: syncResult.Folders.Sum(folder => folder.SelectedCount),
+                        lastError: failed.Count == 0 ? null : string.Join("; ", failed.Select(folder => $"{folder.FolderPath}: {folder.Error}")));
+                    if (!completed)
+                        throw new OperationCanceledException("Sync lease was lost.");
+
+                    return syncResult;
+                });
 
                 PrintMetadataSyncResult(result);
             }
             catch (OperationCanceledException)
             {
-                database.CancelSyncRun(syncRunId, done: 0, total: folders.Count);
+                database.CancelSyncRun(syncRun.Id, syncRun.OwnerId, done: 0, total: folders.Count);
                 throw;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                database.CompleteSyncRun(syncRunId, succeeded: false, done: 0, total: folders.Count, lastError: ex.Message);
+                database.CompleteSyncRun(syncRun.Id, syncRun.OwnerId, succeeded: false, done: 0, total: folders.Count, lastError: ex.Message);
                 throw;
             }
         }
@@ -346,38 +357,49 @@ internal static class CliApp
             Console.WriteLine($"Syncing bodies for '{account.Id}', max_per_folder={FormatMaxPerFolder(maxPerFolder)}, batch_size={batchSize}...");
 
             var pendingTargetCount = database.ReadPendingBodySyncTargets(account.Id, folderFilter, maxPerFolder).Count;
-            var syncRunId = database.StartSyncRun(databaseAccountId, account.Id, folderFilter, "syncing_bodies", pendingTargetCount);
-            Console.WriteLine($"Sync run: {syncRunId}");
+            var syncRun = database.StartOrQueueSyncRun(databaseAccountId, account.Id, folderFilter, "syncing_bodies", pendingTargetCount);
+            Console.WriteLine($"Sync run: {syncRun.Id} status={syncRun.Status}");
 
             try
             {
-                var result = await new ImapBodySync(database).SyncAccountAsync(
-                    account,
-                    password,
-                    folderFilter,
-                    maxPerFolder,
-                    batchSize,
-                    cancellationToken,
-                    (done, total) => database.UpdateSyncRunProgress(syncRunId, done, total));
+                syncRun = await WaitForSyncRunLeaseAsync(database, syncRun, cancellationToken);
 
-                var failed = result.Folders.Where(folder => !folder.Succeeded).ToList();
-                database.CompleteSyncRun(
-                    syncRunId,
-                    succeeded: failed.Count == 0,
-                    done: result.Folders.Sum(folder => folder.PersistedCount),
-                    total: result.Folders.Sum(folder => folder.SelectedCount),
-                    lastError: failed.Count == 0 ? null : string.Join("; ", failed.Select(folder => $"{folder.FolderPath}: {folder.Error}")));
+                var result = await RunWithSyncLeaseHeartbeatAsync(database, syncRun, cancellationToken, async () =>
+                {
+                    var syncResult = await new ImapBodySync(database).SyncAccountAsync(
+                        account,
+                        password,
+                        folderFilter,
+                        maxPerFolder,
+                        batchSize,
+                        cancellationToken,
+                        (done, total) => UpdateSyncRunProgressOrThrow(database, syncRun, done, total),
+                        () => ThrowIfSyncLeaseLost(database, syncRun));
+
+                    var failed = syncResult.Folders.Where(folder => !folder.Succeeded).ToList();
+                    var completed = database.CompleteSyncRun(
+                        syncRun.Id,
+                        syncRun.OwnerId,
+                        succeeded: failed.Count == 0,
+                        done: syncResult.Folders.Sum(folder => folder.PersistedCount),
+                        total: syncResult.Folders.Sum(folder => folder.SelectedCount),
+                        lastError: failed.Count == 0 ? null : string.Join("; ", failed.Select(folder => $"{folder.FolderPath}: {folder.Error}")));
+                    if (!completed)
+                        throw new OperationCanceledException("Sync lease was lost.");
+
+                    return syncResult;
+                });
 
                 PrintBodySyncResult(result);
             }
             catch (OperationCanceledException)
             {
-                database.CancelSyncRun(syncRunId, done: 0, total: pendingTargetCount);
+                database.CancelSyncRun(syncRun.Id, syncRun.OwnerId, done: 0, total: pendingTargetCount);
                 throw;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                database.CompleteSyncRun(syncRunId, succeeded: false, done: 0, total: pendingTargetCount, lastError: ex.Message);
+                database.CompleteSyncRun(syncRun.Id, syncRun.OwnerId, succeeded: false, done: 0, total: pendingTargetCount, lastError: ex.Message);
                 throw;
             }
         }
@@ -749,6 +771,108 @@ internal static class CliApp
 
         if (readiness.ActiveSyncRun is not null)
             Console.WriteLine($"Active sync run: {FormatSyncRun(readiness.ActiveSyncRun)}");
+    }
+
+    private static async Task<SyncRunStartResult> WaitForSyncRunLeaseAsync(
+        EmailDatabase database,
+        SyncRunStartResult syncRun,
+        CancellationToken cancellationToken)
+    {
+        if (syncRun.Acquired)
+            return syncRun;
+
+        Console.WriteLine($"Sync queued: {syncRun.Id}");
+        if (syncRun.ActiveRun is not null)
+            Console.WriteLine($"Waiting behind: {FormatSyncRun(syncRun.ActiveRun)}");
+
+        var lastReportAt = DateTimeOffset.UtcNow;
+
+        while (true)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
+            var claim = database.TryClaimQueuedSyncRun(syncRun.Id, syncRun.OwnerId);
+
+            if (claim.Acquired)
+            {
+                Console.WriteLine($"Sync run started: {claim.Id}");
+                return claim;
+            }
+
+            if (!claim.Status.Equals("queued", StringComparison.OrdinalIgnoreCase))
+                throw new CliException($"Sync run {claim.Id} is no longer queued; status={claim.Status}.", 1);
+
+            var now = DateTimeOffset.UtcNow;
+            if ((now - lastReportAt) >= TimeSpan.FromSeconds(30))
+            {
+                if (claim.ActiveRun is not null)
+                    Console.WriteLine($"Still queued behind: {FormatSyncRun(claim.ActiveRun)}");
+                else
+                    Console.WriteLine($"Still queued: {claim.Id}");
+
+                lastReportAt = now;
+            }
+        }
+    }
+
+    private static async Task<T> RunWithSyncLeaseHeartbeatAsync<T>(
+        EmailDatabase database,
+        SyncRunStartResult syncRun,
+        CancellationToken cancellationToken,
+        Func<Task<T>> action)
+    {
+        using var heartbeatCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var heartbeatTask = HeartbeatSyncLeaseAsync(database, syncRun, heartbeatCancellation.Token);
+
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            await StopHeartbeatAsync(heartbeatCancellation, heartbeatTask);
+        }
+    }
+
+    private static async Task HeartbeatSyncLeaseAsync(
+        EmailDatabase database,
+        SyncRunStartResult syncRun,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+            if (!database.HeartbeatSyncLease(syncRun.Id, syncRun.OwnerId))
+                throw new OperationCanceledException("Sync lease was lost.");
+        }
+    }
+
+    private static void ThrowIfSyncLeaseLost(EmailDatabase database, SyncRunStartResult syncRun)
+    {
+        if (!database.OwnsActiveSyncLease(syncRun.Id, syncRun.OwnerId))
+            throw new OperationCanceledException("Sync lease was lost.");
+    }
+
+    private static void UpdateSyncRunProgressOrThrow(
+        EmailDatabase database,
+        SyncRunStartResult syncRun,
+        int done,
+        int total)
+    {
+        if (!database.UpdateSyncRunProgress(syncRun.Id, syncRun.OwnerId, done, total))
+            throw new OperationCanceledException("Sync lease was lost.");
+    }
+
+    private static async Task StopHeartbeatAsync(CancellationTokenSource cancellation, Task heartbeatTask)
+    {
+        cancellation.Cancel();
+
+        try
+        {
+            await heartbeatTask;
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 
     private static string FormatSyncRun(SyncRunSnapshot run)
