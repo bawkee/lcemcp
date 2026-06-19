@@ -33,7 +33,10 @@ Next work:
 Follow-up result on 2026-06-18:
 
 - A bounded live Yahoo probe with `--since-days 3 --limit 3` matched 16 UIDs and fetched `3 of 3 requested`; the prior 5-requested/4-returned result did not reproduce in this small window.
-- Keep the older 30-day missing-summary question open until a wider probe or real sync run catches another mismatch.
+
+Follow-up result on 2026-06-19:
+
+- A wider live Yahoo Inbox metadata sync with `--since-days 30 --max-per-folder 200 --batch-size 25` matched 170 UIDs, selected 170, fetched 170, persisted 170, reported `missing=0`, and reached highest UID 283547. The older 5-requested/4-returned probe result did not reproduce in this wider real sync and is not a current blocker unless it recurs.
 
 ## 2. Add Walking Skeleton Storage
 
@@ -100,11 +103,12 @@ Test result:
 - Temp-config `status` smoke test created schema version 2 and reported 0 messages / 0 message locations.
 - Live Yahoo metadata sync succeeded on 2026-06-19 with `sync --account yahoo --folder Inbox --since-days 3 --max-per-folder 5 --batch-size 2`: auto-discovered 16 folders after prototype reset, matched 16 Inbox UIDs, selected 5, fetched 5, persisted 5, missing 0, highest UID 283547.
 - Re-running the same live sync stayed idempotent: status still reported 5 messages and 5 message locations.
+- Added the first xUnit test project on 2026-06-19. `dotnet test lcemcp.slnx` passed with 10 tests covering config save/load, config validation, credential target generation, schema v2 initialization, prototype rebuild, account/folder upsert idempotence, metadata upsert idempotence by location/provider key, Message-ID fallback matching, and transaction rollback on a failed location insert.
+- Temp-config CLI `status` smoke test also succeeded on 2026-06-19 and created schema version 2 in an isolated config directory.
+- Wider live Yahoo Inbox metadata sync succeeded on 2026-06-19 with `sync --account yahoo --folder Inbox --since-days 30 --max-per-folder 200 --batch-size 25`: matched 170, selected 170, fetched 170, persisted 170, missing 0, highest UID 283547. Follow-up `status` reported 1 account, 16 folders, 170 messages, 170 message locations, and last sync state `yahoo/Inbox`.
 
 Next work:
 
-- Add focused tests once the first test project exists, especially schema v2 initialization and metadata upsert idempotence.
-- Run a wider Yahoo metadata sync, likely Inbox first with the account's 30-day window, and record whether the older missing-summary question reproduces.
 - Add a local message-list/debug command if needed before body sync, so synced metadata can be inspected without ad hoc database queries.
 - Continue with body sync and local search once metadata sync has had a slightly wider live run.
 
@@ -137,10 +141,8 @@ The project is still young, so test only the parts where regressions would be an
 
 Next work:
 
-- Unit-test config load/save round trips.
-- Unit-test config validation errors.
-- Unit-test credential target generation without touching the OS credential store.
-- Integration-test SQLite schema initialization.
+- Completed on 2026-06-19: Added `tests/LceMcp.Tests` with unit tests for config load/save round trips, config validation errors, and credential target generation without touching the OS credential store.
+- Completed on 2026-06-19: Added SQLite integration tests for schema v2 initialization, prototype rebuild, account/folder upsert idempotence, message metadata upsert idempotence, Message-ID fallback matching, and rollback on failed message-location insert.
 - Add an optional manual IMAP smoke test path that requires a configured real account and is not run by default.
 
 ## 8. Later Milestones

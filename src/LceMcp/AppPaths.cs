@@ -24,12 +24,15 @@ internal sealed class AppPaths
     {
         var overrideDirectory = Environment.GetEnvironmentVariable("LCEMCP_CONFIG_DIR");
         if (!string.IsNullOrWhiteSpace(overrideDirectory))
-            return new AppPaths(Path.GetFullPath(overrideDirectory));
+            return FromDirectory(overrideDirectory);
 
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         if (string.IsNullOrWhiteSpace(appData))
             appData = Environment.CurrentDirectory;
 
-        return new AppPaths(Path.Combine(appData, "lcemcp"));
+        return FromDirectory(Path.Combine(appData, "lcemcp"));
     }
+
+    public static AppPaths FromDirectory(string configDirectory) =>
+        new(Path.GetFullPath(configDirectory));
 }
