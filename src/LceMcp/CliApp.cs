@@ -125,7 +125,6 @@ internal static class CliApp
                 Console.WriteLine($"  {error}");
         }
 
-        Console.WriteLine($"Schema mode: {databaseStatus.SchemaMode} (migrations_locked={databaseStatus.MigrationsLocked.ToString().ToLowerInvariant()})");
         Console.WriteLine($"Database schema version: {databaseStatus.SchemaVersion} / target {databaseStatus.TargetSchemaVersion}");
         Console.WriteLine($"Database accounts: {databaseStatus.AccountCount}");
         Console.WriteLine($"Database folders: {databaseStatus.FolderCount}");
@@ -507,7 +506,6 @@ internal static class CliApp
         {
             DatabaseInitializationKind.Opened => "present",
             DatabaseInitializationKind.Created => "created",
-            DatabaseInitializationKind.RecreatedPrototype => "recreated for prototype schema",
             DatabaseInitializationKind.Migrated => "migrated",
             _ => kind.ToString()
         };

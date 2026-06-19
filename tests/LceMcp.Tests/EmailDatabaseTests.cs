@@ -5,7 +5,7 @@ namespace LceMcp.Tests;
 public sealed class EmailDatabaseTests
 {
     [Fact]
-    public void GetStatusInitializesPrototypeSchemaV2()
+    public void GetStatusInitializesMigrationSchema()
     {
         using var temp = TempWorkspace.Create();
         var database = new EmailDatabase(temp.Paths);
@@ -13,10 +13,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Created, status.InitializationKind);
-        Assert.Equal("prototype-reset", status.SchemaMode);
-        Assert.True(status.MigrationsLocked);
-        Assert.Equal(2, status.SchemaVersion);
-        Assert.Equal(2, status.TargetSchemaVersion);
+        Assert.Equal(1, status.SchemaVersion);
+        Assert.Equal(1, status.TargetSchemaVersion);
         Assert.Equal(0, status.AccountCount);
         Assert.Equal(0, status.FolderCount);
         Assert.Equal(0, status.MessageCount);
@@ -42,19 +40,17 @@ public sealed class EmailDatabaseTests
     }
 
     [Fact]
-    public void GetStatusRecreatesNonPrototypeDatabaseWhileMigrationsAreLocked()
+    public void GetStatusOpensAlreadyMigratedDatabase()
     {
         using var temp = TempWorkspace.Create();
-        Directory.CreateDirectory(temp.Paths.ConfigDirectory);
-        File.WriteAllText(temp.Paths.DatabasePath, "not sqlite");
         var database = new EmailDatabase(temp.Paths);
 
+        database.GetStatus();
         var status = database.GetStatus();
 
-        Assert.Equal(DatabaseInitializationKind.RecreatedPrototype, status.InitializationKind);
-        Assert.Equal(2, status.SchemaVersion);
-        Assert.Equal(0, status.MessageCount);
-        Assert.Equal(["prototype_schema_metadata_sync"], ReadNames(
+        Assert.Equal(DatabaseInitializationKind.Opened, status.InitializationKind);
+        Assert.Equal(1, status.SchemaVersion);
+        Assert.Equal(["initial_metadata_cache"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
     }

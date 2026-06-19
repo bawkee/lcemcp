@@ -1,8 +1,6 @@
 namespace LceMcp;
 
 internal sealed record DatabaseStatus(
-    string SchemaMode,
-    bool MigrationsLocked,
     int SchemaVersion,
     int TargetSchemaVersion,
     int AccountCount,
@@ -16,7 +14,6 @@ internal enum DatabaseInitializationKind
 {
     Opened,
     Created,
-    RecreatedPrototype,
     Migrated
 }
 

@@ -53,6 +53,13 @@ Completed on 2026-06-18:
 - Added `status`, which initializes storage if needed and reports config presence, database path, config validation, database account/folder counts, and last sync state.
 - Added lightweight migration infrastructure, but migrations are intentionally locked during the prototype phase. While `DatabaseMigrations.MigrationsLocked = true`, `DatabaseMigrations.All` must stay empty and schema changes rebuild `email.db` when the prototype schema marker changes. When the MVP schema is stable, remove the lock deliberately, add a complete migration 1, delete/recreate the prototype DB one final time, and then preserve DBs with forward-only migrations.
 
+Completed on 2026-06-19:
+
+- Removed the prototype migration lock and prototype initializer. Migration mode is now the only schema initialization path.
+- Added migration 1, `initial_metadata_cache`, as the complete current metadata-cache schema.
+- Decided not to keep a legacy prototype-database bridge because no one else is using the app yet. From this point forward databases are preserved with explicit forward-only migrations.
+- The real configured database at `C:\Users\bojan\AppData\Roaming\lcemcp\email.db` was recreated once under migration tracking. Follow-up `status` reported schema version `1 / target 1`.
+
 Test result:
 
 - `dotnet build lcemcp.slnx` succeeded on 2026-06-18.
@@ -106,6 +113,7 @@ Test result:
 - Added the first xUnit test project on 2026-06-19. `dotnet test lcemcp.slnx` passed with 10 tests covering config save/load, config validation, credential target generation, schema v2 initialization, prototype rebuild, account/folder upsert idempotence, metadata upsert idempotence by location/provider key, Message-ID fallback matching, and transaction rollback on a failed location insert.
 - Temp-config CLI `status` smoke test also succeeded on 2026-06-19 and created schema version 2 in an isolated config directory.
 - Wider live Yahoo Inbox metadata sync succeeded on 2026-06-19 with `sync --account yahoo --folder Inbox --since-days 30 --max-per-folder 200 --batch-size 25`: matched 170, selected 170, fetched 170, persisted 170, missing 0, highest UID 283547. Follow-up `status` reported 1 account, 16 folders, 170 messages, 170 message locations, and last sync state `yahoo/Inbox`.
+- After migration unlock on 2026-06-19, live Yahoo Inbox sync succeeded with `sync --account yahoo --folder Inbox --since-days 30 --max-per-folder 50 --batch-size 25`: auto-discovered 16 folders into the newly recreated migration-tracked DB, matched 170 Inbox UIDs, selected 50, fetched 50, persisted 50, missing 0, highest UID 283547. Follow-up `status` reported schema version `1 / target 1`, 1 account, 16 folders, 50 messages, 50 message locations, and last sync state `yahoo/Inbox`.
 
 Next work:
 
@@ -143,6 +151,7 @@ Next work:
 
 - Completed on 2026-06-19: Added `tests/LceMcp.Tests` with unit tests for config load/save round trips, config validation errors, and credential target generation without touching the OS credential store.
 - Completed on 2026-06-19: Added SQLite integration tests for schema v2 initialization, prototype rebuild, account/folder upsert idempotence, message metadata upsert idempotence, Message-ID fallback matching, and rollback on failed message-location insert.
+- Completed on 2026-06-19: Updated SQLite integration tests for migration mode. `dotnet test lcemcp.slnx` passed with 10 tests covering fresh migration initialization, already-migrated database preservation, and the previous storage idempotence/rollback behavior.
 - Add an optional manual IMAP smoke test path that requires a configured real account and is not run by default.
 
 ## 8. Later Milestones
