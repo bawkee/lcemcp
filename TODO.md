@@ -1,6 +1,6 @@
 # TODO
 
-This file is the project working memory. Keep it in sensible implementation order, and add context here when a test result or decision is not already captured in `spec.md`.
+This file is the project working memory as a dev log appendix to the far more important `SPEC.md` which is the initial app's dev specification. Keep it in sensible implementation order, and add context here when a test result or decision is not already captured in `spec.md`.
 
 ## 1. Close The Yahoo IMAP Probe Slice
 
@@ -144,12 +144,21 @@ Test result:
 - Bounded live Yahoo body sync succeeded on 2026-06-19 with `sync-bodies --account yahoo --folder Inbox --max-per-folder 3 --batch-size 2`: selected 3, fetched 3, persisted 3, missing 0. Follow-up `status` reported schema version `2 / target 2`, 50 messages, 50 message locations, 3 message bodies, and 3 message search docs.
 - CLI `search` smoke test with a random non-matching token and `--account yahoo --limit 5` succeeded on 2026-06-19 and returned 0 results without printing private snippets.
 
+Design decision on 2026-06-19:
+
+- Search readiness must be binary for the requested scope. MCP `email_search` should return normal results only when the relevant corpus is fully indexed. If metadata, bodies, search docs, or FTS rows are incomplete for the requested account/folder/history/search scope, it should return `not_synced`/readiness status rather than an ordinary empty result set.
+- Do not rely on partial search as default behavior. Partial search may exist later only as an explicit/debug opt-in such as `allow_partial: true`, and must label results as incomplete.
+- Long-running sync should be durable and observable. `email_sync_now` should start/resume a sync run, return a `sync_run_id`, and expose phase/progress/elapsed/ETA/estimate-confidence through `email_get_sync_status`. MCP progress notifications can be used when available, but pollable status is the real contract because LLM harness support varies.
+- LLM-facing tool descriptions should tell clients to check `email_get_sync_status`, trigger sync if needed, poll at reasonable intervals, and treat `not_synced` as "search not ready", never as evidence that no matching email exists.
+
 Next work:
 
+- Before exposing `email_search` over MCP, refactor current CLI/body-search assumptions toward explicit readiness checks and sync progress state. Current CLI `search` can return empty against an incomplete body index; MCP search must not.
+- Define and persist enough sync-run/search-readiness state to answer: total metadata messages in scope, indexed body/search-doc count, pending bodies, active phase, elapsed time, estimated remaining time, and last error.
 - Run a few local searches against the live indexed Yahoo bodies without recording private snippets in TODO, just counts and whether snippets are usefully hit-centered.
 - Add a local `get-message`/debug read command if needed before MCP exposure, so a synced message can be inspected through bounded, cited local storage rather than ad hoc database queries.
 - Expand body sync after a small live soak: larger bounded runs, body re-fetch/reindex behavior, and error-state handling for messages whose body fetch repeatedly fails.
-- Expose read-only local search through MCP after the stdio walking skeleton lands.
+- Expose read-only local search through MCP after the stdio walking skeleton lands and readiness semantics are in place.
 
 ## 6. Add MCP Walking Skeleton
 
@@ -159,8 +168,10 @@ Next work:
 
 - Add the MCP stdio server command: `serve`.
 - Ensure diagnostics/logging go to stderr so JSON-RPC stdout stays clean.
-- Start with `email_get_sync_status`.
+- Start with `email_get_sync_status`, including binary search readiness and sync-run progress fields before exposing search.
 - Add read-only tools in this order: `email_list_accounts`, `email_list_folders`, `email_search`, `email_get_message`, `email_sync_now`.
+- `email_search` must return `not_synced` rather than empty results when the requested corpus is not fully indexed.
+- `email_sync_now` should return a durable run/status id and progress instead of blocking indefinitely.
 - Log every MCP call to `audit_log`.
 
 ## 7. Add Focused Tests

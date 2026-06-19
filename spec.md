@@ -1117,7 +1117,71 @@ Optional IMAP IDLE support later.
 Manual sync through email_sync_now.
 ```
 
-The MCP server should remain available while sync is running. Tools should expose sync status and partial results.
+The MCP server should remain available while sync is running. Tools should expose sync status and durable progress. Search tools must not quietly return partial search results by default.
+
+#### 14.3.1 Search Readiness
+
+Email search readiness is binary for the requested scope.
+
+Default behavior:
+
+```text
+requested search scope fully indexed -> run search and return results
+requested search scope not fully indexed -> return not_synced/readiness status, not an empty result set
+```
+
+The requested scope includes:
+
+- Account selection.
+- Folder selection or folder roles.
+- Configured searchable history window.
+- Message metadata sync.
+- Message body sync.
+- Message search documents and FTS index rows.
+
+For v1, message search should not rely on partial body indexing. A search result of zero must mean "the fully indexed corpus was searched and nothing matched." It must not mean "the body index is incomplete."
+
+If a future debug or advanced mode supports partial search, it must be explicit, for example `allow_partial: true`, and the response must clearly say results are incomplete. Do not enable partial search by default for MCP clients.
+
+Attachment search readiness can be tracked separately from message search readiness. Message search may be ready before attachment extraction is complete, as long as the response is explicit about which corpus was searched.
+
+#### 14.3.2 Long-Running Sync Progress
+
+Long-running sync should be durable and observable.
+
+`email_sync_now` should start or resume a sync run and return quickly with a `sync_run_id`. LLM clients can then poll `email_get_sync_status` instead of blocking indefinitely.
+
+Progress should include:
+
+```text
+sync_run_id
+status: queued | running | succeeded | failed | canceled
+phase: discovering_folders | syncing_metadata | syncing_bodies | indexing | extracting_attachments
+done
+total
+percent
+elapsed_seconds
+estimated_remaining_seconds
+estimate_confidence: low | medium | high
+last_progress_at
+last_error
+```
+
+When an MCP client provides a progress token and the server stack supports progress notifications, the server may emit progress notifications during long tool calls. Pollable sync status remains the primary contract because not every LLM harness surfaces progress notifications consistently.
+
+ETA values are best-effort. They should be calculated from observed progress over time and should expose low confidence early in a run or when provider throttling/body sizes make throughput unstable.
+
+#### 14.3.3 LLM Client Guidance
+
+Tool descriptions and MCP documentation should instruct LLM clients to:
+
+```text
+1. Call email_get_sync_status before trusting email_search for a new or recently changed account.
+2. If search_ready is false, call email_sync_now or report that indexing is still required.
+3. Poll email_get_sync_status at reasonable intervals, such as 10 seconds.
+4. Use progress percent, elapsed time, and estimated remaining time to decide whether to wait or tell the user sync is still running.
+5. Treat not_synced search responses as "not ready", never as evidence that no matching email exists.
+```
 
 ### 14.4 Crash Safety
 
@@ -1414,6 +1478,7 @@ Input:
   "max_snippets_per_message": 5,
   "max_snippets_per_attachment": 5,
   "max_attachment_hits_per_message": 5,
+  "allow_partial": false,
   "limit": 20,
   "cursor": null
 }
@@ -1469,6 +1534,57 @@ Output:
 ```
 
 The result shape should stay message-centric even when searching attachments only. Attachment-only searches should return the parent message with matching attachment hits populated.
+
+Default readiness rule:
+
+```text
+email_search must not return ordinary empty results when the requested searchable corpus is not fully indexed.
+```
+
+If the requested scope is not ready, return a readiness response instead of `results: []`:
+
+```json
+{
+  "status": "not_synced",
+  "search_ready": false,
+  "message": "The requested email search corpus is not fully indexed.",
+  "sync_run_id": "sync-20260617-172500",
+  "readiness": {
+    "scope": {
+      "accounts": ["yahoo"],
+      "folder_roles": ["inbox"],
+      "history_days": 30,
+      "search_in": ["messages"]
+    },
+    "metadata_complete": true,
+    "bodies_complete": false,
+    "message_search_index_complete": false,
+    "attachments_complete": null,
+    "indexed_messages": 500,
+    "metadata_messages": 5000,
+    "pending_message_bodies": 4500
+  },
+  "progress": {
+    "phase": "syncing_bodies",
+    "done": 500,
+    "total": 5000,
+    "percent": 10,
+    "elapsed_seconds": 60,
+    "estimated_remaining_seconds": 540,
+    "estimate_confidence": "low"
+  }
+}
+```
+
+`allow_partial` defaults to false. If it is ever implemented, partial search must be opt-in and the response must include:
+
+```json
+{
+  "status": "partial",
+  "search_ready": false,
+  "results_may_be_incomplete": true
+}
+```
 
 ### 16.5 email_get_message
 
@@ -1608,7 +1724,8 @@ Input:
 ```json
 {
   "accounts": ["gmail", "yahoo"],
-  "full": false
+  "full": false,
+  "wait_for_completion": false
 }
 ```
 
@@ -1619,11 +1736,22 @@ Output:
   "accepted": true,
   "sync_run_id": "sync-20260617-172500",
   "status": "running",
-  "message": "Sync started for 2 accounts."
+  "message": "Sync started for 2 accounts.",
+  "progress": {
+    "phase": "syncing_bodies",
+    "done": 500,
+    "total": 5000,
+    "percent": 10,
+    "elapsed_seconds": 60,
+    "estimated_remaining_seconds": 540,
+    "estimate_confidence": "low"
+  }
 }
 ```
 
-For long-running sync, return a run/status ID rather than blocking indefinitely.
+For long-running sync, return a run/status ID rather than blocking indefinitely by default. `wait_for_completion` may be supported for short runs or interactive clients, but the server must still emit or expose progress and must respect cancellation when supported by the host.
+
+`email_sync_now` should bring the requested corpus to search-ready state. For message search this means metadata, bodies, search docs, and FTS rows are complete for the configured history window. Attachment extraction may remain a separate phase unless the request explicitly includes attachment search readiness.
 
 ### 16.9 email_get_sync_status
 
@@ -1643,12 +1771,32 @@ Output:
 ```json
 {
   "database_locked": false,
+  "active_sync_run_id": "sync-20260617-172500",
   "accounts": [
     {
       "account": "gmail",
       "enabled": true,
       "last_success_at": "2026-06-17T17:18:00Z",
       "last_error": null,
+      "search_ready": true,
+      "search_ready_scope": {
+        "history_days": 30,
+        "message_search_ready": true,
+        "attachment_search_ready": false
+      },
+      "sync_progress": {
+        "status": "running",
+        "phase": "syncing_bodies",
+        "done": 500,
+        "total": 5000,
+        "percent": 10,
+        "elapsed_seconds": 60,
+        "estimated_remaining_seconds": 540,
+        "estimate_confidence": "low",
+        "last_progress_at": "2026-06-17T17:18:45Z"
+      },
+      "metadata_messages": 12043,
+      "message_bodies_indexed": 12043,
       "messages_indexed": 12043,
       "attachments_indexed": 884,
       "extraction_pending": 12,
@@ -1663,6 +1811,8 @@ Output:
   ]
 }
 ```
+
+`email_get_sync_status` is the authoritative readiness endpoint for LLM clients. It must make the distinction between synced and not synced visible without requiring the model to infer it from raw counts.
 
 ### 16.10 email_get_audit_events
 
@@ -2006,6 +2156,9 @@ Deliver:
 - message_search_docs and messages_fts index.
 - SqlBinder-based optional criteria for search queries.
 - Hit-centered snippet extraction.
+- Binary search readiness for the requested scope: synced or not_synced, with no quiet partial search by default.
+- Durable sync run/status tracking with progress, elapsed time, ETA, and estimate confidence.
+- LLM guidance for polling sync status before trusting search on a new or incomplete corpus.
 - MCP tools:
   - email_list_accounts
   - email_list_folders
