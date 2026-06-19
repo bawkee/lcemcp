@@ -5,7 +5,8 @@ internal static class DatabaseMigrations
     public static IReadOnlyList<DatabaseMigration> All { get; } =
     [
         new(1, "initial_metadata_cache", InitialSchemaSql),
-        new(2, "message_bodies_and_search", BodySearchSchemaSql)
+        new(2, "message_bodies_and_search", BodySearchSchemaSql),
+        new(3, "sync_runs_and_search_readiness", SyncRunsAndReadinessSql)
     ];
 
     public static int TargetVersion => All.Select(migration => migration.Version).DefaultIfEmpty(0).Max();
@@ -192,5 +193,28 @@ internal static class DatabaseMigrations
 
         CREATE INDEX IF NOT EXISTS idx_message_recipients_message ON message_recipients(message_id);
         CREATE INDEX IF NOT EXISTS idx_message_recipients_email ON message_recipients(email);
+        """;
+
+    public const string SyncRunsAndReadinessSql = """
+        ALTER TABLE accounts ADD COLUMN history_days INTEGER NOT NULL DEFAULT 30;
+
+        CREATE TABLE IF NOT EXISTS sync_runs (
+            id TEXT PRIMARY KEY,
+            account_id INTEGER,
+            account_name TEXT NOT NULL,
+            folder_filter TEXT,
+            status TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            total INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL,
+            last_progress_at TEXT NOT NULL,
+            completed_at TEXT,
+            last_error TEXT,
+            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sync_runs_status_progress ON sync_runs(status, last_progress_at);
+        CREATE INDEX IF NOT EXISTS idx_sync_runs_account_progress ON sync_runs(account_id, last_progress_at);
         """;
 }

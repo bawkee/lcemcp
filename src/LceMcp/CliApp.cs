@@ -135,6 +135,11 @@ internal static class CliApp
         Console.WriteLine($"Database message bodies: {databaseStatus.MessageBodyCount}");
         Console.WriteLine($"Database message search docs: {databaseStatus.MessageSearchDocCount}");
         Console.WriteLine($"Last sync state: {FormatSyncState(databaseStatus.LastSyncState)}");
+        PrintMessageSearchReadiness(database.GetMessageSearchReadiness(new(
+            AccountFilters: [],
+            FromEmail: null,
+            FolderRoles: [],
+            HasAttachment: null)));
 
         return 0;
     }
@@ -265,17 +270,42 @@ internal static class CliApp
 
             Console.WriteLine($"Syncing metadata for '{account.Id}' from {folders.Count} folder(s), since_days={sinceDays}, max_per_folder={FormatMaxPerFolder(maxPerFolder)}, batch_size={batchSize}...");
 
-            var result = await new ImapMetadataSync(database).SyncAccountAsync(
-                account,
-                password,
-                databaseAccountId,
-                folders,
-                sinceDays,
-                maxPerFolder,
-                batchSize,
-                cancellationToken);
+            var syncRunId = database.StartSyncRun(databaseAccountId, account.Id, folderFilter, "syncing_metadata", folders.Count);
+            Console.WriteLine($"Sync run: {syncRunId}");
 
-            PrintMetadataSyncResult(result);
+            try
+            {
+                var result = await new ImapMetadataSync(database).SyncAccountAsync(
+                    account,
+                    password,
+                    databaseAccountId,
+                    folders,
+                    sinceDays,
+                    maxPerFolder,
+                    batchSize,
+                    cancellationToken,
+                    (done, total) => database.UpdateSyncRunProgress(syncRunId, done, total));
+
+                var failed = result.Folders.Where(folder => !folder.Succeeded).ToList();
+                database.CompleteSyncRun(
+                    syncRunId,
+                    succeeded: failed.Count == 0,
+                    done: result.Folders.Sum(folder => folder.FetchedCount),
+                    total: result.Folders.Sum(folder => folder.SelectedCount),
+                    lastError: failed.Count == 0 ? null : string.Join("; ", failed.Select(folder => $"{folder.FolderPath}: {folder.Error}")));
+
+                PrintMetadataSyncResult(result);
+            }
+            catch (OperationCanceledException)
+            {
+                database.CancelSyncRun(syncRunId, done: 0, total: folders.Count);
+                throw;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                database.CompleteSyncRun(syncRunId, succeeded: false, done: 0, total: folders.Count, lastError: ex.Message);
+                throw;
+            }
         }
 
         return 0;
@@ -311,19 +341,45 @@ internal static class CliApp
             if (password is null)
                 throw new CliException($"Credential not found: {account.CredentialRef}", 3);
 
-            database.UpsertConfiguredAccount(account);
+            var databaseAccountId = database.UpsertConfiguredAccount(account);
 
             Console.WriteLine($"Syncing bodies for '{account.Id}', max_per_folder={FormatMaxPerFolder(maxPerFolder)}, batch_size={batchSize}...");
 
-            var result = await new ImapBodySync(database).SyncAccountAsync(
-                account,
-                password,
-                folderFilter,
-                maxPerFolder,
-                batchSize,
-                cancellationToken);
+            var pendingTargetCount = database.ReadPendingBodySyncTargets(account.Id, folderFilter, maxPerFolder).Count;
+            var syncRunId = database.StartSyncRun(databaseAccountId, account.Id, folderFilter, "syncing_bodies", pendingTargetCount);
+            Console.WriteLine($"Sync run: {syncRunId}");
 
-            PrintBodySyncResult(result);
+            try
+            {
+                var result = await new ImapBodySync(database).SyncAccountAsync(
+                    account,
+                    password,
+                    folderFilter,
+                    maxPerFolder,
+                    batchSize,
+                    cancellationToken,
+                    (done, total) => database.UpdateSyncRunProgress(syncRunId, done, total));
+
+                var failed = result.Folders.Where(folder => !folder.Succeeded).ToList();
+                database.CompleteSyncRun(
+                    syncRunId,
+                    succeeded: failed.Count == 0,
+                    done: result.Folders.Sum(folder => folder.PersistedCount),
+                    total: result.Folders.Sum(folder => folder.SelectedCount),
+                    lastError: failed.Count == 0 ? null : string.Join("; ", failed.Select(folder => $"{folder.FolderPath}: {folder.Error}")));
+
+                PrintBodySyncResult(result);
+            }
+            catch (OperationCanceledException)
+            {
+                database.CancelSyncRun(syncRunId, done: 0, total: pendingTargetCount);
+                throw;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                database.CompleteSyncRun(syncRunId, succeeded: false, done: 0, total: pendingTargetCount, lastError: ex.Message);
+                throw;
+            }
         }
 
         return 0;
@@ -339,7 +395,8 @@ internal static class CliApp
             FolderRoles: SplitOption(options.Get("--folder-role")),
             HasAttachment: ParseNullableBool(options.Get("--has-attachment"), "--has-attachment"),
             Limit: options.GetInt("--limit", 20),
-            SnippetChars: options.GetInt("--snippet-chars", 1024));
+            SnippetChars: options.GetInt("--snippet-chars", 1024),
+            AllowPartial: options.Has("--allow-partial"));
 
         if (request.Limit < 1 || request.Limit > 100)
             throw new CliException("--limit must be between 1 and 100.", 2);
@@ -347,9 +404,35 @@ internal static class CliApp
         if (request.SnippetChars < 160 || request.SnippetChars > 4096)
             throw new CliException("--snippet-chars must be between 160 and 4096.", 2);
 
-        var results = database.SearchMessages(request);
-
         Console.WriteLine($"Database: {database.DatabasePath}");
+
+        FtsQueryBuilder.Build(request.Query);
+
+        var readiness = database.GetMessageSearchReadiness(new(
+            AccountFilters: request.AccountFilters,
+            FromEmail: request.FromEmail,
+            FolderRoles: request.FolderRoles,
+            HasAttachment: request.HasAttachment));
+
+        if (!readiness.SearchReady && !request.AllowPartial)
+        {
+            Console.WriteLine("Search status: not_synced");
+            PrintMessageSearchReadiness(readiness);
+            Console.WriteLine("Search results: not run");
+            return 0;
+        }
+
+        if (!readiness.SearchReady)
+        {
+            Console.WriteLine("Search status: partial");
+            PrintMessageSearchReadiness(readiness);
+        }
+        else
+        {
+            Console.WriteLine("Search status: ready");
+        }
+
+        var results = database.SearchMessages(request);
         Console.WriteLine($"Search results: {results.Count}");
 
         foreach (var result in results)
@@ -653,6 +736,31 @@ internal static class CliApp
             Console.WriteLine($"snippet={result.Snippet}");
     }
 
+    private static void PrintMessageSearchReadiness(MessageSearchReadiness readiness)
+    {
+        Console.WriteLine(
+            $"Message search readiness: {(readiness.SearchReady ? "ready" : "not_synced")} "
+            + $"metadata={FormatBool(readiness.MetadataComplete)} bodies={FormatBool(readiness.BodiesComplete)} index={FormatBool(readiness.MessageSearchIndexComplete)}");
+        Console.WriteLine(
+            $"Message search scope: accounts={readiness.ScopeAccountCount} folders={readiness.ScopeFolderCount} "
+            + $"metadata_folders={readiness.MetadataCompleteFolderCount}/{readiness.ScopeFolderCount} "
+            + $"metadata_messages={readiness.MetadataMessages} indexed_bodies={readiness.IndexedMessageBodies} "
+            + $"search_docs={readiness.MessageSearchDocs} fts_rows={readiness.FtsRows} pending_bodies={readiness.PendingMessageBodies}");
+
+        if (readiness.ActiveSyncRun is not null)
+            Console.WriteLine($"Active sync run: {FormatSyncRun(readiness.ActiveSyncRun)}");
+    }
+
+    private static string FormatSyncRun(SyncRunSnapshot run)
+    {
+        var eta = run.EstimatedRemainingSeconds is int seconds ? seconds.ToString() : "unknown";
+        var folder = string.IsNullOrWhiteSpace(run.FolderFilter) ? "all-folders" : run.FolderFilter;
+        return $"{run.Id} account={run.AccountName} folder={folder} status={run.Status} phase={run.Phase} done={run.Done}/{run.Total} percent={run.Percent} elapsed={run.ElapsedSeconds}s eta={eta}s confidence={run.EstimateConfidence}";
+    }
+
+    private static string FormatBool(bool value) =>
+        value.ToString().ToLowerInvariant();
+
     private static string FormatMaxPerFolder(int maxPerFolder) =>
         maxPerFolder == 0 ? "unbounded" : maxPerFolder.ToString();
 
@@ -750,6 +858,7 @@ internal static class CliApp
           --has-attachment <bool>  Optional true/false metadata filter.
           --limit <n>              Default: 20. Maximum 100.
           --snippet-chars <n>      Default: 1024. Range 160 to 4096.
+          --allow-partial          Debug opt-in. Search even when the requested corpus is not fully indexed.
 
         imap-test options:
           --account <id-or-email>  Required when more than one account exists.

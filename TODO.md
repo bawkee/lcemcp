@@ -135,6 +135,13 @@ Completed on 2026-06-19:
 - Added local `search` CLI as the first `email_search` behavior over message metadata/body FTS. It supports bounded result limits, account filter, sender filter, folder-role filter, attachment metadata filter, sanitized terms/phrases/OR, and SQLite FTS hit-centered snippets.
 - Added `SqlBinder` 1.0.0 for optional search filters, with FTS query text still parsed separately and bound as a normal SQLite parameter.
 - `status` now reports message body and message search-doc counts.
+- Added migration 3, `sync_runs_and_search_readiness`, with durable `sync_runs` plus persisted account `history_days` so readiness can compare metadata sync coverage with the configured searchable window.
+- Added message-search readiness computation for account/sender/folder-role/attachment scopes. It reports metadata messages, indexed bodies, search-doc rows, FTS rows, pending bodies, complete metadata folders, and active sync-run progress.
+- CLI `search` now returns `not_synced` and does not run FTS when the requested corpus is incomplete. `--allow-partial` is available as an explicit debug opt-in.
+- CLI `sync` and `sync-bodies` now create durable sync-run records with phase, status, progress counts, elapsed/ETA fields, last error, and cancellation cleanup. Metadata sync updates progress by folder; body sync updates progress by pending message body target.
+- Stale `queued`/`running` sync runs are reconciled to `failed` after 6 hours without progress when status/readiness paths inspect sync state. This prevents crash-abandoned runs from looking active forever without killing a legitimate sync that another process is still updating.
+- Refactored SqlBinder usage from manual `Query.GetSql()` / `SqlParameters` copying to `DbQuery.CreateCommand()` with custom bracket placeholders. Raw SQLite parameters such as `$fts`, `$limit`, and `$snippetTokens` remain explicit app-owned parameters.
+- `status` now prints message-search readiness and active sync-run progress.
 
 Test result:
 
@@ -143,6 +150,11 @@ Test result:
 - Temp-config CLI `status` smoke test succeeded on 2026-06-19 and created schema version 2 with 0 messages, 0 bodies, and 0 search docs.
 - Bounded live Yahoo body sync succeeded on 2026-06-19 with `sync-bodies --account yahoo --folder Inbox --max-per-folder 3 --batch-size 2`: selected 3, fetched 3, persisted 3, missing 0. Follow-up `status` reported schema version `2 / target 2`, 50 messages, 50 message locations, 3 message bodies, and 3 message search docs.
 - CLI `search` smoke test with a random non-matching token and `--account yahoo --limit 5` succeeded on 2026-06-19 and returned 0 results without printing private snippets.
+- `dotnet build lcemcp.slnx` succeeded on 2026-06-19 after readiness/sync-run changes.
+- `dotnet test lcemcp.slnx` passed with 16 tests on 2026-06-19. New coverage includes schema v3 initialization/migration, search-readiness gating for missing bodies/search docs, capped metadata sync remaining not ready, active sync-run progress, and stale sync-run reconciliation.
+- Temp-config CLI `status` smoke test succeeded on 2026-06-19 and created schema version 3 with message search readiness `not_synced` for an empty config.
+- Temp-config CLI `search --query smoke --limit 5` smoke test succeeded on 2026-06-19 and returned `Search status: not_synced` / `Search results: not run`, without treating the empty incomplete corpus as a normal empty result.
+- Temp-config CLI `search --query smoke --limit 5 --allow-partial` smoke test succeeded on 2026-06-19 after the `DbQuery` refactor and executed the FTS path with 0 results.
 
 Design decision on 2026-06-19:
 
@@ -153,8 +165,6 @@ Design decision on 2026-06-19:
 
 Next work:
 
-- Before exposing `email_search` over MCP, refactor current CLI/body-search assumptions toward explicit readiness checks and sync progress state. Current CLI `search` can return empty against an incomplete body index; MCP search must not.
-- Define and persist enough sync-run/search-readiness state to answer: total metadata messages in scope, indexed body/search-doc count, pending bodies, active phase, elapsed time, estimated remaining time, and last error.
 - Run a few local searches against the live indexed Yahoo bodies without recording private snippets in TODO, just counts and whether snippets are usefully hit-centered.
 - Add a local `get-message`/debug read command if needed before MCP exposure, so a synced message can be inspected through bounded, cited local storage rather than ad hoc database queries.
 - Expand body sync after a small live soak: larger bounded runs, body re-fetch/reindex behavior, and error-state handling for messages whose body fetch repeatedly fails.
@@ -169,6 +179,7 @@ Next work:
 - Add the MCP stdio server command: `serve`.
 - Ensure diagnostics/logging go to stderr so JSON-RPC stdout stays clean.
 - Start with `email_get_sync_status`, including binary search readiness and sync-run progress fields before exposing search.
+- Add cross-process sync coordination before exposing `email_sync_now`. Stdio MCP clients can launch separate server processes, and current `sync_runs` rows are observable status, not a lease/mutex. A second process should return the active run or claim an expired lease instead of starting overlapping IMAP sync for the same account/scope.
 - Add read-only tools in this order: `email_list_accounts`, `email_list_folders`, `email_search`, `email_get_message`, `email_sync_now`.
 - `email_search` must return `not_synced` rather than empty results when the requested corpus is not fully indexed.
 - `email_sync_now` should return a durable run/status id and progress instead of blocking indefinitely.
@@ -184,6 +195,7 @@ Next work:
 - Completed on 2026-06-19: Added SQLite integration tests for schema v2 initialization, prototype rebuild, account/folder upsert idempotence, message metadata upsert idempotence, Message-ID fallback matching, and rollback on failed message-location insert.
 - Completed on 2026-06-19: Updated SQLite integration tests for migration mode. `dotnet test lcemcp.slnx` passed with 10 tests covering fresh migration initialization, already-migrated database preservation, and the previous storage idempotence/rollback behavior.
 - Completed on 2026-06-19: Added migration/search tests for schema version 2 body/search migration, v1-to-v2 migration preservation, body/recipient/search-doc persistence, FTS search, recipient search, and FTS cleanup on body updates. `dotnet test lcemcp.slnx` passed with 12 tests.
+- Completed on 2026-06-19: Added readiness/sync-run tests for schema version 3, binary search readiness, capped metadata detection, active sync-run progress, and stale sync-run reconciliation. `dotnet test lcemcp.slnx` passed with 16 tests.
 - Add an optional manual IMAP smoke test path that requires a configured real account and is not run by default.
 
 ## 8. Later Milestones

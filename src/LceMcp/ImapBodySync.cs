@@ -18,7 +18,8 @@ internal sealed class ImapBodySync
         string folderFilter,
         int maxPerFolder,
         int batchSize,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<int, int> progress = null)
     {
         var targets = _database.ReadPendingBodySyncTargets(account.Id, folderFilter, maxPerFolder);
         if (targets.Count == 0)
@@ -38,6 +39,7 @@ internal sealed class ImapBodySync
 
         var discoveredFolders = await ImapFolderDiscovery.GetFoldersAsync(client, cancellationToken);
         var results = new List<BodyFolderSyncResult>();
+        var completedTargets = 0;
 
         foreach (var group in targets.GroupBy(target => new { target.FolderId, target.FolderPath }))
         {
@@ -48,7 +50,12 @@ internal sealed class ImapBodySync
                 group.Key.FolderPath,
                 folderTargets,
                 batchSize,
-                cancellationToken));
+                cancellationToken,
+                () =>
+                {
+                    completedTargets++;
+                    progress?.Invoke(completedTargets, targets.Count);
+                }));
         }
 
         await client.DisconnectAsync(true, cancellationToken);
@@ -61,7 +68,8 @@ internal sealed class ImapBodySync
         string folderPath,
         IReadOnlyList<BodySyncTarget> targets,
         int batchSize,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action progress)
     {
         var fetchedCount = 0;
         var persistedCount = 0;
@@ -86,6 +94,7 @@ internal sealed class ImapBodySync
                     if (!uint.TryParse(target.ProviderUid, out var uidValue))
                     {
                         missingCount++;
+                        progress?.Invoke();
                         continue;
                     }
 
@@ -102,6 +111,8 @@ internal sealed class ImapBodySync
                     {
                         missingCount++;
                     }
+
+                    progress?.Invoke();
                 }
             }
 

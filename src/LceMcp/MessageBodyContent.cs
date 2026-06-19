@@ -41,7 +41,8 @@ internal sealed record EmailSearchRequest(
     IReadOnlyList<string> FolderRoles,
     bool? HasAttachment,
     int Limit,
-    int SnippetChars);
+    int SnippetChars,
+    bool AllowPartial = false);
 
 internal sealed record EmailSearchResult(
     int MessageId,

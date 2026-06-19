@@ -24,7 +24,8 @@ internal sealed class ImapMetadataSync
         int sinceDays,
         int maxPerFolder,
         int batchSize,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<int, int> progress = null)
     {
         using var client = new ImapClient();
         client.Timeout = 30_000;
@@ -42,7 +43,9 @@ internal sealed class ImapMetadataSync
         var discoveredFolders = await ImapFolderDiscovery.GetFoldersAsync(client, cancellationToken);
         var results = new List<MetadataFolderSyncResult>();
 
+        var completedFolders = 0;
         foreach (var storedFolder in folders)
+        {
             results.Add(await SyncFolderAsync(
                 client,
                 discoveredFolders,
@@ -52,6 +55,9 @@ internal sealed class ImapMetadataSync
                 maxPerFolder,
                 batchSize,
                 cancellationToken));
+            completedFolders++;
+            progress?.Invoke(completedFolders, folders.Count);
+        }
 
         await client.DisconnectAsync(true, cancellationToken);
         return new(account.Id, capabilities, results);

@@ -1,5 +1,7 @@
 using Microsoft.Data.Sqlite;
 using SqlBinder;
+using SqlBinder.Parsing;
+using System.Text.Json;
 
 namespace LceMcp;
 
@@ -267,30 +269,15 @@ internal sealed class EmailDatabase
         if (HasValues(request.AccountFilters) && accountIds.Count == 0)
             return [];
 
-        var query = new Query(SearchMessagesSql);
+        var query = CreateDbQuery(connection, SearchMessagesSql);
+        ApplyScopeConditions(query, accountIds, request.FromEmail, request.FolderRoles, request.HasAttachment);
 
-        if (accountIds.Count > 0)
-            query.SetCondition("accountIds", accountIds);
+        using var command = query.CreateCommand();
+        query.AddSqlParameter("$fts", fts);
+        query.AddSqlParameter("$limit", limit);
+        query.AddSqlParameter("$snippetTokens", snippetTokens);
 
-        query.SetCondition("fromEmail", BlankToNull(request.FromEmail), StringOperator.Is, ignoreIfNull: true);
-
-        if (HasValues(request.FolderRoles))
-            query.SetCondition("folderRoles", request.FolderRoles.Select(role => role.Trim().ToLowerInvariant()).ToList());
-
-        if (request.HasAttachment is bool hasAttachment)
-            query.SetCondition("hasAttachments", hasAttachment ? 1 : 0);
-
-        using var command = connection.CreateCommand();
-        command.CommandText = query.GetSql();
-
-        foreach (var parameter in query.SqlParameters)
-            AddParameter(command, $":{parameter.Key}", parameter.Value);
-
-        AddParameter(command, "$fts", fts);
-        AddParameter(command, "$limit", limit);
-        AddParameter(command, "$snippetTokens", snippetTokens);
-
-        using var reader = command.ExecuteReader();
+        using var reader = (SqliteDataReader)command.ExecuteReader();
         var results = new List<EmailSearchResult>();
 
         while (reader.Read())
@@ -309,6 +296,194 @@ internal sealed class EmailDatabase
         }
 
         return results;
+    }
+
+    public MessageSearchReadiness GetMessageSearchReadiness(MessageSearchReadinessRequest request)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        var accountIds = ResolveAccountIds(connection, request.AccountFilters);
+        ReconcileStaleSyncRuns(connection);
+        var activeSyncRun = ReadActiveSyncRun(connection);
+
+        if (HasValues(request.AccountFilters) && accountIds.Count == 0)
+        {
+            return new(
+                SearchReady: false,
+                MetadataComplete: false,
+                BodiesComplete: false,
+                MessageSearchIndexComplete: false,
+                ScopeAccountCount: 0,
+                ScopeFolderCount: 0,
+                MetadataCompleteFolderCount: 0,
+                MetadataMessages: 0,
+                IndexedMessageBodies: 0,
+                MessageSearchDocs: 0,
+                FtsRows: 0,
+                PendingMessageBodies: 0,
+                ActiveSyncRun: activeSyncRun);
+        }
+
+        var scopedAccountCount = ReadScopedAccountCount(connection, accountIds, request.AccountFilters);
+        var folderStates = ReadMessageSearchFolderStates(connection, accountIds, request.FolderRoles);
+        var counts = ReadMessageSearchCounts(connection, accountIds, request);
+        var completeFolderCount = folderStates.Count(IsFolderMetadataComplete);
+
+        var metadataComplete = scopedAccountCount > 0
+            && folderStates.Count > 0
+            && completeFolderCount == folderStates.Count;
+        var bodiesComplete = counts.MetadataMessages == counts.IndexedMessageBodies
+            && counts.PendingMessageBodies == 0;
+        var indexComplete = counts.MetadataMessages == counts.MessageSearchDocs
+            && counts.MetadataMessages == counts.FtsRows;
+
+        return new(
+            SearchReady: metadataComplete && bodiesComplete && indexComplete,
+            MetadataComplete: metadataComplete,
+            BodiesComplete: bodiesComplete,
+            MessageSearchIndexComplete: indexComplete,
+            ScopeAccountCount: scopedAccountCount,
+            ScopeFolderCount: folderStates.Count,
+            MetadataCompleteFolderCount: completeFolderCount,
+            MetadataMessages: counts.MetadataMessages,
+            IndexedMessageBodies: counts.IndexedMessageBodies,
+            MessageSearchDocs: counts.MessageSearchDocs,
+            FtsRows: counts.FtsRows,
+            PendingMessageBodies: counts.PendingMessageBodies,
+            ActiveSyncRun: activeSyncRun);
+    }
+
+    public string StartSyncRun(
+        int? accountId,
+        string accountName,
+        string folderFilter,
+        string phase,
+        int total)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        ReconcileStaleSyncRuns(connection);
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        var syncRunId = BuildSyncRunId();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO sync_runs (
+                id,
+                account_id,
+                account_name,
+                folder_filter,
+                status,
+                phase,
+                done,
+                total,
+                started_at,
+                last_progress_at
+            )
+            VALUES (
+                $id,
+                $accountId,
+                $accountName,
+                $folderFilter,
+                'running',
+                $phase,
+                0,
+                $total,
+                $startedAt,
+                $lastProgressAt
+            );
+            """;
+        AddParameter(command, "$id", syncRunId);
+        AddParameter(command, "$accountId", accountId);
+        AddParameter(command, "$accountName", BlankToNull(accountName) ?? "(unknown)");
+        AddParameter(command, "$folderFilter", BlankToNull(folderFilter));
+        AddParameter(command, "$phase", phase);
+        AddParameter(command, "$total", Math.Max(0, total));
+        AddParameter(command, "$startedAt", now);
+        AddParameter(command, "$lastProgressAt", now);
+        command.ExecuteNonQuery();
+
+        return syncRunId;
+    }
+
+    public void UpdateSyncRunProgress(string syncRunId, int done, int total)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE sync_runs
+            SET
+                done = $done,
+                total = $total,
+                last_progress_at = $lastProgressAt
+            WHERE id = $id;
+            """;
+        AddParameter(command, "$id", syncRunId);
+        AddParameter(command, "$done", Math.Max(0, done));
+        AddParameter(command, "$total", Math.Max(0, total));
+        AddParameter(command, "$lastProgressAt", DateTimeOffset.UtcNow.ToString("O"));
+        command.ExecuteNonQuery();
+    }
+
+    public void CompleteSyncRun(
+        string syncRunId,
+        bool succeeded,
+        int done,
+        int total,
+        string lastError)
+    {
+        FinishSyncRun(syncRunId, succeeded ? "succeeded" : "failed", done, total, lastError);
+    }
+
+    public void CancelSyncRun(string syncRunId, int done, int total)
+    {
+        FinishSyncRun(syncRunId, "canceled", done, total, "canceled");
+    }
+
+    private void FinishSyncRun(
+        string syncRunId,
+        string status,
+        int done,
+        int total,
+        string lastError)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        command.CommandText = """
+            UPDATE sync_runs
+            SET
+                status = $status,
+                done = $done,
+                total = $total,
+                last_progress_at = $lastProgressAt,
+                completed_at = $completedAt,
+                last_error = $lastError
+            WHERE id = $id;
+            """;
+        AddParameter(command, "$id", syncRunId);
+        AddParameter(command, "$status", status);
+        AddParameter(command, "$done", Math.Max(0, done));
+        AddParameter(command, "$total", Math.Max(0, total));
+        AddParameter(command, "$lastProgressAt", now);
+        AddParameter(command, "$completedAt", now);
+        AddParameter(command, "$lastError", BlankToNull(lastError));
+        command.ExecuteNonQuery();
+    }
+
+    public SyncRunSnapshot ReadActiveSyncRun()
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        ReconcileStaleSyncRuns(connection);
+        return ReadActiveSyncRun(connection);
     }
 
     public int UpsertMessageMetadataBatch(
@@ -483,6 +658,7 @@ internal sealed class EmailDatabase
                     imap_host = $imapHost,
                     imap_port = $imapPort,
                     imap_security = $imapSecurity,
+                    history_days = $historyDays,
                     username = $username,
                     auth_type = $authType,
                     credential_ref = $credentialRef,
@@ -506,6 +682,7 @@ internal sealed class EmailDatabase
                     imap_host,
                     imap_port,
                     imap_security,
+                    history_days,
                     username,
                     auth_type,
                     credential_ref,
@@ -519,6 +696,7 @@ internal sealed class EmailDatabase
                     $imapHost,
                     $imapPort,
                     $imapSecurity,
+                    $historyDays,
                     $username,
                     $authType,
                     $credentialRef,
@@ -569,6 +747,7 @@ internal sealed class EmailDatabase
         AddParameter(command, "$imapHost", account.ImapHost);
         AddParameter(command, "$imapPort", account.ImapPort);
         AddParameter(command, "$imapSecurity", account.ImapSecurity);
+        AddParameter(command, "$historyDays", account.HistoryDays);
         AddParameter(command, "$username", account.Username);
         AddParameter(command, "$authType", "password");
         AddParameter(command, "$credentialRef", BlankToNull(account.CredentialRef));
@@ -1182,6 +1361,289 @@ internal sealed class EmailDatabase
         return accountIds.Order().ToList();
     }
 
+    private static int ReadScopedAccountCount(
+        SqliteConnection connection,
+        IReadOnlyList<int> accountIds,
+        IReadOnlyList<string> accountFilters)
+    {
+        if (accountIds.Count > 0)
+            return accountIds.Count;
+
+        if (HasValues(accountFilters))
+            return 0;
+
+        return ExecuteScalarInt(connection, "SELECT COUNT(*) FROM accounts WHERE enabled = 1;");
+    }
+
+    private static IReadOnlyList<MessageSearchFolderState> ReadMessageSearchFolderStates(
+        SqliteConnection connection,
+        IReadOnlyList<int> accountIds,
+        IReadOnlyList<string> folderRoles)
+    {
+        var query = CreateDbQuery(connection, SearchReadinessFoldersSql);
+        ApplyScopeConditions(query, accountIds, null, folderRoles, null);
+
+        using var command = query.CreateCommand();
+
+        using var reader = (SqliteDataReader)command.ExecuteReader();
+        var folders = new List<MessageSearchFolderState>();
+
+        while (reader.Read())
+        {
+            folders.Add(new(
+                FolderId: reader.GetInt32(reader.GetOrdinal("folder_id")),
+                HistoryDays: reader.GetInt32(reader.GetOrdinal("history_days")),
+                StateJson: GetNullableString(reader, "state_json"),
+                LastSuccessAt: GetNullableString(reader, "last_success_at"),
+                LastErrorAt: GetNullableString(reader, "last_error_at")));
+        }
+
+        return folders;
+    }
+
+    private static MessageSearchReadinessCounts ReadMessageSearchCounts(
+        SqliteConnection connection,
+        IReadOnlyList<int> accountIds,
+        MessageSearchReadinessRequest request)
+    {
+        var query = CreateDbQuery(connection, SearchReadinessCountsSql);
+        ApplyScopeConditions(query, accountIds, request.FromEmail, request.FolderRoles, request.HasAttachment);
+
+        using var command = query.CreateCommand();
+
+        using var reader = (SqliteDataReader)command.ExecuteReader();
+        if (!reader.Read())
+            return new(0, 0, 0, 0, 0);
+
+        return new(
+            MetadataMessages: reader.GetInt32(reader.GetOrdinal("metadata_messages")),
+            IndexedMessageBodies: reader.GetInt32(reader.GetOrdinal("indexed_message_bodies")),
+            MessageSearchDocs: reader.GetInt32(reader.GetOrdinal("message_search_docs")),
+            FtsRows: reader.GetInt32(reader.GetOrdinal("fts_rows")),
+            PendingMessageBodies: reader.GetInt32(reader.GetOrdinal("pending_message_bodies")));
+    }
+
+    private static void ApplyScopeConditions(
+        DbQuery query,
+        IReadOnlyList<int> accountIds,
+        string fromEmail,
+        IReadOnlyList<string> folderRoles,
+        bool? hasAttachment)
+    {
+        if (accountIds.Count > 0)
+            query.SetCondition("accountIds", accountIds);
+
+        query.SetCondition("fromEmail", BlankToNull(fromEmail), StringOperator.Is, ignoreIfNull: true);
+
+        if (HasValues(folderRoles))
+            query.SetCondition("folderRoles", folderRoles.Select(role => role.Trim().ToLowerInvariant()).ToList());
+
+        if (hasAttachment is bool hasAttachments)
+            query.SetCondition("hasAttachments", hasAttachments ? 1 : 0);
+    }
+
+    private static DbQuery CreateDbQuery(SqliteConnection connection, string sql)
+    {
+        var query = new DbQuery(connection, sql)
+        {
+            ParserHints = ParserHints.UseCustomSyntaxForParams
+        };
+
+        query.FormatParameterName += (_, e) =>
+        {
+            var parameterName = $"${e.FormattedName}";
+            e.FormattedName = parameterName;
+            e.FormattedForSqlPlaceholder = parameterName;
+        };
+
+        return query;
+    }
+
+    private static bool IsFolderMetadataComplete(MessageSearchFolderState folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder.LastSuccessAt))
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(folder.LastErrorAt))
+            return false;
+
+        var state = ParseMetadataSyncState(folder.StateJson);
+        if (state is null)
+            return false;
+
+        var coversHistory = state.SinceDays == 0 || state.SinceDays <= folder.HistoryDays;
+        var uncapped = state.MaxPerFolder == 0 || state.SelectedCount >= state.MatchedCount;
+        var fetchedSelected = state.FetchedCount >= state.SelectedCount;
+
+        return coversHistory
+            && uncapped
+            && fetchedSelected
+            && state.MissingCount == 0;
+    }
+
+    private static MetadataSyncState ParseMetadataSyncState(string stateJson)
+    {
+        if (string.IsNullOrWhiteSpace(stateJson))
+            return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(stateJson);
+            var root = document.RootElement;
+
+            if (!TryGetJsonInt(root, "since_days", out var sinceDays)
+                || !TryGetJsonInt(root, "max_per_folder", out var maxPerFolder)
+                || !TryGetJsonInt(root, "matched_count", out var matchedCount)
+                || !TryGetJsonInt(root, "selected_count", out var selectedCount)
+                || !TryGetJsonInt(root, "fetched_count", out var fetchedCount)
+                || !TryGetJsonInt(root, "missing_count", out var missingCount))
+                return null;
+
+            return new(sinceDays, maxPerFolder, matchedCount, selectedCount, fetchedCount, missingCount);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static bool TryGetJsonInt(JsonElement root, string name, out int value)
+    {
+        value = 0;
+        return root.TryGetProperty(name, out var property)
+            && property.ValueKind == JsonValueKind.Number
+            && property.TryGetInt32(out value);
+    }
+
+    private static SyncRunSnapshot ReadActiveSyncRun(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                id,
+                account_name,
+                folder_filter,
+                status,
+                phase,
+                done,
+                total,
+                started_at,
+                last_progress_at,
+                completed_at,
+                last_error
+            FROM sync_runs
+            WHERE status IN ('queued', 'running')
+            ORDER BY last_progress_at DESC
+            LIMIT 1;
+            """;
+
+        using var reader = command.ExecuteReader();
+        return reader.Read() ? ReadSyncRunSnapshot(reader) : null;
+    }
+
+    private static void ReconcileStaleSyncRuns(SqliteConnection connection)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var staleBefore = now.Subtract(StaleSyncRunAfter);
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE sync_runs
+            SET
+                status = 'failed',
+                last_progress_at = $lastProgressAt,
+                completed_at = $completedAt,
+                last_error = $lastError
+            WHERE status IN ('queued', 'running')
+              AND last_progress_at < $staleBefore;
+            """;
+        AddParameter(command, "$lastProgressAt", now.ToString("O"));
+        AddParameter(command, "$completedAt", now.ToString("O"));
+        AddParameter(
+            command,
+            "$lastError",
+            $"Sync run became stale after no progress for {StaleSyncRunAfter.TotalHours:0.#} hours; marking failed.");
+        AddParameter(command, "$staleBefore", staleBefore.ToString("O"));
+        command.ExecuteNonQuery();
+    }
+
+    private static readonly TimeSpan StaleSyncRunAfter = TimeSpan.FromHours(6);
+
+    private static SyncRunSnapshot ReadSyncRunSnapshot(SqliteDataReader reader)
+    {
+        var done = reader.GetInt32(reader.GetOrdinal("done"));
+        var total = reader.GetInt32(reader.GetOrdinal("total"));
+        var status = reader.GetString(reader.GetOrdinal("status"));
+        var startedAt = reader.GetString(reader.GetOrdinal("started_at"));
+        var completedAt = GetNullableString(reader, "completed_at");
+        var elapsedSeconds = CalculateElapsedSeconds(startedAt, completedAt);
+        var percent = CalculatePercent(status, done, total);
+        var estimatedRemainingSeconds = CalculateEstimatedRemainingSeconds(done, total, elapsedSeconds);
+
+        return new(
+            Id: reader.GetString(reader.GetOrdinal("id")),
+            AccountName: reader.GetString(reader.GetOrdinal("account_name")),
+            FolderFilter: GetNullableString(reader, "folder_filter"),
+            Status: status,
+            Phase: reader.GetString(reader.GetOrdinal("phase")),
+            Done: done,
+            Total: total,
+            Percent: percent,
+            ElapsedSeconds: elapsedSeconds,
+            EstimatedRemainingSeconds: estimatedRemainingSeconds,
+            EstimateConfidence: EstimateConfidence(done, total, elapsedSeconds),
+            StartedAt: startedAt,
+            LastProgressAt: reader.GetString(reader.GetOrdinal("last_progress_at")),
+            CompletedAt: completedAt,
+            LastError: GetNullableString(reader, "last_error"));
+    }
+
+    private static int CalculateElapsedSeconds(string startedAt, string completedAt)
+    {
+        if (!DateTimeOffset.TryParse(startedAt, out var start))
+            return 0;
+
+        var end = DateTimeOffset.TryParse(completedAt, out var completed)
+            ? completed
+            : DateTimeOffset.UtcNow;
+
+        return Math.Max(0, Convert.ToInt32(Math.Round((end - start).TotalSeconds)));
+    }
+
+    private static int CalculatePercent(string status, int done, int total)
+    {
+        if (total <= 0)
+            return status.Equals("succeeded", StringComparison.OrdinalIgnoreCase) ? 100 : 0;
+
+        return Math.Clamp(Convert.ToInt32(Math.Round(done * 100d / total)), 0, 100);
+    }
+
+    private static int? CalculateEstimatedRemainingSeconds(int done, int total, int elapsedSeconds)
+    {
+        if (done <= 0 || total <= 0 || done >= total || elapsedSeconds <= 0)
+            return null;
+
+        return Convert.ToInt32(Math.Round(elapsedSeconds * (total - done) / (double)done));
+    }
+
+    private static string EstimateConfidence(int done, int total, int elapsedSeconds)
+    {
+        if (done <= 0 || total <= 0 || elapsedSeconds < 10)
+            return "low";
+
+        if (done < Math.Min(10, total) || done < total / 2)
+            return "medium";
+
+        return "high";
+    }
+
+    private static string BuildSyncRunId()
+    {
+        var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmssfff");
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        return $"sync-{timestamp}-{suffix}";
+    }
+
     private static bool HasValues(IReadOnlyList<string> values) =>
         values is not null && values.Any(value => !string.IsNullOrWhiteSpace(value));
 
@@ -1332,6 +1794,28 @@ internal sealed class EmailDatabase
         return reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal);
     }
 
+    private sealed record MessageSearchFolderState(
+        int FolderId,
+        int HistoryDays,
+        string StateJson,
+        string LastSuccessAt,
+        string LastErrorAt);
+
+    private sealed record MessageSearchReadinessCounts(
+        int MetadataMessages,
+        int IndexedMessageBodies,
+        int MessageSearchDocs,
+        int FtsRows,
+        int PendingMessageBodies);
+
+    private sealed record MetadataSyncState(
+        int SinceDays,
+        int MaxPerFolder,
+        int MatchedCount,
+        int SelectedCount,
+        int FetchedCount,
+        int MissingCount);
+
     private const string MigrationTableSql = """
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
@@ -1369,9 +1853,9 @@ internal sealed class EmailDatabase
         JOIN accounts a ON a.id = m.account_id
         WHERE messages_fts MATCH $fts
         {AND
-            {m.account_id :accountIds}
-            {m.from_email COLLATE NOCASE :fromEmail}
-            {m.has_attachments :hasAttachments}
+            {m.account_id [accountIds]}
+            {m.from_email COLLATE NOCASE [fromEmail]}
+            {m.has_attachments [hasAttachments]}
             {EXISTS (
                 SELECT 1
                 FROM message_locations ml_filter
@@ -1379,9 +1863,59 @@ internal sealed class EmailDatabase
                 WHERE ml_filter.message_id = m.id
                   AND ml_filter.deleted_locally = 0
                   AND ml_filter.expunged = 0
-                  {AND {f_filter.role :folderRoles}}
+                  {AND {f_filter.role [folderRoles]}}
             )}}
         ORDER BY score, COALESCE(m.date_sent, m.date_received, '') DESC
         LIMIT $limit;
+        """;
+
+    private const string SearchReadinessFoldersSql = """
+        SELECT
+            f.id AS folder_id,
+            a.history_days,
+            s.state_json,
+            s.last_success_at,
+            s.last_error_at
+        FROM folders f
+        JOIN accounts a ON a.id = f.account_id
+        LEFT JOIN sync_state s ON s.account_id = f.account_id
+            AND s.folder_id = f.id
+        WHERE a.enabled = 1
+          AND f.selectable = 1
+          AND f.sync_enabled = 1
+        {AND
+            {a.id [accountIds]}
+            {f.role [folderRoles]}}
+        ORDER BY a.name COLLATE NOCASE, f.path COLLATE NOCASE;
+        """;
+
+    private const string SearchReadinessCountsSql = """
+        SELECT
+            COUNT(DISTINCT m.id) AS metadata_messages,
+            COUNT(DISTINCT CASE
+                WHEN m.body_downloaded = 1 AND b.message_id IS NOT NULL THEN m.id
+            END) AS indexed_message_bodies,
+            COUNT(DISTINCT d.message_id) AS message_search_docs,
+            COUNT(DISTINCT fts.rowid) AS fts_rows,
+            COUNT(DISTINCT CASE
+                WHEN m.body_downloaded = 0 OR b.message_id IS NULL THEN m.id
+            END) AS pending_message_bodies
+        FROM messages m
+        JOIN accounts a ON a.id = m.account_id
+        JOIN message_locations ml ON ml.message_id = m.id
+        JOIN folders f ON f.id = ml.folder_id
+        LEFT JOIN message_bodies b ON b.message_id = m.id
+        LEFT JOIN message_search_docs d ON d.message_id = m.id
+        LEFT JOIN messages_fts fts ON fts.rowid = m.id
+        WHERE a.enabled = 1
+          AND f.selectable = 1
+          AND f.sync_enabled = 1
+          AND ml.deleted_locally = 0
+          AND ml.expunged = 0
+        {AND
+            {m.account_id [accountIds]}
+            {m.from_email COLLATE NOCASE [fromEmail]}
+            {m.has_attachments [hasAttachments]}
+            {f.role [folderRoles]}}
         """;
 }

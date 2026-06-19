@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using System.Text.Json;
 
 namespace LceMcp.Tests;
 
@@ -13,8 +14,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Created, status.InitializationKind);
-        Assert.Equal(2, status.SchemaVersion);
-        Assert.Equal(2, status.TargetSchemaVersion);
+        Assert.Equal(3, status.SchemaVersion);
+        Assert.Equal(3, status.TargetSchemaVersion);
         Assert.Equal(0, status.AccountCount);
         Assert.Equal(0, status.FolderCount);
         Assert.Equal(0, status.MessageCount);
@@ -42,6 +43,7 @@ public sealed class EmailDatabaseTests
             "messages",
             "messages_fts",
             "schema_migrations",
+            "sync_runs",
             "sync_state"
         })
             Assert.Contains(tableName, tableNames);
@@ -57,8 +59,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Opened, status.InitializationKind);
-        Assert.Equal(2, status.SchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search"], ReadNames(
+        Assert.Equal(3, status.SchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
     }
@@ -87,12 +89,15 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Migrated, status.InitializationKind);
-        Assert.Equal(2, status.SchemaVersion);
-        Assert.Equal(2, status.TargetSchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search"], ReadNames(
+        Assert.Equal(3, status.SchemaVersion);
+        Assert.Equal(3, status.TargetSchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
         Assert.Contains("message_search_docs", ReadNames(
+            temp.Paths.DatabasePath,
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;"));
+        Assert.Contains("sync_runs", ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;"));
     }
@@ -294,6 +299,150 @@ public sealed class EmailDatabaseTests
         Assert.Single(updatedResults);
     }
 
+    [Fact]
+    public void MessageSearchReadinessRequiresCompleteMetadataBodiesAndSearchDocs()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(providerUid: "100", providerMessageKey: "emailid:abc-1", messageIdHeader: "abc-1@example.com"),
+            TestData.Message(providerUid: "101", providerMessageKey: "emailid:abc-2", messageIdHeader: "abc-2@example.com")
+        ], SyncStateJson(matchedCount: 2, selectedCount: 2, fetchedCount: 2), 101);
+
+        var request = new MessageSearchReadinessRequest(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null);
+        var initial = database.GetMessageSearchReadiness(request);
+        var messageIds = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages ORDER BY id;");
+
+        database.UpsertMessageBody(new(
+            MessageId: messageIds[0],
+            PlainText: "First indexed body",
+            HtmlText: null,
+            NormalizedText: "First indexed body",
+            Recipients: []));
+        var partial = database.GetMessageSearchReadiness(request);
+
+        database.UpsertMessageBody(new(
+            MessageId: messageIds[1],
+            PlainText: "Second indexed body",
+            HtmlText: null,
+            NormalizedText: "Second indexed body",
+            Recipients: []));
+        var ready = database.GetMessageSearchReadiness(request);
+
+        Assert.False(initial.SearchReady);
+        Assert.True(initial.MetadataComplete);
+        Assert.False(initial.BodiesComplete);
+        Assert.False(initial.MessageSearchIndexComplete);
+        Assert.Equal(2, initial.PendingMessageBodies);
+        Assert.False(partial.SearchReady);
+        Assert.Equal(1, partial.PendingMessageBodies);
+        Assert.True(ready.SearchReady);
+        Assert.Equal(2, ready.MetadataMessages);
+        Assert.Equal(2, ready.IndexedMessageBodies);
+        Assert.Equal(2, ready.MessageSearchDocs);
+        Assert.Equal(2, ready.FtsRows);
+        Assert.Equal(0, ready.PendingMessageBodies);
+    }
+
+    [Fact]
+    public void MessageSearchReadinessRejectsCappedMetadataSync()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(providerUid: "100", providerMessageKey: "emailid:abc-1", messageIdHeader: "abc-1@example.com")
+        ], SyncStateJson(maxPerFolder: 1, matchedCount: 2, selectedCount: 1, fetchedCount: 1), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Indexed body",
+            HtmlText: null,
+            NormalizedText: "Indexed body",
+            Recipients: []));
+
+        var readiness = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null));
+
+        Assert.False(readiness.SearchReady);
+        Assert.False(readiness.MetadataComplete);
+        Assert.True(readiness.BodiesComplete);
+        Assert.True(readiness.MessageSearchIndexComplete);
+        Assert.Equal(1, readiness.MetadataMessages);
+        Assert.Equal(0, readiness.PendingMessageBodies);
+    }
+
+    [Fact]
+    public void SyncRunsExposeActiveProgressUntilCompleted()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+
+        var syncRunId = database.StartSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
+        var active = database.ReadActiveSyncRun();
+
+        database.UpdateSyncRunProgress(syncRunId, done: 3, total: 10);
+        var progressed = database.ReadActiveSyncRun();
+
+        database.CompleteSyncRun(syncRunId, succeeded: true, done: 10, total: 10, lastError: null);
+
+        Assert.Equal(syncRunId, active.Id);
+        Assert.Equal("running", active.Status);
+        Assert.Equal("syncing_bodies", active.Phase);
+        Assert.Equal(10, active.Total);
+        Assert.Equal(3, progressed.Done);
+        Assert.Equal(30, progressed.Percent);
+        Assert.Null(database.ReadActiveSyncRun());
+    }
+
+    [Fact]
+    public void ReadActiveSyncRunMarksStaleRunsFailed()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        var syncRunId = database.StartSyncRun(accountId, "yahoo", "Inbox", "syncing_bodies", total: 10);
+        var staleTimestamp = DateTimeOffset.UtcNow.AddHours(-7).ToString("O");
+
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE sync_runs
+            SET
+                started_at = '{staleTimestamp}',
+                last_progress_at = '{staleTimestamp}'
+            WHERE id = '{syncRunId}';
+            """);
+
+        var active = database.ReadActiveSyncRun();
+        var row = ReadNullableNames(
+            temp.Paths.DatabasePath,
+            "SELECT status || '|' || COALESCE(last_error, '') FROM sync_runs WHERE id = (SELECT id FROM sync_runs LIMIT 1);").Single();
+
+        Assert.Null(active);
+        Assert.StartsWith("failed|Sync run became stale", row);
+    }
+
     private static string[] ReadNames(string databasePath, string sql)
     {
         using var connection = OpenReadConnection(databasePath);
@@ -370,4 +519,21 @@ public sealed class EmailDatabaseTests
         connection.Open();
         return connection;
     }
+
+    private static string SyncStateJson(
+        int sinceDays = 30,
+        int maxPerFolder = 0,
+        int matchedCount = 1,
+        int selectedCount = 1,
+        int fetchedCount = 1,
+        int missingCount = 0) =>
+        JsonSerializer.Serialize(new Dictionary<string, int>
+        {
+            ["since_days"] = sinceDays,
+            ["max_per_folder"] = maxPerFolder,
+            ["matched_count"] = matchedCount,
+            ["selected_count"] = selectedCount,
+            ["fetched_count"] = fetchedCount,
+            ["missing_count"] = missingCount
+        });
 }
