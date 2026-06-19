@@ -35,6 +35,8 @@ internal sealed class EmailDatabase
             TargetSchemaVersion: DatabaseMigrations.TargetVersion,
             AccountCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM accounts;"),
             FolderCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM folders;"),
+            MessageCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM messages;"),
+            MessageLocationCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM message_locations;"),
             LastSyncState: ReadLastSyncState(connection),
             InitializationKind: initializationKind);
     }
@@ -165,6 +167,111 @@ internal sealed class EmailDatabase
         }
 
         return folders;
+    }
+
+    public IReadOnlyList<StoredFolder> ReadSyncFolders(string accountFilter, string folderFilter)
+    {
+        var folders = ReadFolders(accountFilter)
+            .Where(folder => folder.Selectable && folder.SyncEnabled);
+
+        if (!string.IsNullOrWhiteSpace(folderFilter))
+        {
+            var requested = folderFilter.Trim();
+            folders = folders.Where(folder =>
+                folder.Path.Equals(requested, StringComparison.OrdinalIgnoreCase)
+                || folder.Name.Equals(requested, StringComparison.OrdinalIgnoreCase)
+                || folder.Id.ToString().Equals(requested, StringComparison.OrdinalIgnoreCase));
+        }
+
+        return folders
+            .OrderBy(folder => folder.Path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    public int UpsertMessageMetadataBatch(
+        int accountId,
+        int folderId,
+        IReadOnlyCollection<MessageMetadata> messages,
+        string stateJson,
+        uint? highestUid)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        var now = DateTimeOffset.UtcNow.ToString("O");
+
+        foreach (var message in messages)
+            UpsertMessageMetadata(connection, transaction, accountId, folderId, message, now);
+
+        MarkFolderSyncSucceeded(connection, transaction, accountId, folderId, stateJson, highestUid, now);
+
+        transaction.Commit();
+        return messages.Count;
+    }
+
+    public void MarkFolderSyncSucceeded(
+        int accountId,
+        int folderId,
+        string stateJson,
+        uint? highestUid)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        MarkFolderSyncSucceeded(
+            connection,
+            transaction,
+            accountId,
+            folderId,
+            stateJson,
+            highestUid,
+            DateTimeOffset.UtcNow.ToString("O"));
+
+        transaction.Commit();
+    }
+
+    public void MarkFolderSyncFailed(
+        int accountId,
+        int folderId,
+        string error)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        var now = DateTimeOffset.UtcNow.ToString("O");
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO sync_state (
+                account_id,
+                folder_id,
+                last_error_at,
+                last_error
+            )
+            VALUES (
+                $accountId,
+                $folderId,
+                $lastErrorAt,
+                $lastError
+            )
+            ON CONFLICT(account_id, folder_id) DO UPDATE SET
+                last_error_at = excluded.last_error_at,
+                last_error = excluded.last_error;
+            """;
+        AddParameter(command, "$accountId", accountId);
+        AddParameter(command, "$folderId", folderId);
+        AddParameter(command, "$lastErrorAt", now);
+        AddParameter(command, "$lastError", error);
+        command.ExecuteNonQuery();
+
+        transaction.Commit();
     }
 
     private DatabaseInitializationKind EnsurePrototypeDatabase()
@@ -488,6 +595,381 @@ internal sealed class EmailDatabase
         command.ExecuteNonQuery();
     }
 
+    private static void UpsertMessageMetadata(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int accountId,
+        int folderId,
+        MessageMetadata message,
+        string now)
+    {
+        var messageId = FindExistingMessageId(connection, transaction, accountId, folderId, message);
+
+        if (messageId is int existingMessageId)
+        {
+            UpdateMessage(connection, transaction, existingMessageId, message, now);
+            UpsertMessageLocation(connection, transaction, existingMessageId, accountId, folderId, message, now);
+            return;
+        }
+
+        var insertedMessageId = InsertMessage(connection, transaction, accountId, message, now);
+        UpsertMessageLocation(connection, transaction, insertedMessageId, accountId, folderId, message, now);
+    }
+
+    private static int? FindExistingMessageId(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int accountId,
+        int folderId,
+        MessageMetadata message)
+    {
+        var existingLocation = ExecuteScalarNullableInt(
+            connection,
+            transaction,
+            """
+            SELECT message_id
+            FROM message_locations
+            WHERE account_id = $accountId
+              AND folder_id = $folderId
+              AND provider_uid = $providerUid
+            LIMIT 1;
+            """,
+            command =>
+            {
+                AddParameter(command, "$accountId", accountId);
+                AddParameter(command, "$folderId", folderId);
+                AddParameter(command, "$providerUid", message.ProviderUid);
+            });
+
+        if (existingLocation is not null)
+            return existingLocation;
+
+        if (!string.IsNullOrWhiteSpace(message.ProviderMessageKey))
+        {
+            var existingProviderMessage = ExecuteScalarNullableInt(
+                connection,
+                transaction,
+                """
+                SELECT id
+                FROM messages
+                WHERE account_id = $accountId
+                  AND provider_message_key = $providerMessageKey
+                ORDER BY id
+                LIMIT 1;
+                """,
+                command =>
+                {
+                    AddParameter(command, "$accountId", accountId);
+                    AddParameter(command, "$providerMessageKey", message.ProviderMessageKey);
+                });
+
+            if (existingProviderMessage is not null)
+                return existingProviderMessage;
+        }
+
+        if (!string.IsNullOrWhiteSpace(message.MessageIdHeader))
+        {
+            return ExecuteScalarNullableInt(
+                connection,
+                transaction,
+                """
+                SELECT id
+                FROM messages
+                WHERE account_id = $accountId
+                  AND message_id_header = $messageIdHeader
+                ORDER BY id
+                LIMIT 1;
+                """,
+                command =>
+                {
+                    AddParameter(command, "$accountId", accountId);
+                    AddParameter(command, "$messageIdHeader", message.MessageIdHeader);
+                });
+        }
+
+        return null;
+    }
+
+    private static int InsertMessage(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int accountId,
+        MessageMetadata message,
+        string now)
+    {
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO messages (
+                    account_id,
+                    provider_message_key,
+                    provider_thread_key,
+                    message_id_header,
+                    in_reply_to,
+                    references_header,
+                    thread_key,
+                    subject,
+                    normalized_subject,
+                    from_name,
+                    from_email,
+                    date_sent,
+                    date_received,
+                    has_attachments,
+                    size_bytes,
+                    raw_headers,
+                    body_downloaded,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $accountId,
+                    $providerMessageKey,
+                    $providerThreadKey,
+                    $messageIdHeader,
+                    $inReplyTo,
+                    $referencesHeader,
+                    $threadKey,
+                    $subject,
+                    $normalizedSubject,
+                    $fromName,
+                    $fromEmail,
+                    $dateSent,
+                    $dateReceived,
+                    $hasAttachments,
+                    $sizeBytes,
+                    $rawHeaders,
+                    0,
+                    $createdAt,
+                    $updatedAt
+                );
+                """;
+            AddMessageParameters(command, accountId, message);
+            AddParameter(command, "$createdAt", now);
+            AddParameter(command, "$updatedAt", now);
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = "SELECT last_insert_rowid();";
+            return Convert.ToInt32(command.ExecuteScalar());
+        }
+    }
+
+    private static void UpdateMessage(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int messageId,
+        MessageMetadata message,
+        string now)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE messages
+            SET
+                provider_message_key = COALESCE($providerMessageKey, provider_message_key),
+                provider_thread_key = COALESCE($providerThreadKey, provider_thread_key),
+                message_id_header = COALESCE($messageIdHeader, message_id_header),
+                in_reply_to = COALESCE($inReplyTo, in_reply_to),
+                references_header = COALESCE($referencesHeader, references_header),
+                thread_key = COALESCE($threadKey, thread_key),
+                subject = COALESCE($subject, subject),
+                normalized_subject = COALESCE($normalizedSubject, normalized_subject),
+                from_name = COALESCE($fromName, from_name),
+                from_email = COALESCE($fromEmail, from_email),
+                date_sent = COALESCE($dateSent, date_sent),
+                date_received = COALESCE($dateReceived, date_received),
+                has_attachments = $hasAttachments,
+                size_bytes = COALESCE($sizeBytes, size_bytes),
+                raw_headers = COALESCE($rawHeaders, raw_headers),
+                updated_at = $updatedAt
+            WHERE id = $id;
+            """;
+        AddParameter(command, "$id", messageId);
+        AddMessageParameters(command, accountId: 0, message);
+        AddParameter(command, "$updatedAt", now);
+        command.ExecuteNonQuery();
+    }
+
+    private static void AddMessageParameters(
+        SqliteCommand command,
+        int accountId,
+        MessageMetadata message)
+    {
+        if (accountId != 0)
+            AddParameter(command, "$accountId", accountId);
+
+        AddParameter(command, "$providerMessageKey", BlankToNull(message.ProviderMessageKey));
+        AddParameter(command, "$providerThreadKey", BlankToNull(message.ProviderThreadKey));
+        AddParameter(command, "$messageIdHeader", BlankToNull(message.MessageIdHeader));
+        AddParameter(command, "$inReplyTo", BlankToNull(message.InReplyTo));
+        AddParameter(command, "$referencesHeader", BlankToNull(message.ReferencesHeader));
+        AddParameter(command, "$threadKey", BlankToNull(message.ThreadKey));
+        AddParameter(command, "$subject", BlankToNull(message.Subject));
+        AddParameter(command, "$normalizedSubject", BlankToNull(message.NormalizedSubject));
+        AddParameter(command, "$fromName", BlankToNull(message.FromName));
+        AddParameter(command, "$fromEmail", BlankToNull(message.FromEmail));
+        AddParameter(command, "$dateSent", BlankToNull(message.DateSent));
+        AddParameter(command, "$dateReceived", BlankToNull(message.DateReceived));
+        AddParameter(command, "$hasAttachments", message.HasAttachments ? 1 : 0);
+        AddParameter(command, "$sizeBytes", message.SizeBytes);
+        AddParameter(command, "$rawHeaders", BlankToNull(message.RawHeaders));
+    }
+
+    private static void UpsertMessageLocation(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int messageId,
+        int accountId,
+        int folderId,
+        MessageMetadata message,
+        string now)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO message_locations (
+                message_id,
+                account_id,
+                folder_id,
+                provider_uid,
+                provider_message_key,
+                flags,
+                labels,
+                deleted_locally,
+                expunged,
+                first_seen_at,
+                last_seen_at
+            )
+            VALUES (
+                $messageId,
+                $accountId,
+                $folderId,
+                $providerUid,
+                $providerMessageKey,
+                $flags,
+                $labels,
+                0,
+                0,
+                $firstSeenAt,
+                $lastSeenAt
+            )
+            ON CONFLICT(account_id, folder_id, provider_uid) DO UPDATE SET
+                message_id = excluded.message_id,
+                provider_message_key = COALESCE(excluded.provider_message_key, message_locations.provider_message_key),
+                flags = excluded.flags,
+                labels = excluded.labels,
+                deleted_locally = 0,
+                expunged = 0,
+                last_seen_at = excluded.last_seen_at;
+            """;
+        AddParameter(command, "$messageId", messageId);
+        AddParameter(command, "$accountId", accountId);
+        AddParameter(command, "$folderId", folderId);
+        AddParameter(command, "$providerUid", message.ProviderUid);
+        AddParameter(command, "$providerMessageKey", BlankToNull(message.ProviderMessageKey));
+        AddParameter(command, "$flags", BlankToNull(message.Flags));
+        AddParameter(command, "$labels", BlankToNull(message.Labels));
+        AddParameter(command, "$firstSeenAt", now);
+        AddParameter(command, "$lastSeenAt", now);
+        command.ExecuteNonQuery();
+    }
+
+    private static void MarkFolderSyncSucceeded(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int accountId,
+        int folderId,
+        string stateJson,
+        uint? highestUid,
+        string now)
+    {
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO sync_state (
+                    account_id,
+                    folder_id,
+                    state_json,
+                    last_success_at,
+                    last_error_at,
+                    last_error
+                )
+                VALUES (
+                    $accountId,
+                    $folderId,
+                    $stateJson,
+                    $lastSuccessAt,
+                    NULL,
+                    NULL
+                )
+                ON CONFLICT(account_id, folder_id) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    last_success_at = excluded.last_success_at,
+                    last_error_at = NULL,
+                    last_error = NULL;
+                """;
+            AddParameter(command, "$accountId", accountId);
+            AddParameter(command, "$folderId", folderId);
+            AddParameter(command, "$stateJson", BlankToNull(stateJson));
+            AddParameter(command, "$lastSuccessAt", now);
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                UPDATE folders
+                SET
+                    last_uid = CASE
+                        WHEN $lastUid IS NULL THEN last_uid
+                        WHEN last_uid IS NULL THEN $lastUid
+                        WHEN $lastUid > last_uid THEN $lastUid
+                        ELSE last_uid
+                    END,
+                    last_sync_at = $lastSyncAt
+                WHERE id = $folderId;
+                """;
+            AddParameter(command, "$folderId", folderId);
+            AddParameter(command, "$lastUid", highestUid);
+            AddParameter(command, "$lastSyncAt", now);
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                UPDATE accounts
+                SET last_sync_at = $lastSyncAt
+                WHERE id = $accountId;
+                """;
+            AddParameter(command, "$accountId", accountId);
+            AddParameter(command, "$lastSyncAt", now);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static int? ExecuteScalarNullableInt(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sql,
+        Action<SqliteCommand> bind)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        bind(command);
+
+        var value = command.ExecuteScalar();
+        return value is null || value is DBNull ? null : Convert.ToInt32(value);
+    }
+
     private static void AddParameter(SqliteCommand command, string name, object value)
     {
         command.Parameters.AddWithValue(name, value ?? DBNull.Value);
@@ -698,6 +1180,49 @@ internal sealed class EmailDatabase
             UNIQUE(account_id, folder_id)
         );
 
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            provider_message_key TEXT,
+            provider_thread_key TEXT,
+            message_id_header TEXT,
+            in_reply_to TEXT,
+            references_header TEXT,
+            thread_key TEXT,
+            subject TEXT,
+            normalized_subject TEXT,
+            from_name TEXT,
+            from_email TEXT,
+            date_sent TEXT,
+            date_received TEXT,
+            has_attachments INTEGER NOT NULL DEFAULT 0,
+            size_bytes INTEGER,
+            raw_headers TEXT,
+            body_downloaded INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS message_locations (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            folder_id INTEGER NOT NULL,
+            provider_uid TEXT NOT NULL,
+            provider_message_key TEXT,
+            flags TEXT,
+            labels TEXT,
+            deleted_locally INTEGER NOT NULL DEFAULT 0,
+            expunged INTEGER NOT NULL DEFAULT 0,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+            FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE,
+            UNIQUE(account_id, folder_id, provider_uid)
+        );
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY,
             timestamp TEXT NOT NULL,
@@ -713,6 +1238,12 @@ internal sealed class EmailDatabase
 
         CREATE INDEX IF NOT EXISTS idx_folders_account_role ON folders(account_id, role);
         CREATE INDEX IF NOT EXISTS idx_sync_state_last_success ON sync_state(last_success_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_date ON messages(account_id, date_sent);
+        CREATE INDEX IF NOT EXISTS idx_messages_provider_key ON messages(account_id, provider_message_key);
+        CREATE INDEX IF NOT EXISTS idx_messages_message_id_header ON messages(account_id, message_id_header);
+        CREATE INDEX IF NOT EXISTS idx_messages_thread_key ON messages(account_id, thread_key);
+        CREATE INDEX IF NOT EXISTS idx_message_locations_message ON message_locations(message_id);
+        CREATE INDEX IF NOT EXISTS idx_message_locations_folder_uid ON message_locations(folder_id, provider_uid);
         CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
         """;
 }

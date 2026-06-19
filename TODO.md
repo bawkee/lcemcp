@@ -86,11 +86,27 @@ After account/folder discovery is durable, sync message envelopes for a bounded 
 
 Next work:
 
-- Add `messages` and `message_locations` tables from the spec, scoped to a pragmatic first subset.
-- Sync newest messages first for a configurable `history_days`.
-- Commit in small batches and advance `sync_state` only after a batch succeeds.
-- Store stable provider IDs where available. Yahoo advertises `ObjectID`, so investigate whether MailKit exposes a useful provider-stable ID before relying on Message-ID fallback.
-- Make all upserts idempotent.
+Completed on 2026-06-19:
+
+- Added prototype schema v2 with `messages` and `message_locations`, plus status counts for stored messages and message locations. Because migrations are still locked, old prototype DBs rebuild under the new prototype marker.
+- Added `sync` CLI for bounded envelope metadata sync. It syncs newest messages first, uses account `history_days` by default, supports `--since-days`, `--folder`, `--max-per-folder`, and `--batch-size`, and auto-discovers folders when the local folder cache is empty after a prototype reset.
+- Metadata fetch requests include MailKit `EmailId`/`ThreadId` when the server advertises `ObjectID`, and Gmail IDs/labels when `GMailExt1` is available. Yahoo ObjectID values were confirmed in the database as `emailid:*` provider keys and `threadid:*` thread keys.
+- Message upserts are idempotent by existing folder UID location first, then provider message key, then `Message-ID` header fallback. `message_locations` is idempotent on `(account_id, folder_id, provider_uid)`.
+- Sync commits each fetched batch and advances `sync_state`, `folders.last_uid`, `folders.last_sync_at`, and `accounts.last_sync_at` only after the batch transaction succeeds.
+
+Test result:
+
+- `dotnet build lcemcp.slnx` succeeded on 2026-06-19.
+- Temp-config `status` smoke test created schema version 2 and reported 0 messages / 0 message locations.
+- Live Yahoo metadata sync succeeded on 2026-06-19 with `sync --account yahoo --folder Inbox --since-days 3 --max-per-folder 5 --batch-size 2`: auto-discovered 16 folders after prototype reset, matched 16 Inbox UIDs, selected 5, fetched 5, persisted 5, missing 0, highest UID 283547.
+- Re-running the same live sync stayed idempotent: status still reported 5 messages and 5 message locations.
+
+Next work:
+
+- Add focused tests once the first test project exists, especially schema v2 initialization and metadata upsert idempotence.
+- Run a wider Yahoo metadata sync, likely Inbox first with the account's 30-day window, and record whether the older missing-summary question reproduces.
+- Add a local message-list/debug command if needed before body sync, so synced metadata can be inspected without ad hoc database queries.
+- Continue with body sync and local search once metadata sync has had a slightly wider live run.
 
 ## 5. Implement Body Sync And Local Search
 

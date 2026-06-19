@@ -7,6 +7,8 @@ internal sealed record DatabaseStatus(
     int TargetSchemaVersion,
     int AccountCount,
     int FolderCount,
+    int MessageCount,
+    int MessageLocationCount,
     SyncStateStatus LastSyncState,
     DatabaseInitializationKind InitializationKind);
 
