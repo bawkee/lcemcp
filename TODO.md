@@ -184,13 +184,47 @@ Once local status and basic storage exist, add MCP stdio without disrupting CLI 
 
 Next work:
 
-- Add the MCP stdio server command: `serve`.
-- Ensure diagnostics/logging go to stderr so JSON-RPC stdout stays clean.
-- Start with `email_get_sync_status`, including binary search readiness and sync-run progress fields before exposing search.
-- Add read-only tools in this order: `email_list_accounts`, `email_list_folders`, `email_search`, `email_get_message`, `email_sync_now`.
-- `email_search` must return `not_synced` rather than empty results when the requested corpus is not fully indexed.
-- `email_sync_now` should use the lease-backed queue but return a durable queued/running run/status id and progress instead of waiting like the CLI commands do.
-- Log every MCP call to `audit_log`.
+Completed on 2026-06-20:
+
+- Added the MCP stdio server command: `serve`.
+- Implemented a small explicit line-delimited JSON-RPC stdio loop for `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`.
+- Negotiates supported MCP protocol versions and defaults to the current official `2025-11-25` version when the client asks for an unsupported version.
+- Ensured MCP diagnostics go to stderr; stdout is reserved for JSON-RPC messages only.
+- Added first read-only MCP tool: `email_get_sync_status`.
+- `email_get_sync_status` returns structured content plus text fallback, configured account status, config validation issues, binary message-search readiness, readiness counts, active sync-run progress, and optional known folder sync state.
+- Added audit-log writes for `email_get_sync_status` tool calls.
+
+Completed on 2026-06-20 follow-up:
+
+- Expanded the MCP tool catalog beyond status-only. MCP now exposes `email_list_accounts`, `email_list_folders`, `email_search`, `email_get_message`, `email_sync_now`, and `email_get_sync_status`.
+- `email_search` uses the same local FTS path and binary readiness gate as the CLI. It returns `not_synced` with readiness/progress details rather than ordinary empty results when the requested corpus is incomplete. `allow_partial` remains an explicit debug opt-in.
+- MCP `email_search` resolves account scope through enabled configured accounts before querying SQLite, so stale local database rows for removed/unconfigured accounts are not exposed through MCP.
+- `email_get_message` reads one locally cached message by stable local `message_id`, returns bounded body text, sender/recipient/folder context, and does not expose raw filesystem paths or raw provider access.
+- `email_sync_now` starts or queues metadata+body indexing for configured accounts, returns quickly with a durable `sync_run_id`, and runs provider work on a background task using the existing global sync lease/queue. Clients should poll `email_get_sync_status`.
+- Added local storage helpers for bounded message reads, sync-run phase changes, affected-message audit ids, account sync summaries, and folder `last_sync_at`.
+- MCP tool calls are audited to `audit_log`; search/message calls include affected local message ids when available.
+
+Test result:
+
+- `dotnet build lcemcp.slnx` succeeded on 2026-06-20.
+- `dotnet test lcemcp.slnx` passed with 25 tests on 2026-06-20. New coverage exercises MCP initialize/tools-list behavior, stdout/stderr separation, `email_get_sync_status` structured readiness output, and audit logging.
+- Temp-config CLI stdio smoke succeeded on 2026-06-20: `serve` returned valid JSON-RPC for initialize and tools/list on stdout, while the startup diagnostic went to stderr.
+- `dotnet build lcemcp.slnx` succeeded after the expanded MCP catalog on 2026-06-20.
+- `dotnet test lcemcp.slnx` passed with 26 tests on 2026-06-20. New coverage drives a ready local message index through MCP `email_search` and `email_get_message`, including audit rows with affected message ids.
+- Temp-config CLI stdio smoke succeeded on 2026-06-20 after the expanded catalog: `tools/list` returned all six MCP tools, and `email_search` returned structured `not_synced` output on stdout with diagnostics only on stderr.
+- Live real-config MCP smoke succeeded on 2026-06-20 without recording private snippets/subjects/senders:
+  - Initial `email_get_sync_status` for Yahoo reported `search_ready=false`, 50 metadata messages, and 3 indexed messages.
+  - Normal `email_search` for Yahoo Inbox returned `status=not_synced` and 0 results, as intended for the incomplete corpus.
+  - Bounded `email_sync_now` for Yahoo Inbox with `since_days=3` and `max_per_folder=2` returned a running `sync_run_id`; same-server polling showed phase changes from `syncing_metadata` to `syncing_bodies`.
+  - The bounded sync completed within the polling window and advanced the real cache to 52 metadata messages and 5 indexed bodies/search docs.
+  - `dotnet-script` 2.0.1 was installed for future smoke harnesses. A follow-up MCP `email_search` with `allow_partial=true` over generic terms returned `status=partial`, 2 results, 2 snippets, and both snippets included FTS hit markers. Snippet text was not recorded.
+- Follow-up real database inspection on 2026-06-20 explained the 52-message / 5-FTS-row gap: all 5 downloaded bodies had matching `message_search_docs` and `messages_fts` rows, while the other 47 messages were still `body_downloaded = 0`. This is expected after the deliberately bounded body syncs, not an FTS trigger failure. The only recorded metadata sync state was Yahoo Inbox with `since_days=3` and `max_per_folder=2`, so default all-folder readiness also correctly remained `not_synced`.
+
+Next work:
+
+- Expand body sync toward full readiness for the configured history window, then rerun normal MCP `email_search` without `allow_partial`.
+- Add `email_get_audit_events` once there is enough audit history to inspect through MCP.
+- Later MCP tools remain `email_get_thread` and attachment-text search/read once those local features exist.
 
 ## 7. Add Focused Tests
 
@@ -205,6 +239,8 @@ Next work:
 - Completed on 2026-06-19: Added readiness/sync-run tests for schema version 3, binary search readiness, capped metadata detection, active sync-run progress, and stale sync-run reconciliation. `dotnet test lcemcp.slnx` passed with 16 tests.
 - Completed on 2026-06-19: Added sync lease/queue tests for schema version 4, queued second run behavior, old progress with live lease, expired lease recovery, and stale owner completion refusal. `dotnet test lcemcp.slnx` passed with 19 tests.
 - Completed on 2026-06-19: Expanded sync lease tests after review to cover expired heartbeat refusal, queued successor claim after a crashed running owner, abandoned queued-run cleanup, and wrong-owner heartbeat/progress/completion refusal. `dotnet test lcemcp.slnx` passed with 23 tests.
+- Completed on 2026-06-20: Added MCP stdio tests for initialize/tools-list, stdout/stderr separation, `email_get_sync_status` structured readiness output, and audit logging. `dotnet test lcemcp.slnx` passed with 25 tests.
+- Completed on 2026-06-20: Expanded MCP tests to cover the full exposed tool catalog plus ready-index `email_search` and `email_get_message`, including affected-message audit ids. `dotnet test lcemcp.slnx` passed with 26 tests.
 - Add an optional manual IMAP smoke test path that requires a configured real account and is not run by default.
 
 ## 8. Later Milestones

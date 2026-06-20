@@ -28,6 +28,7 @@ internal static class CliApp
             "sync" => await SyncAsync(configStore, credentialStore, database, options, cancellationToken),
             "sync-bodies" => await SyncBodiesAsync(configStore, credentialStore, database, options, cancellationToken),
             "search" => Search(database, options),
+            "serve" => await McpStdioServer.RunAsync(configStore, database, cancellationToken),
             "credential-test" => CredentialTest(configStore, credentialStore, options),
             "credential-delete" => CredentialDelete(configStore, credentialStore, options),
             "imap-test" => await ImapTestAsync(configStore, credentialStore, options, cancellationToken),
@@ -208,7 +209,7 @@ internal static class CliApp
         {
             Console.WriteLine($"{folder.AccountName}  {folder.Path}  role={folder.Role}  selectable={folder.Selectable.ToString().ToLowerInvariant()}  sync={folder.SyncEnabled.ToString().ToLowerInvariant()}");
             Console.WriteLine($"  id={folder.Id}  name={folder.Name}  delimiter={FormatOptional(folder.Delimiter)}  uidvalidity={FormatOptional(folder.UidValidity)}  messages={FormatOptional(folder.MessageCount)}  recent={FormatOptional(folder.RecentCount)}");
-            Console.WriteLine($"  attrs={FormatOptional(folder.Attributes)}  discovered={FormatOptional(folder.LastDiscoveredAt)}");
+            Console.WriteLine($"  attrs={FormatOptional(folder.Attributes)}  discovered={FormatOptional(folder.LastDiscoveredAt)}  last_sync={FormatOptional(folder.LastSyncAt)}");
         }
 
         return 0;
@@ -932,6 +933,7 @@ internal static class CliApp
           sync              Sync bounded message envelope metadata into local SQLite storage.
           sync-bodies       Download body text for already-synced message metadata and index it locally.
           search            Search local indexed message metadata and body text.
+          serve             Run the MCP stdio server. Writes protocol messages only to stdout.
           credential-test   Check whether an account credential can be found.
           credential-delete Delete an account credential from Windows Credential Manager.
           imap-test         Connect to IMAP, list folders, search/fetch message summaries, optionally fetch one body.
@@ -945,6 +947,7 @@ internal static class CliApp
           dotnet run --project src/LceMcp -- sync --account yahoo --folder Inbox --max-per-folder 50
           dotnet run --project src/LceMcp -- sync-bodies --account yahoo --folder Inbox --max-per-folder 10
           dotnet run --project src/LceMcp -- search --query "refund processed" --account yahoo
+          dotnet run --project src/LceMcp -- serve
           dotnet run --project src/LceMcp -- credential-test --account yahoo
           dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund processed" --limit 5
           dotnet run --project src/LceMcp -- imap-test --account yahoo --limit 3 --fetch-first-body

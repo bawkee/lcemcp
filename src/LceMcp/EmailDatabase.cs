@@ -111,7 +111,8 @@ internal sealed class EmailDatabase
                     f.uidvalidity,
                     f.message_count,
                     f.recent_count,
-                    f.last_discovered_at
+                    f.last_discovered_at,
+                    f.last_sync_at
                 FROM folders f
                 JOIN accounts a ON a.id = f.account_id
                 ORDER BY a.name COLLATE NOCASE, f.path COLLATE NOCASE;
@@ -132,7 +133,8 @@ internal sealed class EmailDatabase
                     f.uidvalidity,
                     f.message_count,
                     f.recent_count,
-                    f.last_discovered_at
+                    f.last_discovered_at,
+                    f.last_sync_at
                 FROM folders f
                 JOIN accounts a ON a.id = f.account_id
                 WHERE a.name COLLATE NOCASE = $accountFilter
@@ -164,7 +166,8 @@ internal sealed class EmailDatabase
                 UidValidity: GetNullableString(reader, "uidvalidity"),
                 MessageCount: GetNullableInt(reader, "message_count"),
                 RecentCount: GetNullableInt(reader, "recent_count"),
-                LastDiscoveredAt: GetNullableString(reader, "last_discovered_at")));
+                LastDiscoveredAt: GetNullableString(reader, "last_discovered_at"),
+                LastSyncAt: GetNullableString(reader, "last_sync_at")));
         }
 
         return folders;
@@ -187,6 +190,112 @@ internal sealed class EmailDatabase
         return folders
             .OrderBy(folder => folder.Path, StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    public AccountSyncSummary ReadAccountSyncSummary(string accountFilter)
+    {
+        EnsureInitialized();
+
+        if (string.IsNullOrWhiteSpace(accountFilter))
+            return null;
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                a.id,
+                a.name,
+                a.email_address,
+                (
+                    SELECT s.last_success_at
+                    FROM sync_state s
+                    WHERE s.account_id = a.id
+                      AND s.last_success_at IS NOT NULL
+                    ORDER BY s.last_success_at DESC
+                    LIMIT 1
+                ) AS last_success_at,
+                (
+                    SELECT s.last_error_at
+                    FROM sync_state s
+                    WHERE s.account_id = a.id
+                      AND s.last_error_at IS NOT NULL
+                    ORDER BY s.last_error_at DESC
+                    LIMIT 1
+                ) AS last_error_at,
+                (
+                    SELECT s.last_error
+                    FROM sync_state s
+                    WHERE s.account_id = a.id
+                      AND s.last_error_at IS NOT NULL
+                    ORDER BY s.last_error_at DESC
+                    LIMIT 1
+                ) AS last_error
+            FROM accounts a
+            WHERE a.name COLLATE NOCASE = $accountFilter
+               OR a.email_address COLLATE NOCASE = $accountFilter
+               OR CAST(a.id AS TEXT) = $accountFilter
+            ORDER BY CASE WHEN a.name COLLATE NOCASE = $accountFilter THEN 0 ELSE 1 END
+            LIMIT 1;
+            """;
+        AddParameter(command, "$accountFilter", accountFilter.Trim());
+
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
+            return null;
+
+        return new(
+            AccountId: reader.GetInt32(reader.GetOrdinal("id")),
+            AccountName: reader.GetString(reader.GetOrdinal("name")),
+            EmailAddress: reader.GetString(reader.GetOrdinal("email_address")),
+            LastSuccessAt: GetNullableString(reader, "last_success_at"),
+            LastErrorAt: GetNullableString(reader, "last_error_at"),
+            LastError: GetNullableString(reader, "last_error"));
+    }
+
+    public void WriteAuditLog(
+        string clientName,
+        string toolName,
+        string actionType,
+        string argumentsSummary,
+        string resultSummary,
+        IReadOnlyList<int> affectedMessageIds = null)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO audit_log (
+                timestamp,
+                client_name,
+                tool_name,
+                action_type,
+                arguments_summary,
+                affected_message_ids,
+                affected_attachment_ids,
+                affected_draft_ids,
+                result_summary
+            )
+            VALUES (
+                $timestamp,
+                $clientName,
+                $toolName,
+                $actionType,
+                $argumentsSummary,
+                $affectedMessageIds,
+                NULL,
+                NULL,
+                $resultSummary
+            );
+            """;
+        AddParameter(command, "$timestamp", DateTimeOffset.UtcNow.ToString("O"));
+        AddParameter(command, "$clientName", BlankToNull(clientName));
+        AddParameter(command, "$toolName", toolName);
+        AddParameter(command, "$actionType", actionType);
+        AddParameter(command, "$argumentsSummary", BlankToNull(argumentsSummary));
+        AddParameter(command, "$affectedMessageIds", affectedMessageIds is { Count: > 0 } ? string.Join(",", affectedMessageIds) : null);
+        AddParameter(command, "$resultSummary", BlankToNull(resultSummary));
+        command.ExecuteNonQuery();
     }
 
     public IReadOnlyList<BodySyncTarget> ReadPendingBodySyncTargets(
@@ -261,7 +370,7 @@ internal sealed class EmailDatabase
         EnsureInitialized();
 
         var fts = FtsQueryBuilder.Build(request.Query);
-        var limit = Math.Clamp(request.Limit <= 0 ? 20 : request.Limit, 1, 100);
+        var limit = Math.Clamp(request.Limit <= 0 ? 20 : request.Limit, 1, 101);
         var snippetTokens = Math.Clamp(request.SnippetChars <= 0 ? 32 : request.SnippetChars / 6, 16, 64);
 
         using var connection = OpenConnection();
@@ -297,6 +406,75 @@ internal sealed class EmailDatabase
         }
 
         return results;
+    }
+
+    public StoredEmailMessage ReadMessage(int messageId)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                m.id AS message_id,
+                a.name AS account_name,
+                a.email_address AS account_email_address,
+                m.date_sent,
+                m.date_received,
+                m.from_name,
+                m.from_email,
+                m.subject,
+                m.has_attachments,
+                b.normalized_text AS body_text
+            FROM messages m
+            JOIN accounts a ON a.id = m.account_id
+            LEFT JOIN message_bodies b ON b.message_id = m.id
+            WHERE m.id = $messageId
+            LIMIT 1;
+            """;
+        AddParameter(command, "$messageId", messageId);
+
+        int storedMessageId;
+        string accountName;
+        string accountEmailAddress;
+        string dateSent;
+        string dateReceived;
+        string fromName;
+        string fromEmail;
+        string subject;
+        bool hasAttachments;
+        string bodyText;
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (!reader.Read())
+                return null;
+
+            storedMessageId = reader.GetInt32(reader.GetOrdinal("message_id"));
+            accountName = reader.GetString(reader.GetOrdinal("account_name"));
+            accountEmailAddress = reader.GetString(reader.GetOrdinal("account_email_address"));
+            dateSent = GetNullableString(reader, "date_sent");
+            dateReceived = GetNullableString(reader, "date_received");
+            fromName = GetNullableString(reader, "from_name");
+            fromEmail = GetNullableString(reader, "from_email");
+            subject = GetNullableString(reader, "subject");
+            hasAttachments = reader.GetInt32(reader.GetOrdinal("has_attachments")) != 0;
+            bodyText = GetNullableString(reader, "body_text");
+        }
+
+        return new(
+            MessageId: storedMessageId,
+            AccountName: accountName,
+            AccountEmailAddress: accountEmailAddress,
+            DateSent: dateSent,
+            DateReceived: dateReceived,
+            FromName: fromName,
+            FromEmail: fromEmail,
+            Subject: subject,
+            HasAttachments: hasAttachments,
+            BodyText: bodyText,
+            Folders: ReadMessageFolders(connection, messageId),
+            Recipients: ReadMessageRecipients(connection, messageId));
     }
 
     public MessageSearchReadiness GetMessageSearchReadiness(MessageSearchReadinessRequest request)
@@ -516,6 +694,39 @@ internal sealed class EmailDatabase
             """;
         AddParameter(command, "$id", syncRunId);
         AddParameter(command, "$ownerId", ownerId);
+        AddParameter(command, "$done", Math.Max(0, done));
+        AddParameter(command, "$total", Math.Max(0, total));
+        AddParameter(command, "$lastProgressAt", DateTimeOffset.UtcNow.ToString("O"));
+        return command.ExecuteNonQuery() > 0;
+    }
+
+    public bool UpdateSyncRunPhase(string syncRunId, string ownerId, string phase, int done, int total)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE sync_runs
+            SET
+                phase = $phase,
+                done = $done,
+                total = $total,
+                last_progress_at = $lastProgressAt
+            WHERE id = $id
+              AND status = 'running'
+              AND EXISTS (
+                  SELECT 1
+                  FROM sync_leases
+                  WHERE sync_leases.scope_key = sync_runs.scope_key
+                    AND sync_leases.sync_run_id = sync_runs.id
+                    AND sync_leases.owner_id = $ownerId
+                    AND sync_leases.lease_expires_at >= $lastProgressAt
+              );
+            """;
+        AddParameter(command, "$id", syncRunId);
+        AddParameter(command, "$ownerId", ownerId);
+        AddParameter(command, "$phase", string.IsNullOrWhiteSpace(phase) ? "syncing" : phase.Trim());
         AddParameter(command, "$done", Math.Max(0, done));
         AddParameter(command, "$total", Math.Max(0, total));
         AddParameter(command, "$lastProgressAt", DateTimeOffset.UtcNow.ToString("O"));
@@ -777,6 +988,54 @@ internal sealed class EmailDatabase
         command.CommandText = sql;
         var value = command.ExecuteScalar();
         return Convert.ToInt32(value);
+    }
+
+    private static IReadOnlyList<string> ReadMessageFolders(SqliteConnection connection, int messageId)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT f.path
+            FROM message_locations ml
+            JOIN folders f ON f.id = ml.folder_id
+            WHERE ml.message_id = $messageId
+              AND ml.deleted_locally = 0
+              AND ml.expunged = 0
+            ORDER BY f.path COLLATE NOCASE;
+            """;
+        AddParameter(command, "$messageId", messageId);
+
+        using var reader = command.ExecuteReader();
+        var folders = new List<string>();
+
+        while (reader.Read())
+            folders.Add(reader.GetString(0));
+
+        return folders;
+    }
+
+    private static IReadOnlyList<MessageRecipient> ReadMessageRecipients(SqliteConnection connection, int messageId)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT type, name, email
+            FROM message_recipients
+            WHERE message_id = $messageId
+            ORDER BY type COLLATE NOCASE, id;
+            """;
+        AddParameter(command, "$messageId", messageId);
+
+        using var reader = command.ExecuteReader();
+        var recipients = new List<MessageRecipient>();
+
+        while (reader.Read())
+        {
+            recipients.Add(new(
+                Type: reader.GetString(reader.GetOrdinal("type")),
+                Name: GetNullableString(reader, "name"),
+                Email: GetNullableString(reader, "email")));
+        }
+
+        return recipients;
     }
 
     private static int UpsertConfiguredAccount(

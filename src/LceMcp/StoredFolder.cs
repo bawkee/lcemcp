@@ -15,4 +15,5 @@ internal sealed record StoredFolder(
     string UidValidity,
     int? MessageCount,
     int? RecentCount,
-    string LastDiscoveredAt);
+    string LastDiscoveredAt,
+    string LastSyncAt);
