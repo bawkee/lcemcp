@@ -277,6 +277,7 @@ internal static class CliApp
             try
             {
                 syncRun = await WaitForSyncRunLeaseAsync(database, syncRun, cancellationToken);
+                PrintSyncProgress(syncRun.ActiveRun);
 
                 var result = await RunWithSyncLeaseHeartbeatAsync(database, syncRun, cancellationToken, async () =>
                 {
@@ -304,7 +305,7 @@ internal static class CliApp
                         throw new OperationCanceledException("Sync lease was lost.");
 
                     return syncResult;
-                });
+                }, PrintSyncProgress);
 
                 PrintMetadataSyncResult(result);
             }
@@ -364,6 +365,7 @@ internal static class CliApp
             try
             {
                 syncRun = await WaitForSyncRunLeaseAsync(database, syncRun, cancellationToken);
+                PrintSyncProgress(syncRun.ActiveRun);
 
                 var result = await RunWithSyncLeaseHeartbeatAsync(database, syncRun, cancellationToken, async () =>
                 {
@@ -389,7 +391,7 @@ internal static class CliApp
                         throw new OperationCanceledException("Sync lease was lost.");
 
                     return syncResult;
-                });
+                }, PrintSyncProgress);
 
                 PrintBodySyncResult(result);
             }
@@ -819,10 +821,11 @@ internal static class CliApp
         EmailDatabase database,
         SyncRunStartResult syncRun,
         CancellationToken cancellationToken,
-        Func<Task<T>> action)
+        Func<Task<T>> action,
+        Action<SyncRunSnapshot> progressReport = null)
     {
         using var heartbeatCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var heartbeatTask = HeartbeatSyncLeaseAsync(database, syncRun, heartbeatCancellation.Token);
+        var heartbeatTask = HeartbeatSyncLeaseAsync(database, syncRun, progressReport, heartbeatCancellation.Token);
 
         try
         {
@@ -837,6 +840,7 @@ internal static class CliApp
     private static async Task HeartbeatSyncLeaseAsync(
         EmailDatabase database,
         SyncRunStartResult syncRun,
+        Action<SyncRunSnapshot> progressReport,
         CancellationToken cancellationToken)
     {
         while (true)
@@ -844,6 +848,10 @@ internal static class CliApp
             await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
             if (!database.HeartbeatSyncLease(syncRun.Id, syncRun.OwnerId))
                 throw new OperationCanceledException("Sync lease was lost.");
+
+            var activeRun = database.ReadActiveSyncRun();
+            if (activeRun is not null && activeRun.Id == syncRun.Id)
+                progressReport?.Invoke(activeRun);
         }
     }
 
@@ -881,6 +889,12 @@ internal static class CliApp
         var eta = run.EstimatedRemainingSeconds is int seconds ? seconds.ToString() : "unknown";
         var folder = string.IsNullOrWhiteSpace(run.FolderFilter) ? "all-folders" : run.FolderFilter;
         return $"{run.Id} account={run.AccountName} folder={folder} status={run.Status} phase={run.Phase} done={run.Done}/{run.Total} percent={run.Percent} elapsed={run.ElapsedSeconds}s eta={eta}s confidence={run.EstimateConfidence}";
+    }
+
+    private static void PrintSyncProgress(SyncRunSnapshot run)
+    {
+        if (run is not null)
+            Console.WriteLine($"Sync progress: {FormatSyncRun(run)}");
     }
 
     private static string FormatBool(bool value) =>

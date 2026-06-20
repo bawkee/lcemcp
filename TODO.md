@@ -162,6 +162,8 @@ Test result:
 - `dotnet test lcemcp.slnx` passed with 19 tests on 2026-06-19. New coverage includes schema v4 initialization/migration, queued second sync runs, old progress with a live lease, expired lease recovery, and stale-owner completion refusal.
 - Temp-config CLI `status` smoke test succeeded on 2026-06-19 and created schema version `4 / target 4` with no configured accounts.
 - Sync lease sanity review on 2026-06-19 found and fixed two safety gaps: expired heartbeat revival and ignored owner-check failures in CLI progress/completion. `dotnet test lcemcp.slnx` passed with 23 tests, adding coverage for expired-running-lease crash recovery into a queued successor, expired heartbeat refusal, abandoned queued-run recovery, and wrong-owner heartbeat/progress/completion refusal. A temp-config CLI `status` smoke test still created schema version `4 / target 4`.
+- Manual live Yahoo body sync on 2026-06-20 with `sync-bodies --account yahoo --folder Inbox --max-per-folder 0` completed, but showed no foreground progress for about 3 minutes between sync-run start and final folder summary. Root cause: body sync updated durable `sync_runs` progress after each target, but the foreground CLI only printed queued-wait progress and final results. Fixed the CLI to print active sync progress when the run starts and then about every 30 seconds from the sync lease heartbeat.
+- `dotnet build lcemcp.slnx` and `dotnet test lcemcp.slnx` passed with 26 tests on 2026-06-20 after foreground sync-progress reporting was added.
 
 Design decision on 2026-06-19:
 
