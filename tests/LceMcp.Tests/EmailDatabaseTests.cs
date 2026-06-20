@@ -395,6 +395,43 @@ public sealed class EmailDatabaseTests
         Assert.Equal(0, readiness.PendingMessageBodies);
     }
 
+    [Theory]
+    [InlineData(60, true)]
+    [InlineData(10, false)]
+    public void MessageSearchReadinessComparesMetadataWindowToConfiguredHistory(int syncSinceDays, bool expectedReady)
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(providerUid: "100", providerMessageKey: "emailid:abc-1", messageIdHeader: "abc-1@example.com")
+        ], SyncStateJson(sinceDays: syncSinceDays), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Indexed body",
+            HtmlText: null,
+            NormalizedText: "Indexed body",
+            Recipients: []));
+
+        var readiness = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null));
+
+        Assert.Equal(expectedReady, readiness.SearchReady);
+        Assert.Equal(expectedReady, readiness.MetadataComplete);
+        Assert.True(readiness.BodiesComplete);
+        Assert.True(readiness.MessageSearchIndexComplete);
+    }
+
     [Fact]
     public void SyncRunsExposeActiveProgressUntilCompleted()
     {

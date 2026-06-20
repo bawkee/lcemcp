@@ -1872,7 +1872,7 @@ internal sealed class EmailDatabase
         if (state is null)
             return false;
 
-        var coversHistory = state.SinceDays == 0 || state.SinceDays <= folder.HistoryDays;
+        var coversHistory = state.SinceDays == 0 || state.SinceDays >= folder.HistoryDays;
         var uncapped = state.MaxPerFolder == 0 || state.SelectedCount >= state.MatchedCount;
         var fetchedSelected = state.FetchedCount >= state.SelectedCount;
 
