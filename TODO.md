@@ -235,9 +235,12 @@ These came from reviewing what happens when a normal Codex user asks something l
 
 Legit near-term issues:
 
+- Make `email_search` query text optional when the caller supplies bounded metadata filters. The tool should support date-only and filter-only browsing, such as "show Yahoo messages from June", without forcing an LLM to invent broad synthetic search terms. Implementation needs a non-FTS filtered listing path with deterministic date/message-id ordering, normal readiness checks, cursor pagination, and CLI parity.
 - Add `date_from` / `date_to` to `email_search` and CLI search. This should bind against the message date (`COALESCE(date_sent, date_received)`) instead of making the LLM filter dates from returned snippets. Search readiness/results should also include an explicit coverage note when the requested date range extends beyond the configured/synced account history, rather than silently implying the whole request was searched.
 - Add recipient filtering, starting with `to_email` and likely broader recipient/participant filters over `message_recipients`. Current MCP only supports `from_email`.
 - Implement real pagination/cursors for `email_search`. Current responses can set `has_more=true`, but `next_cursor` is always `null`, so callers cannot continue without changing the query or limit.
+- Fix explicit one-off folder sync. Today `ReadSyncFolders(account, folder)` filters to `sync_enabled = true` before applying an explicit folder filter, so a direct MCP `email_sync_now` for a disabled-but-selectable folder such as Yahoo `Important` selects zero folders. The spec now says an explicit folder path/name/id should override the default `sync_enabled` scope for that one run; if no selectable folder matches, reject immediately instead of accepting a zero-folder run.
+- Improve estimate/list UX for non-selected folders. `email_estimate_sync` intentionally defaults to selected sync-enabled folders, but the response should make omitted selectable folders obvious enough that an LLM does not mistake the default estimate for "all folders". Consider returning omitted/selectable counts and a hint to call `email_list_folders` or pass explicit `folders`.
 - Make sync setup explicit and harness-friendly:
   - Update implementation defaults to match `SPEC.md`: first-run `history_days = 90`, with larger windows such as 365/1095/everything treated as deliberate per-run or config choices.
   - Treat `history_days` in `config.toml` as the default requested window, not a hard cap. MCP tools must not silently rewrite `config.toml`; one-off wider backfills should pass `since_days` to `email_sync_now`.
@@ -281,9 +284,19 @@ Manual test result on 2026-06-22:
 - Added `credential-update` on 2026-06-22 so an existing account password/app password can be replaced without rerunning setup or rewriting account config. Usage: `credential-update --id yahoo` or `credential-update --account yahoo`; `--password-stdin` is available for non-interactive use. `credential-test` and `credential-delete` also accept `--id` as an alias for `--account`.
 - Release publish was refreshed after `credential-update`. `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 33 tests, Release build succeeded, and an isolated smoke against the published executable created a throwaway account credential, updated it via `credential-update --id <temp> --password-stdin`, verified it existed, and deleted it.
 
+User-context MCP test result on 2026-06-22:
+
+- A Codex MCP run against the real Yahoo account reached normal search readiness for the current default scope: 176 indexed messages across the three sync-enabled folders, Archive, Inbox, and Sent.
+- The run exposed a real search flexibility gap: `email_search` rejects a blank query, so the agent could not ask for "all June mail" with date/account filters only. It had to use broad synthetic searches and targeted follow-ups instead.
+- The `Important` folder oddity was not a Yahoo provider issue. Local folder metadata shows `Important` is selectable but `sync_enabled=false` and `last_sync=-`. The implementation path uses `ReadSyncFolders`, which excludes disabled folders before applying the explicit folder filter. Result: a targeted `email_sync_now` for `Important` can be accepted as a run but select no folders, while `email_get_sync_status` continues to report readiness for the default three sync-enabled folders.
+- The likely third issue from the transcript is estimate-scope discoverability: `email_estimate_sync` without explicit `folders` reports only selected sync-enabled folders by design. The agent noticed and explicitly estimated non-selected folders afterward, but the default response should make that scope more obvious.
+
 Next work:
 
-- Refresh the Yahoo app password in Windows Credential Manager, then rerun live folder discovery, metadata sync, body sync, and normal MCP `email_search` without `allow_partial`.
+- Implement filter-only/date-only `email_search` for MCP and CLI, including cursor behavior and readiness handling.
+- Fix explicit disabled-folder sync selection for MCP and CLI, then add regression tests around a disabled selectable folder such as `Important`.
+- Make `email_sync_now`/`email_get_sync_status` surface zero-folder or failed one-off syncs clearly enough that LLM clients cannot treat them as successful coverage.
+- Improve `email_estimate_sync` output so default selected-folder estimates are clearly distinguished from all-folder estimates.
 - Consider adding provider-probe estimates to `email_estimate_sync`; the current implementation is deliberately factual but cached-count only.
 - Consider a CLI or MCP folder-list view that highlights both current `sync_enabled` and role default side by side for setup UX.
 

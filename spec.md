@@ -256,11 +256,12 @@ Recommended approach:
 ```text
 1. Parse and validate MCP arguments.
 2. Convert account names/emails to local account IDs.
-3. Parse user query into a safe FTS expression.
-4. Bind normal SQL criteria through SqlBinder.
-5. Bind FTS expression as a parameter, not through string concatenation.
-6. Execute message and/or attachment query branches.
-7. Merge and rank results in app code.
+3. If a text query is present, parse it into a safe FTS expression.
+4. If no text query is present, require at least one bounded metadata criterion and run a filtered listing path.
+5. Bind normal SQL criteria through SqlBinder.
+6. Bind FTS expression as a parameter when FTS is used, not through string concatenation.
+7. Execute message and/or attachment query branches.
+8. Merge and rank results in app code.
 ```
 
 Example template shape:
@@ -1748,6 +1749,10 @@ Input:
 }
 ```
 
+`query` may be null, omitted, or blank when the caller supplies bounded metadata criteria such as account, date range, sender, recipient, folder role, attachment, MIME type, or filename filters. This is the same tool an agent should use for date-only or filter-only browsing, such as "show Yahoo messages from June" or "list recent sent mail with attachments." The server should reject an unbounded all-mail listing request, but it should not force callers to invent broad synthetic text terms just to use date or folder filters.
+
+When no text query is supplied, skip FTS `MATCH`, apply the same readiness rules for the requested scope, and return deterministic newest-first results, for example by `COALESCE(date_sent, date_received) DESC, message_id DESC`. Hit counts and hit-centered snippets are not applicable in filter-only mode; return ordinary bounded metadata/body previews only when they are explicitly part of the response contract.
+
 Output:
 
 ```json
@@ -1988,6 +1993,7 @@ Input:
 ```json
 {
   "accounts": ["gmail", "yahoo"],
+  "folder": null,
   "full": false,
   "since_days": 365,
   "max_per_folder": 0,
@@ -2032,6 +2038,8 @@ If the requested/default window would leave a gap since the latest successful un
 ```
 
 `email_sync_now` must not rewrite `history_days` in `config.toml`. A wider `since_days` is a per-run request.
+
+When `folder` is omitted, sync the account's selectable folders with `sync_enabled = true`. When `folder` is provided, treat it as an explicit one-off request for the matching selectable folder path/name/id, even if that folder is normally `sync_enabled = false`. If the folder does not exist or is not selectable, reject the call immediately with a clear `accepted = false` response. Do not enqueue a successful-looking zero-folder run.
 
 If another process already owns the sync lease, the tool should return the active or queued run rather than starting duplicate provider work:
 
@@ -2318,16 +2326,18 @@ For a normal query:
 ```text
 1. Validate tool arguments.
 2. Parse explicit filters, including account scope and search_in list.
-3. Parse user query into safe FTS expression.
-4. Bind optional SQL criteria through SqlBinder.
-5. If search_in includes messages or is empty/null, search messages_fts.
-6. If search_in includes attachments or is empty/null, search attachments_fts.
-7. Join and group matches by parent message.
-8. Compute estimated message hit count, attachment hit counts, and combined score.
-9. Generate hit-centered message and attachment snippets.
-10. Rank.
-11. Return compact message-centric results with nested matching attachments.
-12. AI requests full message/thread/attachment only when needed.
+3. If text query is present, parse it into safe FTS expression.
+4. If text query is absent, validate that the metadata filters bound the request enough for a bounded listing.
+5. Bind optional SQL criteria through SqlBinder.
+6. If FTS is used and search_in includes messages or is empty/null, search messages_fts.
+7. If FTS is used and search_in includes attachments or is empty/null, search attachments_fts.
+8. If FTS is not used, run the filtered message/attachment listing query directly.
+9. Join and group matches by parent message.
+10. Compute estimated message hit count, attachment hit counts, and combined score when FTS is used.
+11. Generate hit-centered message and attachment snippets when FTS is used.
+12. Rank FTS results by score, and order filter-only results deterministically by message date and ID.
+13. Return compact message-centric results with nested matching attachments.
+14. AI requests full message/thread/attachment only when needed.
 ```
 
 For timeline or dispute-style queries:
@@ -2461,6 +2471,7 @@ Deliver:
 - Message body sync.
 - message_search_docs and messages_fts index.
 - SqlBinder-based optional criteria for search queries.
+- Filter-only/date-only `email_search` browsing without requiring synthetic text query terms.
 - Hit-centered snippet extraction.
 - Binary search readiness for the requested scope: synced or not_synced, with no quiet partial search by default.
 - Durable sync run/status tracking with progress, elapsed time, ETA, and estimate confidence.
