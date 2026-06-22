@@ -238,7 +238,20 @@ Legit near-term issues:
 - Add `date_from` / `date_to` to `email_search` and CLI search. This should bind against the message date (`COALESCE(date_sent, date_received)`) instead of making the LLM filter dates from returned snippets. Search readiness/results should also include an explicit coverage note when the requested date range extends beyond the configured/synced account history, rather than silently implying the whole request was searched.
 - Add recipient filtering, starting with `to_email` and likely broader recipient/participant filters over `message_recipients`. Current MCP only supports `from_email`.
 - Implement real pagination/cursors for `email_search`. Current responses can set `has_more=true`, but `next_cursor` is always `null`, so callers cannot continue without changing the query or limit.
-- Make the sync-history default user-visible and deliberately chosen. Current implementation defaults account `history_days` to 30 development days, while `SPEC.md` recommends 1095 days, which is probably too high for normal first-run use. Decide the product default, then show it clearly in setup/help/status/MCP account status and document exactly where/how users change it (`config.toml`, setup options, later admin UI).
+- Make sync setup explicit and harness-friendly:
+  - Update implementation defaults to match `SPEC.md`: first-run `history_days = 90`, with larger windows such as 365/1095/everything treated as deliberate per-run or config choices.
+  - Treat `history_days` in `config.toml` as the default requested window, not a hard cap. MCP tools must not silently rewrite `config.toml`; one-off wider backfills should pass `since_days` to `email_sync_now`.
+  - Add automatic gap expansion in metadata sync. For each account/folder, compute `effective_since_days = max(requested_since_days, days since latest successful uncapped metadata sync + small overlap)`, with `0` still meaning no date bound. Do not count capped runs as closing gaps.
+  - Expose `requested_since_days`, `effective_since_days`, and `auto_expanded_for_gap` in CLI/MCP sync output and `email_get_sync_status` so LLM clients can explain sync scope without inferring it.
+  - Change folder discovery defaults from "all selectable folders sync" to role-based sync choices: default on for inbox/sent/archive/all_mail; default off for spam/junk/bulk/trash/deleted/drafts/outbox/custom/unknown. Rediscovery must preserve existing choices.
+  - Add MCP setup/onboarding tools: `email_get_setup_status` with only setup statuses (`config_invalid`, `credential_missing`, `folders_not_discovered`, `setup_complete`), `email_discover_folders` for provider discovery without message sync, and `email_estimate_sync` for factual counts/estimates without warning prose.
+  - Keep or add CLI parity for practical users: existing `discover-folders`/`folders` already cover discovery/listing, but add a durable way to inspect/set folder sync choices and ensure help/status document `history_days`, per-run `--since-days`, and automatic effective-window expansion.
+
+Design decision on 2026-06-22:
+
+- Avoid a full sync-coverage ledger for MVP. The simpler contract is: `history_days` is the default requested window, explicit `since_days` is a one-run override, and sync automatically widens to cover any gap since the latest successful uncapped sync for the same account/folder. This prevents holes after long idle periods without mutating user config.
+- `email_get_setup_status` is setup-only, not a sync/readiness state machine. Sync progress/readiness remains under `email_get_sync_status`.
+- `email_estimate_sync` should return facts such as selected folders, requested/effective window, estimated messages, estimate source, and confidence. It should not decide whether the result is "too large"; the LLM/user can make that call.
 
 Known deferred or acceptable for MVP:
 

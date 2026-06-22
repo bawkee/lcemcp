@@ -567,7 +567,7 @@ CREATE TABLE folders (
     path TEXT NOT NULL,
     delimiter TEXT,
     role TEXT,
-    sync_enabled INTEGER NOT NULL DEFAULT 1,
+    sync_enabled INTEGER NOT NULL DEFAULT 0,
     uidvalidity TEXT,
     last_uid INTEGER,
     last_sync_at TEXT,
@@ -577,6 +577,15 @@ CREATE TABLE folders (
 ```
 
 `role` should be a best-effort string such as `inbox`, `sent`, `archive`, `all_mail`, `drafts`, `trash`, `spam`, or `custom`. Let users override inferred roles.
+
+Folder discovery should not silently make every selectable folder syncable. On first discovery, use role-based defaults:
+
+```text
+sync_enabled default true: inbox, sent, archive, all_mail
+sync_enabled default false: spam, junk, bulk, trash, deleted, drafts, outbox, custom/unknown
+```
+
+Rediscovery must preserve existing user choices for known folders. New folders may receive role-based defaults, but discovery should report enough folder metadata for the user or LLM harness to choose deliberately.
 
 ### 11.3 messages
 
@@ -1087,10 +1096,10 @@ history_days = 1095
 history_days = null # everything available
 ```
 
-Recommended default for real use:
+Recommended default for first-run real use:
 
 ```toml
-history_days = 1095
+history_days = 90
 ```
 
 Recommended default for development/testing:
@@ -1098,6 +1107,10 @@ Recommended default for development/testing:
 ```toml
 history_days = 30
 ```
+
+`history_days` is the default requested sync/search window stored in `config.toml`; it is not a hard cap and it should not be silently rewritten by MCP tools. A user or local admin UI may change it deliberately, and CLI setup may accept an explicit `--history-days`, but MCP sync calls should use per-call `since_days` overrides for one-off wider backfills.
+
+Offer larger values such as 365 days, 1095 days, or everything available as deliberate choices rather than silent defaults.
 
 Attachment policies should be simple strings:
 
@@ -1163,7 +1176,33 @@ Manual sync through email_sync_now.
 
 The MCP server should remain available while sync is running. Tools should expose sync status and durable progress. Search tools must not quietly return partial search results by default.
 
-#### 14.3.1 Search Readiness
+#### 14.3.1 Sync Window Semantics
+
+Treat `history_days` as the configured default requested window. `email_sync_now.since_days` and CLI `--since-days` are per-run overrides and must not update `config.toml`.
+
+For each account/folder sync scope, compute an effective metadata sync window:
+
+```text
+requested_since_days =
+  full or since_days = 0 -> 0, meaning no date bound
+  explicit since_days    -> explicit value
+  otherwise              -> account history_days from config.toml
+
+gap_since_days =
+  days since the latest successful uncapped metadata sync for the same account/folder,
+  plus a small overlap such as 1-2 days
+
+effective_since_days =
+  requested_since_days = 0 -> 0
+  no prior successful uncapped sync -> requested_since_days
+  otherwise -> max(requested_since_days, gap_since_days)
+```
+
+This prevents holes when an account was last synced farther back than the current default history window. For example, if `history_days = 90` but the last successful sync was 150 days ago, a default sync should use an effective window of about 150 days, not only 90 days. If the user explicitly requests 365 days, the effective window should remain at least 365 days.
+
+Capped runs (`max_per_folder > 0` where not all matches were selected) must not count as closing a coverage gap. Sync output and status should expose `requested_since_days`, `effective_since_days`, and `auto_expanded_for_gap` so LLM clients can explain what happened without inferring from raw timestamps.
+
+#### 14.3.2 Search Readiness
 
 Email search readiness is binary for the requested scope.
 
@@ -1178,7 +1217,7 @@ The requested scope includes:
 
 - Account selection.
 - Folder selection or folder roles.
-- Configured searchable history window.
+- Configured or explicitly requested searchable history window.
 - Message metadata sync.
 - Message body sync.
 - Message search documents and FTS index rows.
@@ -1189,7 +1228,7 @@ If a future debug or advanced mode supports partial search, it must be explicit,
 
 Attachment search readiness can be tracked separately from message search readiness. Message search may be ready before attachment extraction is complete, as long as the response is explicit about which corpus was searched.
 
-#### 14.3.2 Long-Running Sync Progress
+#### 14.3.3 Long-Running Sync Progress
 
 Long-running sync should be durable and observable.
 
@@ -1215,7 +1254,7 @@ When an MCP client provides a progress token and the server stack supports progr
 
 ETA values are best-effort. They should be calculated from observed progress over time and should expose low confidence early in a run or when provider throttling/body sizes make throughput unstable.
 
-#### 14.3.3 Sync Queue And Lease Ownership
+#### 14.3.4 Sync Queue And Lease Ownership
 
 MCP stdio clients commonly launch the server as a subprocess. Multiple harnesses, windows, or chat sessions may therefore create multiple local server processes that point at the same SQLite database and provider accounts. The sync engine must not rely on there being only one process.
 
@@ -1253,16 +1292,18 @@ Crash recovery should operate on leases, not on progress rows. If a process dies
 
 `email_sync_now` should not block indefinitely. If it starts work, it returns the running run ID. If another process already owns the lease, it returns the active or queued run ID plus progress/status so the client can poll `email_get_sync_status`.
 
-#### 14.3.4 LLM Client Guidance
+#### 14.3.5 LLM Client Guidance
 
 Tool descriptions and MCP documentation should instruct LLM clients to:
 
 ```text
-1. Call email_get_sync_status before trusting email_search for a new or recently changed account.
-2. If search_ready is false, call email_sync_now or report that indexing is still required.
-3. Poll email_get_sync_status at reasonable intervals, such as 10 seconds.
-4. Use progress percent, elapsed time, and estimated remaining time to decide whether to wait or tell the user sync is still running.
-5. Treat not_synced search responses as "not ready", never as evidence that no matching email exists.
+1. Call email_get_setup_status before onboarding or when account prerequisites may be missing.
+2. Call email_get_sync_status before trusting email_search for a new or recently changed account.
+3. If search_ready is false, call email_sync_now or report that indexing is still required.
+4. Poll email_get_sync_status at reasonable intervals, such as 10 seconds.
+5. Use progress percent, elapsed time, and estimated remaining time to decide whether to wait or tell the user sync is still running.
+6. Treat not_synced search responses as "not ready", never as evidence that no matching email exists.
+7. Treat history_days from config.toml as the default requested window. Use email_sync_now.since_days for one-off wider syncs instead of changing config.
 ```
 
 ### 14.4 Crash Safety
@@ -1407,6 +1448,9 @@ Recommended tool names:
 
 ```text
 email_list_accounts
+email_get_setup_status
+email_discover_folders
+email_estimate_sync
 email_list_folders
 email_search
 email_get_message
@@ -1494,7 +1538,145 @@ Output:
 }
 ```
 
-### 16.3 email_list_folders
+### 16.3 email_get_setup_status
+
+Return local setup prerequisites without making network calls. This tool should not report sync progress or search readiness; those belong to `email_get_sync_status`.
+
+Top-level statuses:
+
+```text
+no_accounts
+needs_attention
+setup_complete
+```
+
+Per-account setup statuses:
+
+```text
+config_invalid
+credential_missing
+folders_not_discovered
+setup_complete
+```
+
+Output:
+
+```json
+{
+  "status": "needs_attention",
+  "accounts": [
+    {
+      "account": "yahoo",
+      "setup_status": "folders_not_discovered",
+      "config_valid": true,
+      "credential_status": "present",
+      "folders_cached": false,
+      "default_history_days": 90,
+      "default_history_source": "config.toml"
+    }
+  ]
+}
+```
+
+### 16.4 email_discover_folders
+
+Connect to the provider, discover folders, persist local folder metadata, and return folder roles/counts/default sync choices. It must not sync messages.
+
+Input:
+
+```json
+{
+  "accounts": ["yahoo"]
+}
+```
+
+Output:
+
+```json
+{
+  "status": "succeeded",
+  "folders": [
+    {
+      "folder_id": 10,
+      "account": "yahoo",
+      "path": "Inbox",
+      "role": "inbox",
+      "selectable": true,
+      "message_count": 10000,
+      "sync_enabled": true,
+      "default_sync_enabled": true
+    },
+    {
+      "folder_id": 11,
+      "account": "yahoo",
+      "path": "Trash",
+      "role": "trash",
+      "selectable": true,
+      "message_count": 3200,
+      "sync_enabled": false,
+      "default_sync_enabled": false
+    }
+  ]
+}
+```
+
+Rediscovery must preserve existing sync choices for known folders.
+
+### 16.5 email_estimate_sync
+
+Return factual sync estimates for the current or proposed sync scope. Do not include warning prose; LLM clients can decide how to present counts to users.
+
+Depending on setup state, this can return one of:
+
+```text
+needs_account
+config_invalid
+credential_missing
+folders_not_discovered
+estimated
+failed
+```
+
+Input:
+
+```json
+{
+  "accounts": ["yahoo"],
+  "folders": ["Inbox", "Sent"],
+  "since_days": 365,
+  "probe": true
+}
+```
+
+Output:
+
+```json
+{
+  "status": "estimated",
+  "estimate_source": "provider_probe",
+  "requested_since_days": 365,
+  "effective_since_days": 365,
+  "selected_folder_count": 2,
+  "total_estimated_messages": 14400,
+  "estimate_confidence": "medium",
+  "folders": [
+    {
+      "path": "Inbox",
+      "role": "inbox",
+      "estimated_messages": 12000
+    },
+    {
+      "path": "Sent",
+      "role": "sent",
+      "estimated_messages": 2400
+    }
+  ]
+}
+```
+
+`estimate_source` may be `cached_folder_counts`, `provider_probe`, or `mixed`.
+
+### 16.6 email_list_folders
 
 List known folders.
 
@@ -1525,7 +1707,7 @@ Output:
 }
 ```
 
-### 16.4 email_search
+### 16.7 email_search
 
 Unified search across message metadata, message bodies, and/or extracted attachment text.
 
@@ -1635,7 +1817,7 @@ If the requested scope is not ready, return a readiness response instead of `res
     "scope": {
       "accounts": ["yahoo"],
       "folder_roles": ["inbox"],
-      "history_days": 30,
+      "history_days": 90,
       "search_in": ["messages"]
     },
     "metadata_complete": true,
@@ -1668,7 +1850,7 @@ If the requested scope is not ready, return a readiness response instead of `res
 }
 ```
 
-### 16.5 email_get_message
+### 16.8 email_get_message
 
 Fetch one message with metadata, optional body, and optional attachment metadata.
 
@@ -1718,7 +1900,7 @@ Output:
 }
 ```
 
-### 16.6 email_get_thread
+### 16.9 email_get_thread
 
 Fetch thread context around a message.
 
@@ -1764,7 +1946,7 @@ Output:
 
 Threading should be best-effort and clearly marked as such if confidence is low.
 
-### 16.7 email_get_attachment_text
+### 16.10 email_get_attachment_text
 
 Fetch extracted/OCR text for one attachment.
 
@@ -1797,7 +1979,7 @@ Output:
 
 If raw attachment access is ever added, make it a separate disabled-by-default dangerous capability.
 
-### 16.8 email_sync_now
+### 16.11 email_sync_now
 
 Manually trigger sync.
 
@@ -1807,6 +1989,8 @@ Input:
 {
   "accounts": ["gmail", "yahoo"],
   "full": false,
+  "since_days": 365,
+  "max_per_folder": 0,
   "wait_for_completion": false
 }
 ```
@@ -1818,6 +2002,9 @@ Output:
   "accepted": true,
   "sync_run_id": "sync-20260617-172500",
   "status": "running",
+  "requested_since_days": 365,
+  "effective_since_days": 365,
+  "auto_expanded_for_gap": false,
   "message": "Sync started for 2 accounts.",
   "progress": {
     "phase": "syncing_bodies",
@@ -1830,6 +2017,21 @@ Output:
   }
 }
 ```
+
+If the requested/default window would leave a gap since the latest successful uncapped sync, the server should widen the effective window and report it:
+
+```json
+{
+  "accepted": true,
+  "sync_run_id": "sync-20260617-172500",
+  "status": "running",
+  "requested_since_days": 90,
+  "effective_since_days": 151,
+  "auto_expanded_for_gap": true
+}
+```
+
+`email_sync_now` must not rewrite `history_days` in `config.toml`. A wider `since_days` is a per-run request.
 
 If another process already owns the sync lease, the tool should return the active or queued run rather than starting duplicate provider work:
 
@@ -1851,9 +2053,9 @@ If another process already owns the sync lease, the tool should return the activ
 
 For long-running sync, return a run/status ID rather than blocking indefinitely by default. `wait_for_completion` may be supported for short runs or interactive clients, but the server must still emit or expose progress and must respect cancellation when supported by the host.
 
-`email_sync_now` should bring the requested corpus to search-ready state. For message search this means metadata, bodies, search docs, and FTS rows are complete for the configured history window. Attachment extraction may remain a separate phase unless the request explicitly includes attachment search readiness.
+`email_sync_now` should bring the requested corpus to search-ready state. For message search this means metadata, bodies, search docs, and FTS rows are complete for the requested or default history window, after automatic gap expansion. Attachment extraction may remain a separate phase unless the request explicitly includes attachment search readiness.
 
-### 16.9 email_get_sync_status
+### 16.12 email_get_sync_status
 
 Return account/folder sync state.
 
@@ -1880,13 +2082,17 @@ Output:
       "last_error": null,
       "search_ready": true,
       "search_ready_scope": {
-        "history_days": 30,
+        "history_days": 90,
+        "history_source": "config.toml",
         "message_search_ready": true,
         "attachment_search_ready": false
       },
       "sync_progress": {
         "status": "running",
         "phase": "syncing_bodies",
+        "requested_since_days": 90,
+        "effective_since_days": 151,
+        "auto_expanded_for_gap": true,
         "done": 500,
         "total": 5000,
         "percent": 10,
@@ -1914,7 +2120,7 @@ Output:
 
 `email_get_sync_status` is the authoritative readiness endpoint for LLM clients. It must make the distinction between synced and not synced visible without requiring the model to infer it from raw counts.
 
-### 16.10 email_get_audit_events
+### 16.13 email_get_audit_events
 
 Return recent audit log entries.
 
@@ -1946,7 +2152,7 @@ Output:
 }
 ```
 
-### 16.11 Future Draft Tools
+### 16.14 Future Draft Tools
 
 These are not v1.
 
@@ -2249,7 +2455,7 @@ Deliver:
 ```text
 - One or more IMAP accounts.
 - Folder discovery.
-- Initial sync with configurable history_days.
+- Initial sync with configurable `history_days`, explicit per-run `since_days`, and automatic gap expansion through `effective_since_days`.
 - Canonical messages + message_locations schema.
 - Message metadata sync.
 - Message body sync.
@@ -2261,6 +2467,9 @@ Deliver:
 - LLM guidance for polling sync status before trusting search on a new or incomplete corpus.
 - MCP tools:
   - email_list_accounts
+  - email_get_setup_status
+  - email_discover_folders
+  - email_estimate_sync
   - email_list_folders
   - email_search
   - email_get_message
@@ -2359,7 +2568,7 @@ Deliver:
 
 ```toml
 [sync]
-history_days = 1095
+history_days = 90
 periodic_sync_minutes = 10
 download_attachments = "small"
 max_attachment_mb = 25
