@@ -31,6 +31,7 @@ internal static class CliApp
             "search" => Search(database, options),
             "serve" => await McpStdioServer.RunAsync(configStore, database, cancellationToken),
             "credential-test" => CredentialTest(configStore, credentialStore, options),
+            "credential-update" => CredentialUpdate(configStore, credentialStore, options),
             "credential-delete" => CredentialDelete(configStore, credentialStore, options),
             "imap-test" => await ImapTestAsync(configStore, credentialStore, options, cancellationToken),
             "help" => PrintHelpAndReturn(),
@@ -541,7 +542,7 @@ internal static class CliApp
 
     private static int CredentialTest(ConfigStore configStore, WindowsCredentialStore credentialStore, CommandOptions options)
     {
-        var account = ResolveAccount(configStore.Load(), options.Get("--account"));
+        var account = ResolveAccount(configStore.Load(), CredentialAccountOption(options));
 
         if (string.IsNullOrWhiteSpace(account.CredentialRef))
             throw new CliException($"Account '{account.Id}' has no credential_ref in config.", 2);
@@ -554,9 +555,32 @@ internal static class CliApp
         return exists ? 0 : 3;
     }
 
+    private static int CredentialUpdate(ConfigStore configStore, WindowsCredentialStore credentialStore, CommandOptions options)
+    {
+        var account = ResolveAccount(configStore.Load(), CredentialAccountOption(options));
+
+        if (string.IsNullOrWhiteSpace(account.CredentialRef))
+            throw new CliException($"Account '{account.Id}' has no credential_ref in config.", 2);
+
+        if (string.IsNullOrWhiteSpace(account.Username))
+            throw new CliException($"Account '{account.Id}' has no username in config.", 2);
+
+        Console.WriteLine($"Updating credential for account '{account.Id}' ({account.EmailAddress}).");
+        var password = options.Has("--password-stdin")
+            ? ReadPasswordFromStdin()
+            : ConsoleSecretReader.ReadSecret("New password/app password: ");
+
+        if (string.IsNullOrWhiteSpace(password))
+            throw new CliException("No password was provided; credential was not changed.", 2);
+
+        credentialStore.Write(account.CredentialRef, account.Username, password);
+        Console.WriteLine($"Updated IMAP credential in Windows Credential Manager: {account.CredentialRef}");
+        return 0;
+    }
+
     private static int CredentialDelete(ConfigStore configStore, WindowsCredentialStore credentialStore, CommandOptions options)
     {
-        var account = ResolveAccount(configStore.Load(), options.Get("--account"));
+        var account = ResolveAccount(configStore.Load(), CredentialAccountOption(options));
 
         if (string.IsNullOrWhiteSpace(account.CredentialRef))
             throw new CliException($"Account '{account.Id}' has no credential_ref in config.", 2);
@@ -568,6 +592,9 @@ internal static class CliApp
 
         return 0;
     }
+
+    private static string CredentialAccountOption(CommandOptions options) =>
+        options.Get("--account") ?? options.Get("--id");
 
     private static async Task<int> ImapTestAsync(
         ConfigStore configStore,
@@ -1001,6 +1028,7 @@ internal static class CliApp
           search            Search local indexed message metadata and body text.
           serve             Run the MCP stdio server. Writes protocol messages only to stdout.
           credential-test   Check whether an account credential can be found.
+          credential-update Update an existing account credential in Windows Credential Manager.
           credential-delete Delete an account credential from Windows Credential Manager.
           imap-test         Connect to IMAP, list folders, search/fetch message summaries, optionally fetch one body.
 
@@ -1016,6 +1044,7 @@ internal static class CliApp
           dotnet run --project src/LceMcp -- search --query "refund processed" --account yahoo
           dotnet run --project src/LceMcp -- serve
           dotnet run --project src/LceMcp -- credential-test --account yahoo
+          dotnet run --project src/LceMcp -- credential-update --id yahoo
           dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund processed" --limit 5
           dotnet run --project src/LceMcp -- imap-test --account yahoo --limit 3 --fetch-first-body
 
@@ -1027,6 +1056,11 @@ internal static class CliApp
           --history-days <days>    Stored default requested sync window. Default: 90.
           --password-stdin         Read password/app password from stdin instead of prompting.
           --skip-password          Write config without storing a credential.
+
+        credential options:
+          --account <id-or-email>  Optional when only one account exists.
+          --id <id-or-email>       Alias for --account.
+          --password-stdin         For credential-update, read the new password/app password from stdin.
 
         discover-folders/folders options:
           --account <id-or-email>  Required when more than one account exists; optional for folders listing.

@@ -269,9 +269,21 @@ Test result:
 - `dotnet build lcemcp.slnx` succeeded on 2026-06-22.
 - `dotnet test lcemcp.slnx` passed with 33 tests on 2026-06-22. New coverage includes schema v5 migration, folder role defaults/preservation, search date/recipient/cursor behavior, date coverage readiness notes, sync-window auto expansion ignoring capped runs, expanded MCP tool listing, and setup-status output.
 
+Manual test result on 2026-06-22:
+
+- Release verification succeeded: `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 33 tests, and `dotnet build lcemcp.slnx -c Release /p:UseSharedCompilation=false` succeeded.
+- Temp-config CLI smoke through the Release executable succeeded: `status` created schema version 5 in an isolated config directory, and a no-hit `search` correctly returned `not_synced` without running FTS.
+- Before wiring to a real LLM, the old prototype-era Yahoo folder sync choices were tightened to the role-default MVP posture: Inbox, Sent, and Archive are sync-enabled; custom, spam, drafts, trash, and other non-default folders are disabled.
+- Published the MCP executable to ignored local artifact path `artifacts\lcemcp-mcp`, and added a Codex MCP server entry named `lcemcp` in `C:\Users\bojan\.codex\config.toml`, pointing at `artifacts\lcemcp-mcp\LceMcp.exe serve`. The Codex config parsed as valid TOML.
+- Direct JSON-RPC stdio smoke against the configured Release executable succeeded for `initialize`, `tools/list`, `email_get_setup_status`, and `email_get_sync_status`. The server advertised 10 tools and reported 3 sync-enabled folders.
+- Live Yahoo discovery/sync attempted through the Release executable, but Yahoo rejected LOGIN. The Windows Credential Manager target exists, so the current blocker appears to be an invalid/expired app password rather than missing local setup. Default search readiness remains `not_synced` for the 30-day, 3-folder scope until the credential is refreshed and a full metadata/body sync can complete.
+- No-sync Yahoo auth retest later on 2026-06-22 still failed at LOGIN. `imap-test --account yahoo --limit 1` connected to `imap.mail.yahoo.com:993`, read capabilities, then received `LOGIN Invalid credentials`. Credential Manager metadata looked sane: target `lcemcp/imap/yahoo`, username `bojan.sala@yahoo.com`, 16-character secret, no whitespace, no control characters. A direct MCP `email_discover_folders` call also failed with the same provider error without starting message sync.
+- Added `credential-update` on 2026-06-22 so an existing account password/app password can be replaced without rerunning setup or rewriting account config. Usage: `credential-update --id yahoo` or `credential-update --account yahoo`; `--password-stdin` is available for non-interactive use. `credential-test` and `credential-delete` also accept `--id` as an alias for `--account`.
+- Release publish was refreshed after `credential-update`. `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 33 tests, Release build succeeded, and an isolated smoke against the published executable created a throwaway account credential, updated it via `credential-update --id <temp> --password-stdin`, verified it existed, and deleted it.
+
 Next work:
 
-- Run a temp-config CLI smoke after the pt 7 implementation, then a live Yahoo discovery/sync/search smoke when credentials/network are available.
+- Refresh the Yahoo app password in Windows Credential Manager, then rerun live folder discovery, metadata sync, body sync, and normal MCP `email_search` without `allow_partial`.
 - Consider adding provider-probe estimates to `email_estimate_sync`; the current implementation is deliberately factual but cached-count only.
 - Consider a CLI or MCP folder-list view that highlights both current `sync_enabled` and role default side by side for setup UX.
 
