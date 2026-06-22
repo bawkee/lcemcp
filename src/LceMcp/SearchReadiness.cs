@@ -4,7 +4,10 @@ internal sealed record MessageSearchReadinessRequest(
     IReadOnlyList<string> AccountFilters,
     string FromEmail,
     IReadOnlyList<string> FolderRoles,
-    bool? HasAttachment);
+    bool? HasAttachment,
+    string ToEmail = null,
+    string DateFrom = null,
+    string DateTo = null);
 
 internal sealed record MessageSearchReadiness(
     bool SearchReady,
@@ -19,7 +22,8 @@ internal sealed record MessageSearchReadiness(
     int MessageSearchDocs,
     int FtsRows,
     int PendingMessageBodies,
-    SyncRunSnapshot ActiveSyncRun);
+    SyncRunSnapshot ActiveSyncRun,
+    string CoverageNote = null);
 
 internal sealed record SyncRunSnapshot(
     string Id,
@@ -37,7 +41,10 @@ internal sealed record SyncRunSnapshot(
     string StartedAt,
     string LastProgressAt,
     string CompletedAt,
-    string LastError);
+    string LastError,
+    int? RequestedSinceDays = null,
+    int? EffectiveSinceDays = null,
+    bool AutoExpandedForGap = false);
 
 internal sealed record SyncRunStartResult(
     string Id,

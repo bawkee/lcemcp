@@ -42,7 +42,11 @@ internal sealed record EmailSearchRequest(
     bool? HasAttachment,
     int Limit,
     int SnippetChars,
-    bool AllowPartial = false);
+    bool AllowPartial = false,
+    string ToEmail = null,
+    string DateFrom = null,
+    string DateTo = null,
+    string Cursor = null);
 
 internal sealed record EmailSearchResult(
     int MessageId,
@@ -54,4 +58,5 @@ internal sealed record EmailSearchResult(
     string Subject,
     bool HasAttachments,
     string Snippet,
-    double Score);
+    double Score,
+    string Cursor = null);

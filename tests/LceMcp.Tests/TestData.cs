@@ -46,7 +46,10 @@ internal static class TestData
         string providerMessageKey = "emailid:abc",
         string messageIdHeader = "abc@example.com",
         string subject = "Original subject",
-        string flags = null) =>
+        string flags = null,
+        string fromEmail = "sender@example.com",
+        string dateSent = "2026-06-19T10:00:00.0000000+00:00",
+        bool hasAttachments = false) =>
         new(
             ProviderUid: providerUid,
             ProviderMessageKey: providerMessageKey,
@@ -58,10 +61,10 @@ internal static class TestData
             Subject: subject,
             NormalizedSubject: subject?.ToLowerInvariant(),
             FromName: "Sender",
-            FromEmail: "sender@example.com",
-            DateSent: "2026-06-19T10:00:00.0000000+00:00",
-            DateReceived: "2026-06-19T10:01:00.0000000+00:00",
-            HasAttachments: false,
+            FromEmail: fromEmail,
+            DateSent: dateSent,
+            DateReceived: dateSent,
+            HasAttachments: hasAttachments,
             SizeBytes: 1234,
             RawHeaders: null,
             Flags: flags,

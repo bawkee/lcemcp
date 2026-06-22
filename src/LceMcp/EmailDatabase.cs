@@ -192,6 +192,43 @@ internal sealed class EmailDatabase
             .ToList();
     }
 
+    public int SetFolderSyncEnabled(string accountFilter, string folderFilter, bool enabled)
+    {
+        if (string.IsNullOrWhiteSpace(accountFilter))
+            throw new CliException("Account is required when changing folder sync settings.", 2);
+
+        if (string.IsNullOrWhiteSpace(folderFilter))
+            throw new CliException("Folder is required when changing folder sync settings.", 2);
+
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE folders
+            SET sync_enabled = $syncEnabled
+            WHERE id IN (
+                SELECT f.id
+                FROM folders f
+                JOIN accounts a ON a.id = f.account_id
+                WHERE (
+                    a.name COLLATE NOCASE = $accountFilter
+                    OR a.email_address COLLATE NOCASE = $accountFilter
+                    OR CAST(a.id AS TEXT) = $accountFilter
+                )
+                AND (
+                    f.path COLLATE NOCASE = $folderFilter
+                    OR f.name COLLATE NOCASE = $folderFilter
+                    OR CAST(f.id AS TEXT) = $folderFilter
+                )
+            );
+            """;
+        AddParameter(command, "$syncEnabled", enabled ? 1 : 0);
+        AddParameter(command, "$accountFilter", accountFilter.Trim());
+        AddParameter(command, "$folderFilter", folderFilter.Trim());
+        return command.ExecuteNonQuery();
+    }
+
     public AccountSyncSummary ReadAccountSyncSummary(string accountFilter)
     {
         EnsureInitialized();
@@ -375,34 +412,52 @@ internal sealed class EmailDatabase
 
         using var connection = OpenConnection();
         var accountIds = ResolveAccountIds(connection, request.AccountFilters);
+        var cursor = EmailSearchCursorCodec.Decode(request.Cursor);
 
         if (HasValues(request.AccountFilters) && accountIds.Count == 0)
             return [];
 
         var query = CreateDbQuery(connection, SearchMessagesSql);
-        ApplyScopeConditions(query, accountIds, request.FromEmail, request.FolderRoles, request.HasAttachment);
+        ApplyScopeConditions(
+            query,
+            accountIds,
+            request.FromEmail,
+            request.ToEmail,
+            request.FolderRoles,
+            request.HasAttachment,
+            request.DateFrom,
+            request.DateTo);
 
         using var command = query.CreateCommand();
         query.AddSqlParameter("$fts", fts);
         query.AddSqlParameter("$limit", limit);
         query.AddSqlParameter("$snippetTokens", snippetTokens);
+        query.AddSqlParameter("$dateFrom", request.DateFrom);
+        query.AddSqlParameter("$dateTo", request.DateTo);
+        query.AddSqlParameter("$cursorScore", cursor?.Score);
+        query.AddSqlParameter("$cursorDate", cursor?.Date ?? "");
+        query.AddSqlParameter("$cursorMessageId", cursor?.MessageId ?? 0);
 
         using var reader = (SqliteDataReader)command.ExecuteReader();
         var results = new List<EmailSearchResult>();
 
         while (reader.Read())
         {
+            var messageId = reader.GetInt32(reader.GetOrdinal("message_id"));
+            var messageDate = GetNullableString(reader, "message_date");
+            var score = reader.GetDouble(reader.GetOrdinal("score"));
             results.Add(new(
-                MessageId: reader.GetInt32(reader.GetOrdinal("message_id")),
+                MessageId: messageId,
                 AccountName: reader.GetString(reader.GetOrdinal("account_name")),
                 Folders: GetNullableString(reader, "folders"),
-                Date: GetNullableString(reader, "message_date"),
+                Date: messageDate,
                 FromName: GetNullableString(reader, "from_name"),
                 FromEmail: GetNullableString(reader, "from_email"),
                 Subject: GetNullableString(reader, "subject"),
                 HasAttachments: reader.GetInt32(reader.GetOrdinal("has_attachments")) != 0,
                 Snippet: GetNullableString(reader, "snippet"),
-                Score: reader.GetDouble(reader.GetOrdinal("score"))));
+                Score: score,
+                Cursor: EmailSearchCursorCodec.Encode(score, messageDate, messageId)));
         }
 
         return results;
@@ -507,7 +562,8 @@ internal sealed class EmailDatabase
         var scopedAccountCount = ReadScopedAccountCount(connection, accountIds, request.AccountFilters);
         var folderStates = ReadMessageSearchFolderStates(connection, accountIds, request.FolderRoles);
         var counts = ReadMessageSearchCounts(connection, accountIds, request);
-        var completeFolderCount = folderStates.Count(IsFolderMetadataComplete);
+        var completeFolderCount = folderStates.Count(folder => IsFolderMetadataComplete(folder, request));
+        var coverageNote = BuildCoverageNote(folderStates, request, completeFolderCount);
 
         var metadataComplete = scopedAccountCount > 0
             && folderStates.Count > 0
@@ -530,7 +586,8 @@ internal sealed class EmailDatabase
             MessageSearchDocs: counts.MessageSearchDocs,
             FtsRows: counts.FtsRows,
             PendingMessageBodies: counts.PendingMessageBodies,
-            ActiveSyncRun: activeSyncRun);
+            ActiveSyncRun: activeSyncRun,
+            CoverageNote: coverageNote);
     }
 
     public SyncRunStartResult StartOrQueueSyncRun(
@@ -538,7 +595,10 @@ internal sealed class EmailDatabase
         string accountName,
         string folderFilter,
         string phase,
-        int total)
+        int total,
+        int? requestedSinceDays = null,
+        int? effectiveSinceDays = null,
+        bool autoExpandedForGap = false)
     {
         EnsureInitialized();
 
@@ -563,6 +623,9 @@ internal sealed class EmailDatabase
                 ownerId,
                 GlobalSyncScopeKey,
                 status,
+                requestedSinceDays,
+                effectiveSinceDays,
+                autoExpandedForGap,
                 now);
 
             if (status == "running")
@@ -823,6 +886,57 @@ internal sealed class EmailDatabase
         using var connection = OpenConnection();
         ReconcileExpiredSyncWork(connection, DateTimeOffset.UtcNow);
         return ReadActiveSyncRun(connection);
+    }
+
+    public SyncWindowPlan PlanMetadataSyncWindow(
+        int accountId,
+        IReadOnlyList<StoredFolder> folders,
+        int requestedSinceDays)
+    {
+        EnsureInitialized();
+
+        requestedSinceDays = Math.Max(0, requestedSinceDays);
+
+        if (folders.Count == 0)
+            return new(requestedSinceDays, requestedSinceDays, AutoExpandedForGap: false, new Dictionary<int, int>());
+
+        if (requestedSinceDays == 0)
+        {
+            return new(
+                RequestedSinceDays: 0,
+                EffectiveSinceDays: 0,
+                AutoExpandedForGap: false,
+                EffectiveSinceDaysByFolder: folders.ToDictionary(folder => folder.Id, _ => 0));
+        }
+
+        using var connection = OpenConnection();
+        var now = DateTimeOffset.UtcNow;
+        var effectiveByFolder = new Dictionary<int, int>();
+
+        foreach (var folder in folders)
+        {
+            var effectiveSinceDays = requestedSinceDays;
+            var syncState = ReadFolderSyncWindowState(connection, accountId, folder.Id);
+
+            if (syncState is not null
+                && IsUncappedSuccessfulMetadataState(syncState.State)
+                && DateTimeOffset.TryParse(syncState.LastSuccessAt, out var lastSuccessAt))
+            {
+                var gapSinceDays = Math.Max(
+                    1,
+                    Convert.ToInt32(Math.Ceiling((now - lastSuccessAt.ToUniversalTime()).TotalDays)) + 2);
+                effectiveSinceDays = Math.Max(requestedSinceDays, gapSinceDays);
+            }
+
+            effectiveByFolder[folder.Id] = effectiveSinceDays;
+        }
+
+        var effectiveSinceDaysForRun = effectiveByFolder.Values.Max();
+        return new(
+            RequestedSinceDays: requestedSinceDays,
+            EffectiveSinceDays: effectiveSinceDaysForRun,
+            AutoExpandedForGap: effectiveSinceDaysForRun > requestedSinceDays,
+            EffectiveSinceDaysByFolder: effectiveByFolder);
     }
 
     public int UpsertMessageMetadataBatch(
@@ -1173,6 +1287,7 @@ internal sealed class EmailDatabase
                 attributes,
                 role,
                 selectable,
+                sync_enabled,
                 uidvalidity,
                 message_count,
                 recent_count,
@@ -1186,6 +1301,7 @@ internal sealed class EmailDatabase
                 $attributes,
                 $role,
                 $selectable,
+                $syncEnabled,
                 $uidValidity,
                 $messageCount,
                 $recentCount,
@@ -1209,6 +1325,7 @@ internal sealed class EmailDatabase
         AddParameter(command, "$attributes", folder.Attributes);
         AddParameter(command, "$role", folder.Role);
         AddParameter(command, "$selectable", folder.Selectable ? 1 : 0);
+        AddParameter(command, "$syncEnabled", folder.Selectable && ImapFolderRoles.SyncEnabledByDefault(folder.Role) ? 1 : 0);
         AddParameter(command, "$uidValidity", folder.UidValidity);
         AddParameter(command, "$messageCount", folder.MessageCount);
         AddParameter(command, "$recentCount", folder.RecentCount);
@@ -1782,7 +1899,7 @@ internal sealed class EmailDatabase
         IReadOnlyList<string> folderRoles)
     {
         var query = CreateDbQuery(connection, SearchReadinessFoldersSql);
-        ApplyScopeConditions(query, accountIds, null, folderRoles, null);
+        ApplyScopeConditions(query, accountIds, null, null, folderRoles, null, null, null);
 
         using var command = query.CreateCommand();
 
@@ -1808,9 +1925,19 @@ internal sealed class EmailDatabase
         MessageSearchReadinessRequest request)
     {
         var query = CreateDbQuery(connection, SearchReadinessCountsSql);
-        ApplyScopeConditions(query, accountIds, request.FromEmail, request.FolderRoles, request.HasAttachment);
+        ApplyScopeConditions(
+            query,
+            accountIds,
+            request.FromEmail,
+            null,
+            request.FolderRoles,
+            request.HasAttachment,
+            request.DateFrom,
+            request.DateTo);
 
         using var command = query.CreateCommand();
+        query.AddSqlParameter("$dateFrom", request.DateFrom);
+        query.AddSqlParameter("$dateTo", request.DateTo);
 
         using var reader = (SqliteDataReader)command.ExecuteReader();
         if (!reader.Read())
@@ -1828,13 +1955,17 @@ internal sealed class EmailDatabase
         DbQuery query,
         IReadOnlyList<int> accountIds,
         string fromEmail,
+        string toEmail,
         IReadOnlyList<string> folderRoles,
-        bool? hasAttachment)
+        bool? hasAttachment,
+        string dateFrom,
+        string dateTo)
     {
         if (accountIds.Count > 0)
             query.SetCondition("accountIds", accountIds);
 
         query.SetCondition("fromEmail", BlankToNull(fromEmail), StringOperator.Is, ignoreIfNull: true);
+        query.SetCondition("toEmail", BlankToNull(toEmail), StringOperator.Is, ignoreIfNull: true);
 
         if (HasValues(folderRoles))
             query.SetCondition("folderRoles", folderRoles.Select(role => role.Trim().ToLowerInvariant()).ToList());
@@ -1860,7 +1991,9 @@ internal sealed class EmailDatabase
         return query;
     }
 
-    private static bool IsFolderMetadataComplete(MessageSearchFolderState folder)
+    private static bool IsFolderMetadataComplete(
+        MessageSearchFolderState folder,
+        MessageSearchReadinessRequest request)
     {
         if (string.IsNullOrWhiteSpace(folder.LastSuccessAt))
             return false;
@@ -1872,7 +2005,10 @@ internal sealed class EmailDatabase
         if (state is null)
             return false;
 
-        var coversHistory = state.SinceDays == 0 || state.SinceDays >= folder.HistoryDays;
+        var requiredSinceDays = RequiredSinceDays(folder, request);
+        var coversHistory = requiredSinceDays == 0
+            ? state.SinceDays == 0
+            : state.SinceDays == 0 || state.SinceDays >= requiredSinceDays;
         var uncapped = state.MaxPerFolder == 0 || state.SelectedCount >= state.MatchedCount;
         var fetchedSelected = state.FetchedCount >= state.SelectedCount;
 
@@ -1880,6 +2016,58 @@ internal sealed class EmailDatabase
             && uncapped
             && fetchedSelected
             && state.MissingCount == 0;
+    }
+
+    private static string BuildCoverageNote(
+        IReadOnlyList<MessageSearchFolderState> folders,
+        MessageSearchReadinessRequest request,
+        int completeFolderCount)
+    {
+        if (folders.Count == 0)
+            return null;
+
+        if (string.IsNullOrWhiteSpace(request.DateFrom)
+            && !string.IsNullOrWhiteSpace(request.DateTo))
+        {
+            return "The requested date range has no lower bound, so complete coverage requires an uncapped full-history metadata sync.";
+        }
+
+        var requiredSinceDays = folders
+            .Select(folder => RequiredSinceDays(folder, request))
+            .DefaultIfEmpty(0)
+            .Max();
+
+        if (!string.IsNullOrWhiteSpace(request.DateFrom)
+            && folders.Any(folder => RequiredSinceDays(folder, request) > folder.HistoryDays))
+        {
+            return $"The requested date range reaches back about {requiredSinceDays} day(s), beyond at least one configured account history window; sync must cover that wider range before results are complete.";
+        }
+
+        if (completeFolderCount < folders.Count)
+        {
+            return requiredSinceDays == 0
+                ? "One or more selected folders do not have full-history metadata coverage."
+                : $"One or more selected folders do not yet have complete metadata coverage for the requested {requiredSinceDays} day window.";
+        }
+
+        return null;
+    }
+
+    private static int RequiredSinceDays(
+        MessageSearchFolderState folder,
+        MessageSearchReadinessRequest request)
+    {
+        if (!string.IsNullOrWhiteSpace(request.DateFrom)
+            && DateTimeOffset.TryParse(request.DateFrom, out var dateFrom))
+        {
+            var ageDays = (DateTimeOffset.UtcNow - dateFrom.ToUniversalTime()).TotalDays;
+            return Math.Max(1, Convert.ToInt32(Math.Ceiling(ageDays)));
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.DateTo))
+            return 0;
+
+        return folder.HistoryDays;
     }
 
     private static MetadataSyncState ParseMetadataSyncState(string stateJson)
@@ -1900,12 +2088,51 @@ internal sealed class EmailDatabase
                 || !TryGetJsonInt(root, "missing_count", out var missingCount))
                 return null;
 
+            if (TryGetJsonInt(root, "effective_since_days", out var effectiveSinceDays))
+                sinceDays = effectiveSinceDays;
+
             return new(sinceDays, maxPerFolder, matchedCount, selectedCount, fetchedCount, missingCount);
         }
         catch (JsonException)
         {
             return null;
         }
+    }
+
+    private static FolderSyncWindowState ReadFolderSyncWindowState(
+        SqliteConnection connection,
+        int accountId,
+        int folderId)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT state_json, last_success_at
+            FROM sync_state
+            WHERE account_id = $accountId
+              AND folder_id = $folderId
+              AND last_success_at IS NOT NULL
+            LIMIT 1;
+            """;
+        AddParameter(command, "$accountId", accountId);
+        AddParameter(command, "$folderId", folderId);
+
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
+            return null;
+
+        return new(
+            State: ParseMetadataSyncState(GetNullableString(reader, "state_json")),
+            LastSuccessAt: GetNullableString(reader, "last_success_at"));
+    }
+
+    private static bool IsUncappedSuccessfulMetadataState(MetadataSyncState state)
+    {
+        if (state is null)
+            return false;
+
+        var uncapped = state.MaxPerFolder == 0 || state.SelectedCount >= state.MatchedCount;
+        var fetchedSelected = state.FetchedCount >= state.SelectedCount;
+        return uncapped && fetchedSelected && state.MissingCount == 0;
     }
 
     private static bool TryGetJsonInt(JsonElement root, string name, out int value)
@@ -1929,6 +2156,9 @@ internal sealed class EmailDatabase
                 phase,
                 done,
                 total,
+                requested_since_days,
+                effective_since_days,
+                auto_expanded_for_gap,
                 started_at,
                 last_progress_at,
                 completed_at,
@@ -1959,6 +2189,9 @@ internal sealed class EmailDatabase
                 phase,
                 done,
                 total,
+                requested_since_days,
+                effective_since_days,
+                auto_expanded_for_gap,
                 started_at,
                 last_progress_at,
                 completed_at,
@@ -2132,6 +2365,9 @@ internal sealed class EmailDatabase
         string ownerId,
         string scopeKey,
         string status,
+        int? requestedSinceDays,
+        int? effectiveSinceDays,
+        bool autoExpandedForGap,
         DateTimeOffset now)
     {
         var syncRunId = BuildSyncRunId();
@@ -2148,6 +2384,9 @@ internal sealed class EmailDatabase
                 phase,
                 done,
                 total,
+                requested_since_days,
+                effective_since_days,
+                auto_expanded_for_gap,
                 requested_at,
                 started_at,
                 last_progress_at
@@ -2163,6 +2402,9 @@ internal sealed class EmailDatabase
                 $phase,
                 0,
                 $total,
+                $requestedSinceDays,
+                $effectiveSinceDays,
+                $autoExpandedForGap,
                 $requestedAt,
                 $startedAt,
                 $lastProgressAt
@@ -2177,6 +2419,9 @@ internal sealed class EmailDatabase
         AddParameter(command, "$status", status);
         AddParameter(command, "$phase", phase);
         AddParameter(command, "$total", Math.Max(0, total));
+        AddParameter(command, "$requestedSinceDays", requestedSinceDays);
+        AddParameter(command, "$effectiveSinceDays", effectiveSinceDays);
+        AddParameter(command, "$autoExpandedForGap", autoExpandedForGap ? 1 : 0);
         AddParameter(command, "$requestedAt", now.ToString("O"));
         AddParameter(command, "$startedAt", now.ToString("O"));
         AddParameter(command, "$lastProgressAt", now.ToString("O"));
@@ -2297,7 +2542,10 @@ internal sealed class EmailDatabase
             StartedAt: startedAt,
             LastProgressAt: reader.GetString(reader.GetOrdinal("last_progress_at")),
             CompletedAt: completedAt,
-            LastError: GetNullableString(reader, "last_error"));
+            LastError: GetNullableString(reader, "last_error"),
+            RequestedSinceDays: GetNullableInt(reader, "requested_since_days"),
+            EffectiveSinceDays: GetNullableInt(reader, "effective_since_days"),
+            AutoExpandedForGap: reader.GetInt32(reader.GetOrdinal("auto_expanded_for_gap")) != 0);
     }
 
     private static int CalculateElapsedSeconds(string startedAt, string completedAt)
@@ -2542,6 +2790,10 @@ internal sealed class EmailDatabase
         int FetchedCount,
         int MissingCount);
 
+    private sealed record FolderSyncWindowState(
+        MetadataSyncState State,
+        string LastSuccessAt);
+
     private const string MigrationTableSql = """
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
@@ -2578,10 +2830,32 @@ internal sealed class EmailDatabase
         JOIN messages m ON m.id = d.message_id
         JOIN accounts a ON a.id = m.account_id
         WHERE messages_fts MATCH $fts
+          AND ($dateFrom IS NULL OR COALESCE(m.date_sent, m.date_received) >= $dateFrom)
+          AND ($dateTo IS NULL OR COALESCE(m.date_sent, m.date_received) <= $dateTo)
+          AND (
+              $cursorScore IS NULL
+              OR bm25(messages_fts) > $cursorScore
+              OR (
+                  ABS(bm25(messages_fts) - $cursorScore) <= 0.0000001
+                  AND (
+                      COALESCE(m.date_sent, m.date_received, '') < $cursorDate
+                      OR (
+                          COALESCE(m.date_sent, m.date_received, '') = $cursorDate
+                          AND m.id > $cursorMessageId
+                      )
+                  )
+              )
+          )
         {AND
             {m.account_id [accountIds]}
             {m.from_email COLLATE NOCASE [fromEmail]}
             {m.has_attachments [hasAttachments]}
+            {m.id IN (
+                SELECT r_to.message_id
+                FROM message_recipients r_to
+                WHERE r_to.type = 'to'
+                  {AND {r_to.email COLLATE NOCASE [toEmail]}}
+            )}
             {EXISTS (
                 SELECT 1
                 FROM message_locations ml_filter
@@ -2591,7 +2865,7 @@ internal sealed class EmailDatabase
                   AND ml_filter.expunged = 0
                   {AND {f_filter.role [folderRoles]}}
             )}}
-        ORDER BY score, COALESCE(m.date_sent, m.date_received, '') DESC
+        ORDER BY score, COALESCE(m.date_sent, m.date_received, '') DESC, m.id
         LIMIT $limit;
         """;
 
@@ -2638,6 +2912,8 @@ internal sealed class EmailDatabase
           AND f.sync_enabled = 1
           AND ml.deleted_locally = 0
           AND ml.expunged = 0
+          AND ($dateFrom IS NULL OR COALESCE(m.date_sent, m.date_received) >= $dateFrom)
+          AND ($dateTo IS NULL OR COALESCE(m.date_sent, m.date_received) <= $dateTo)
         {AND
             {m.account_id [accountIds]}
             {m.from_email COLLATE NOCASE [fromEmail]}

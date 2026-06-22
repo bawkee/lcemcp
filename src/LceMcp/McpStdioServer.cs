@@ -166,7 +166,7 @@ internal sealed class McpStdioServer
                 ["title"] = "Locally Cached Email MCP",
                 ["version"] = typeof(McpStdioServer).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"
             },
-            ["instructions"] = "Use email_get_sync_status before trusting email_search. If email_search returns not_synced, call email_sync_now and poll email_get_sync_status; not_synced is not evidence that no matching email exists."
+            ["instructions"] = "Use email_get_setup_status when onboarding may be incomplete. Use email_get_sync_status before trusting email_search. If email_search returns not_synced, call email_sync_now and poll email_get_sync_status; not_synced is not evidence that no matching email exists. Use since_days on email_sync_now for one-off wider backfills instead of changing config."
         };
     }
 
@@ -182,6 +182,40 @@ internal sealed class McpStdioServer
                     ObjectSchema(new()
                     {
                         ["enabled_only"] = BoolSchema("Only include enabled accounts. Defaults to true.", defaultValue: true)
+                    }),
+                    readOnly: true,
+                    idempotent: true),
+                ToolDefinition(
+                    "email_get_setup_status",
+                    "Email Setup Status",
+                    "Report local setup prerequisites without contacting mail providers.",
+                    ObjectSchema(new()
+                    {
+                        ["accounts"] = StringArraySchema("Optional account ids, display names, or email addresses. Omit, null, or [] for all configured accounts.")
+                    }),
+                    readOnly: true,
+                    idempotent: true),
+                ToolDefinition(
+                    "email_discover_folders",
+                    "Email Discover Folders",
+                    "Connect to configured mail providers, discover folders, and persist local folder metadata without syncing messages.",
+                    ObjectSchema(new()
+                    {
+                        ["accounts"] = StringArraySchema("Optional account ids, display names, or email addresses. Omit, null, or [] for all enabled accounts.")
+                    }),
+                    readOnly: false,
+                    idempotent: false,
+                    openWorld: true),
+                ToolDefinition(
+                    "email_estimate_sync",
+                    "Email Sync Estimate",
+                    "Return factual cached sync estimates for selected folders and requested/effective metadata windows.",
+                    ObjectSchema(new()
+                    {
+                        ["accounts"] = StringArraySchema("Optional account ids, display names, or email addresses. Omit, null, or [] for all enabled accounts."),
+                        ["folders"] = StringArraySchema("Optional folder paths, names, or ids. Omit for selectable sync-enabled folders."),
+                        ["since_days"] = IntSchema("Optional metadata date bound override. Use 0 for no date bound.", 0, 3650, null),
+                        ["probe"] = BoolSchema("Accepted for compatibility. Current MVP estimates from cached folder counts.", defaultValue: false)
                     }),
                     readOnly: true,
                     idempotent: true),
@@ -205,9 +239,13 @@ internal sealed class McpStdioServer
                         ["query"] = StringSchema("Search text. Quoted phrases and OR are supported."),
                         ["accounts"] = StringArraySchema("Optional account ids, display names, or email addresses. Omit, null, or [] for all configured accounts."),
                         ["from_email"] = NullableStringSchema("Optional exact sender email filter."),
+                        ["to_email"] = NullableStringSchema("Optional exact To recipient email filter."),
+                        ["date_from"] = NullableStringSchema("Optional inclusive lower date bound. Accepts YYYY-MM-DD or an ISO timestamp."),
+                        ["date_to"] = NullableStringSchema("Optional inclusive upper date bound. Accepts YYYY-MM-DD or an ISO timestamp."),
                         ["folder_roles"] = StringArraySchema("Optional folder-role filter such as inbox, sent, archive, trash, or custom."),
                         ["has_attachment"] = NullableBoolSchema("Optional attachment metadata filter."),
                         ["limit"] = IntSchema("Maximum result count, 1 to 100. Defaults to 20.", 1, 100, 20),
+                        ["cursor"] = NullableStringSchema("Opaque cursor returned by a prior email_search response."),
                         ["snippet_chars"] = IntSchema("Approximate maximum snippet characters, 160 to 4096. Defaults to 1024.", 160, 4096, 1024),
                         ["allow_partial"] = BoolSchema("Debug opt-in. Search even when readiness is incomplete and label results partial.", defaultValue: false)
                     }, "query"),
@@ -298,6 +336,9 @@ internal sealed class McpStdioServer
         toolName switch
         {
             "email_list_accounts" => ExecuteListAccounts(arguments),
+            "email_get_setup_status" => ExecuteGetSetupStatus(arguments),
+            "email_discover_folders" => ExecuteDiscoverFolders(arguments, cancellationToken),
+            "email_estimate_sync" => ExecuteEstimateSync(arguments),
             "email_list_folders" => ExecuteListFolders(arguments),
             "email_search" => ExecuteSearch(arguments),
             "email_get_message" => ExecuteGetMessage(arguments),
@@ -347,6 +388,213 @@ internal sealed class McpStdioServer
         };
 
         return new(payload, "read", $"enabled_only={enabledOnly.ToString().ToLowerInvariant()}", $"accounts={values.Count}");
+    }
+
+    private ToolExecution ExecuteGetSetupStatus(JsonElement arguments)
+    {
+        EnsureArgumentObject(arguments, "email_get_setup_status");
+        ValidateAllowedArguments(arguments, "accounts", "_meta");
+
+        var accountFilters = ReadOptionalStringArray(arguments, "accounts");
+        var config = _configStore.Load();
+        var accounts = SelectAccounts(config, accountFilters, enabledOnly: false);
+        var values = new JsonArray();
+
+        foreach (var account in accounts)
+            values.Add(BuildSetupStatusJson(account));
+
+        var topStatus = values.Count == 0
+            ? "no_accounts"
+            : values.OfType<JsonObject>().All(value => value["setup_status"]?.GetValue<string>() == "setup_complete")
+                ? "setup_complete"
+                : "needs_attention";
+        var payload = new JsonObject
+        {
+            ["status"] = topStatus,
+            ["accounts"] = values
+        };
+
+        return new(payload, "read", $"accounts={FormatAccountFilters(accountFilters)}", $"status={topStatus} accounts={values.Count}");
+    }
+
+    private ToolExecution ExecuteDiscoverFolders(JsonElement arguments, CancellationToken cancellationToken)
+    {
+        EnsureArgumentObject(arguments, "email_discover_folders");
+        ValidateAllowedArguments(arguments, "accounts", "_meta");
+
+        var accountFilters = ReadOptionalStringArray(arguments, "accounts");
+        var config = _configStore.Load();
+        var accounts = SelectAccounts(config, accountFilters, enabledOnly: true);
+        var foldersJson = new JsonArray();
+        var errors = new JsonArray();
+
+        foreach (var account in accounts)
+        {
+            var validationErrors = AccountConfigValidator.ValidateForImap(account).ToList();
+            if (validationErrors.Count > 0)
+            {
+                errors.Add(new JsonObject
+                {
+                    ["account"] = account.Id,
+                    ["error"] = $"config_invalid: {string.Join("; ", validationErrors)}"
+                });
+                continue;
+            }
+
+            var password = _credentialStore.Read(account.CredentialRef);
+            if (password is null)
+            {
+                errors.Add(new JsonObject
+                {
+                    ["account"] = account.Id,
+                    ["error"] = $"credential_missing: {account.CredentialRef}"
+                });
+                continue;
+            }
+
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var databaseAccountId = _database.UpsertConfiguredAccount(account);
+                var discovery = new ImapFolderDiscovery()
+                    .DiscoverAsync(account, password, cancellationToken)
+                    .GetAwaiter()
+                    .GetResult();
+                _database.UpsertFolders(databaseAccountId, discovery.Folders);
+
+                foreach (var folder in _database.ReadFolders(account.Id))
+                    foldersJson.Add(ToDiscoveryFolderJson(folder));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                errors.Add(new JsonObject
+                {
+                    ["account"] = account.Id,
+                    ["error"] = ex.Message
+                });
+            }
+        }
+
+        var status = accounts.Count == 0
+            ? "failed"
+            : errors.Count == 0 ? "succeeded" : "failed";
+        var payload = new JsonObject
+        {
+            ["status"] = status,
+            ["folders"] = foldersJson,
+            ["errors"] = errors
+        };
+
+        return new(
+            payload,
+            "sync",
+            $"accounts={FormatAccountFilters(accountFilters)}",
+            $"status={status} folders={foldersJson.Count} errors={errors.Count}",
+            IsError: status != "succeeded");
+    }
+
+    private ToolExecution ExecuteEstimateSync(JsonElement arguments)
+    {
+        EnsureArgumentObject(arguments, "email_estimate_sync");
+        ValidateAllowedArguments(arguments, "accounts", "folders", "since_days", "probe", "_meta");
+
+        var accountFilters = ReadOptionalStringArray(arguments, "accounts");
+        var folderFilters = ReadOptionalStringArray(arguments, "folders");
+        var sinceDays = ReadOptionalNullableInt(arguments, "since_days", min: 0, max: 3650);
+        var probe = ReadOptionalBool(arguments, "probe", defaultValue: false);
+        var accounts = SelectAccounts(_configStore.Load(), accountFilters, enabledOnly: true);
+
+        if (accounts.Count == 0)
+        {
+            var noAccounts = new JsonObject
+            {
+                ["status"] = "needs_account",
+                ["estimate_source"] = null,
+                ["folders"] = new JsonArray(),
+                ["probe_honored"] = false
+            };
+            return new(noAccounts, "read", $"accounts={FormatAccountFilters(accountFilters)}", "status=needs_account", IsError: true);
+        }
+
+        var estimateFolders = new JsonArray();
+        var totalEstimatedMessages = 0;
+        var selectedFolderCount = 0;
+        var allCountsKnown = true;
+        var requestedSinceDays = accounts.Select(account => sinceDays ?? account.HistoryDays).Max();
+        var effectiveSinceDays = requestedSinceDays;
+        var autoExpanded = false;
+
+        foreach (var account in accounts)
+        {
+            var validationErrors = AccountConfigValidator.ValidateForImap(account).ToList();
+            if (validationErrors.Count > 0)
+                return EstimateRejected("config_invalid", $"Account '{account.Id}' is not valid for IMAP: {string.Join("; ", validationErrors)}");
+
+            if (_credentialStore.Read(account.CredentialRef) is null)
+                return EstimateRejected("credential_missing", $"Credential not found for account '{account.Id}': {account.CredentialRef}");
+
+            var cachedFolders = _database.ReadFolders(account.Id);
+            if (cachedFolders.Count == 0)
+                return EstimateRejected("folders_not_discovered", $"No folders are cached for account '{account.Id}'.");
+
+            var selectedFolders = SelectEstimateFolders(cachedFolders, folderFilters);
+            if (selectedFolders.Count == 0)
+                return EstimateRejected("failed", $"No cached folders matched the estimate scope for account '{account.Id}'.");
+
+            var plan = _database.PlanMetadataSyncWindow(
+                _database.UpsertConfiguredAccount(account),
+                selectedFolders,
+                sinceDays ?? account.HistoryDays);
+            if (plan.RequestedSinceDays == 0)
+                requestedSinceDays = 0;
+
+            if (plan.EffectiveSinceDays == 0)
+                effectiveSinceDays = 0;
+            else if (effectiveSinceDays != 0)
+                effectiveSinceDays = Math.Max(effectiveSinceDays, plan.EffectiveSinceDays);
+
+            autoExpanded = autoExpanded || plan.AutoExpandedForGap;
+
+            foreach (var folder in selectedFolders)
+            {
+                if (folder.MessageCount is null)
+                    allCountsKnown = false;
+
+                var estimatedMessages = folder.MessageCount ?? 0;
+                totalEstimatedMessages += estimatedMessages;
+                selectedFolderCount++;
+                estimateFolders.Add(new JsonObject
+                {
+                    ["account"] = account.Id,
+                    ["path"] = folder.Path,
+                    ["role"] = folder.Role,
+                    ["sync_enabled"] = folder.SyncEnabled,
+                    ["estimated_messages"] = estimatedMessages,
+                    ["message_count_known"] = folder.MessageCount is not null
+                });
+            }
+        }
+
+        var payload = new JsonObject
+        {
+            ["status"] = "estimated",
+            ["estimate_source"] = "cached_folder_counts",
+            ["requested_since_days"] = requestedSinceDays,
+            ["effective_since_days"] = effectiveSinceDays,
+            ["auto_expanded_for_gap"] = autoExpanded,
+            ["selected_folder_count"] = selectedFolderCount,
+            ["total_estimated_messages"] = totalEstimatedMessages,
+            ["estimate_confidence"] = allCountsKnown ? "medium" : "low",
+            ["probe_requested"] = probe,
+            ["probe_honored"] = false,
+            ["folders"] = estimateFolders
+        };
+
+        return new(
+            payload,
+            "read",
+            $"accounts={FormatAccountFilters(accountFilters)}, folders={FormatAccountFilters(folderFilters)}, probe={probe.ToString().ToLowerInvariant()}",
+            $"status=estimated folders={selectedFolderCount} messages={totalEstimatedMessages}");
     }
 
     private ToolExecution ExecuteListFolders(JsonElement arguments)
@@ -404,14 +652,32 @@ internal sealed class McpStdioServer
             "query",
             "accounts",
             "from_email",
+            "to_email",
+            "date_from",
+            "date_to",
             "folder_roles",
             "has_attachment",
             "limit",
+            "cursor",
             "snippet_chars",
             "allow_partial",
             "_meta");
 
         var query = ReadRequiredString(arguments, "query").Trim();
+        string dateFrom;
+        string dateTo;
+
+        try
+        {
+            dateFrom = EmailSearchDateParser.NormalizeLowerBound(ReadOptionalString(arguments, "date_from"));
+            dateTo = EmailSearchDateParser.NormalizeUpperBound(ReadOptionalString(arguments, "date_to"));
+            EmailSearchDateParser.ValidateRange(dateFrom, dateTo);
+        }
+        catch (CliException ex)
+        {
+            throw new JsonRpcError(-32602, ex.Message);
+        }
+
         var accountFilters = ReadOptionalStringArray(arguments, "accounts");
         var configuredAccounts = SelectAccounts(_configStore.Load(), accountFilters, enabledOnly: true);
         var effectiveAccountFilters = configuredAccounts.Select(account => account.Id).ToList();
@@ -423,11 +689,16 @@ internal sealed class McpStdioServer
             HasAttachment: ReadOptionalNullableBool(arguments, "has_attachment"),
             Limit: ReadOptionalInt(arguments, "limit", defaultValue: 20, min: 1, max: 100),
             SnippetChars: ReadOptionalInt(arguments, "snippet_chars", defaultValue: 1024, min: 160, max: 4096),
-            AllowPartial: ReadOptionalBool(arguments, "allow_partial", defaultValue: false));
+            AllowPartial: ReadOptionalBool(arguments, "allow_partial", defaultValue: false),
+            ToEmail: ReadOptionalString(arguments, "to_email"),
+            DateFrom: dateFrom,
+            DateTo: dateTo,
+            Cursor: ReadOptionalString(arguments, "cursor"));
 
         try
         {
             FtsQueryBuilder.Build(request.Query);
+            EmailSearchCursorCodec.Decode(request.Cursor);
         }
         catch (CliException ex)
         {
@@ -446,6 +717,7 @@ internal sealed class McpStdioServer
                 ["message"] = "No enabled configured accounts matched the requested search scope.",
                 ["sync_run_id"] = StringOrNull(noAccountsReadiness.ActiveSyncRun?.Id),
                 ["readiness"] = ToReadinessJson(noAccountsReadiness),
+                ["coverage_note"] = StringOrNull(noAccountsReadiness.CoverageNote),
                 ["progress"] = noAccountsReadiness.ActiveSyncRun is null ? null : ToSyncProgressJson(noAccountsReadiness.ActiveSyncRun),
                 ["results"] = new JsonArray(),
                 ["has_more"] = false,
@@ -459,7 +731,10 @@ internal sealed class McpStdioServer
             AccountFilters: request.AccountFilters,
             FromEmail: request.FromEmail,
             FolderRoles: request.FolderRoles,
-            HasAttachment: request.HasAttachment));
+            HasAttachment: request.HasAttachment,
+            ToEmail: request.ToEmail,
+            DateFrom: request.DateFrom,
+            DateTo: request.DateTo));
 
         if (!readiness.SearchReady && !request.AllowPartial)
         {
@@ -470,6 +745,7 @@ internal sealed class McpStdioServer
                 ["message"] = "The requested email search corpus is not fully indexed.",
                 ["sync_run_id"] = StringOrNull(readiness.ActiveSyncRun?.Id),
                 ["readiness"] = ToReadinessJson(readiness),
+                ["coverage_note"] = StringOrNull(readiness.CoverageNote),
                 ["progress"] = readiness.ActiveSyncRun is null ? null : ToSyncProgressJson(readiness.ActiveSyncRun),
                 ["results"] = new JsonArray(),
                 ["has_more"] = false,
@@ -482,6 +758,7 @@ internal sealed class McpStdioServer
         var rawResults = _database.SearchMessages(request with { Limit = Math.Min(request.Limit + 1, 101) });
         var hasMore = rawResults.Count > request.Limit;
         var results = rawResults.Take(request.Limit).ToList();
+        var nextCursor = hasMore ? results.LastOrDefault()?.Cursor : null;
         var payloadResults = new JsonArray();
 
         foreach (var result in results)
@@ -494,9 +771,10 @@ internal sealed class McpStdioServer
             ["search_ready"] = readiness.SearchReady,
             ["results_may_be_incomplete"] = !readiness.SearchReady,
             ["readiness"] = ToReadinessJson(readiness),
+            ["coverage_note"] = StringOrNull(readiness.CoverageNote),
             ["results"] = payloadResults,
             ["has_more"] = hasMore,
-            ["next_cursor"] = null
+            ["next_cursor"] = StringOrNull(nextCursor)
         };
 
         return new(
@@ -620,12 +898,16 @@ internal sealed class McpStdioServer
         if (initialTotal == 0)
             initialTotal = works.Count;
 
+        var syncWindow = PlanSyncWindowForRun(request, works);
         var syncRun = _database.StartOrQueueSyncRun(
             accounts.Count == 1 ? works[0].DatabaseAccountId : null,
             accounts.Count == 1 ? works[0].Account.Id : "multiple",
             request.Folder,
             "syncing_metadata",
-            initialTotal);
+            initialTotal,
+            syncWindow.RequestedSinceDays,
+            syncWindow.EffectiveSinceDays,
+            syncWindow.AutoExpandedForGap);
 
         StartBackgroundSync(request, works, syncRun, cancellationToken);
 
@@ -634,6 +916,9 @@ internal sealed class McpStdioServer
             ["accepted"] = true,
             ["sync_run_id"] = syncRun.Id,
             ["status"] = syncRun.Status,
+            ["requested_since_days"] = syncWindow.RequestedSinceDays,
+            ["effective_since_days"] = syncWindow.EffectiveSinceDays,
+            ["auto_expanded_for_gap"] = syncWindow.AutoExpandedForGap,
             ["active_sync_run_id"] = StringOrNull(syncRun.ActiveRun?.Id),
             ["message"] = syncRun.Acquired
                 ? "Sync started. Poll email_get_sync_status for progress."
@@ -718,6 +1003,7 @@ internal sealed class McpStdioServer
             ["search_ready_scope"] = new JsonObject
             {
                 ["history_days"] = account.HistoryDays,
+                ["history_source"] = "config.toml",
                 ["message_search_ready"] = readiness.SearchReady,
                 ["attachment_search_ready"] = false
             },
@@ -752,6 +1038,45 @@ internal sealed class McpStdioServer
             }
         }, CancellationToken.None);
     }
+
+    private SyncWindowPlan PlanSyncWindowForRun(
+        McpSyncNowRequest request,
+        IReadOnlyList<SyncAccountWork> works)
+    {
+        var requestedSinceDays = works.Count == 0
+            ? 0
+            : works.Select(work => RequestedSinceDays(request, work.Account)).DefaultIfEmpty(0).Max();
+        var effectiveSinceDays = requestedSinceDays;
+        var autoExpanded = false;
+
+        foreach (var work in works)
+        {
+            var folders = _database.ReadSyncFolders(work.Account.Id, request.Folder);
+            var plan = _database.PlanMetadataSyncWindow(
+                work.DatabaseAccountId,
+                folders,
+                RequestedSinceDays(request, work.Account));
+
+            if (plan.RequestedSinceDays == 0)
+                requestedSinceDays = 0;
+
+            if (plan.EffectiveSinceDays == 0)
+                effectiveSinceDays = 0;
+            else if (effectiveSinceDays != 0)
+                effectiveSinceDays = Math.Max(effectiveSinceDays, plan.EffectiveSinceDays);
+
+            autoExpanded = autoExpanded || plan.AutoExpandedForGap;
+        }
+
+        return new(
+            RequestedSinceDays: requestedSinceDays,
+            EffectiveSinceDays: effectiveSinceDays,
+            AutoExpandedForGap: autoExpanded,
+            EffectiveSinceDaysByFolder: new Dictionary<int, int>());
+    }
+
+    private static int RequestedSinceDays(McpSyncNowRequest request, AccountConfig account) =>
+        request.Full ? 0 : request.SinceDays ?? account.HistoryDays;
 
     private async Task RunBackgroundSyncAsync(
         McpSyncNowRequest request,
@@ -802,6 +1127,7 @@ internal sealed class McpStdioServer
         CancellationToken cancellationToken)
     {
         var foldersByAccount = new Dictionary<string, IReadOnlyList<StoredFolder>>(StringComparer.OrdinalIgnoreCase);
+        var syncWindowsByAccount = new Dictionary<string, SyncWindowPlan>(StringComparer.OrdinalIgnoreCase);
         var failures = new List<string>();
         var totalFolders = 0;
 
@@ -816,6 +1142,10 @@ internal sealed class McpStdioServer
             }
 
             foldersByAccount[work.Account.Id] = folders;
+            syncWindowsByAccount[work.Account.Id] = _database.PlanMetadataSyncWindow(
+                work.DatabaseAccountId,
+                folders,
+                RequestedSinceDays(request, work.Account));
             totalFolders += folders.Count;
 
             if (folders.Count == 0)
@@ -831,13 +1161,14 @@ internal sealed class McpStdioServer
             if (folders.Count == 0)
                 continue;
 
-            var sinceDays = request.Full ? 0 : request.SinceDays ?? work.Account.HistoryDays;
+            var syncWindow = syncWindowsByAccount[work.Account.Id];
             var result = await new ImapMetadataSync(_database).SyncAccountAsync(
                 work.Account,
                 work.Password,
                 work.DatabaseAccountId,
                 folders,
-                sinceDays,
+                syncWindow.RequestedSinceDays,
+                syncWindow.EffectiveSinceDaysByFolder,
                 request.MaxPerFolder,
                 batchSize: 50,
                 cancellationToken,
@@ -989,6 +1320,99 @@ internal sealed class McpStdioServer
             .ToList();
     }
 
+    private JsonObject BuildSetupStatusJson(AccountConfig account)
+    {
+        var validationErrors = AccountConfigValidator.ValidateForImap(account).ToList();
+        var credentialStatus = CredentialStatus(account.CredentialRef);
+        var folders = _database.ReadFolders(account.Id);
+        var setupStatus = validationErrors.Count > 0
+            ? "config_invalid"
+            : credentialStatus == "present"
+                ? folders.Count == 0 ? "folders_not_discovered" : "setup_complete"
+                : "credential_missing";
+
+        return new()
+        {
+            ["account"] = account.Id,
+            ["setup_status"] = setupStatus,
+            ["config_valid"] = validationErrors.Count == 0,
+            ["config_errors"] = ToJsonArray(validationErrors),
+            ["credential_status"] = credentialStatus,
+            ["folders_cached"] = folders.Count > 0,
+            ["cached_folder_count"] = folders.Count,
+            ["sync_enabled_folder_count"] = folders.Count(folder => folder.Selectable && folder.SyncEnabled),
+            ["default_history_days"] = account.HistoryDays,
+            ["default_history_source"] = "config.toml"
+        };
+    }
+
+    private JsonObject ToDiscoveryFolderJson(StoredFolder folder) =>
+        new()
+        {
+            ["folder_id"] = folder.Id,
+            ["account"] = folder.AccountName,
+            ["path"] = folder.Path,
+            ["name"] = folder.Name,
+            ["role"] = folder.Role,
+            ["selectable"] = folder.Selectable,
+            ["message_count"] = NumberOrNull(folder.MessageCount),
+            ["sync_enabled"] = folder.SyncEnabled,
+            ["default_sync_enabled"] = folder.Selectable && ImapFolderRoles.SyncEnabledByDefault(folder.Role)
+        };
+
+    private static IReadOnlyList<StoredFolder> SelectEstimateFolders(
+        IReadOnlyList<StoredFolder> folders,
+        IReadOnlyList<string> folderFilters)
+    {
+        var selectable = folders.Where(folder => folder.Selectable);
+
+        if (!HasValues(folderFilters))
+            return selectable
+                .Where(folder => folder.SyncEnabled)
+                .OrderBy(folder => folder.Path, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+        var normalized = folderFilters
+            .Where(filter => !string.IsNullOrWhiteSpace(filter))
+            .Select(filter => filter.Trim())
+            .ToList();
+
+        return selectable
+            .Where(folder => normalized.Any(filter =>
+                folder.Path.Equals(filter, StringComparison.OrdinalIgnoreCase)
+                || folder.Name.Equals(filter, StringComparison.OrdinalIgnoreCase)
+                || folder.Id.ToString().Equals(filter, StringComparison.OrdinalIgnoreCase)))
+            .OrderBy(folder => folder.Path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private ToolExecution EstimateRejected(string status, string message)
+    {
+        var payload = new JsonObject
+        {
+            ["status"] = status,
+            ["message"] = message,
+            ["folders"] = new JsonArray()
+        };
+
+        return new(payload, "read", "estimate", $"status={status}", IsError: true);
+    }
+
+    private string CredentialStatus(string target)
+    {
+        if (string.IsNullOrWhiteSpace(target))
+            return "missing";
+
+        try
+        {
+            return _credentialStore.Exists(target) ? "present" : "missing";
+        }
+        catch (PlatformNotSupportedException)
+        {
+            return "unsupported_platform";
+        }
+    }
+
     private static bool IsConfiguredAccount(AppConfig config, string accountName, string accountEmailAddress) =>
         config.Accounts.Any(account =>
             account.Enabled
@@ -1039,6 +1463,7 @@ internal sealed class McpStdioServer
             ["message_search_docs"] = readiness.MessageSearchDocs,
             ["fts_rows"] = readiness.FtsRows,
             ["pending_message_bodies"] = readiness.PendingMessageBodies,
+            ["coverage_note"] = StringOrNull(readiness.CoverageNote),
             ["active_sync_run"] = readiness.ActiveSyncRun is null ? null : ToSyncProgressJson(readiness.ActiveSyncRun)
         };
 
@@ -1066,6 +1491,9 @@ internal sealed class McpStdioServer
             ["phase"] = run.Phase,
             ["account"] = run.AccountName,
             ["folder_filter"] = StringOrNull(run.FolderFilter),
+            ["requested_since_days"] = NumberOrNull(run.RequestedSinceDays),
+            ["effective_since_days"] = NumberOrNull(run.EffectiveSinceDays),
+            ["auto_expanded_for_gap"] = run.AutoExpandedForGap,
             ["done"] = run.Done,
             ["total"] = run.Total,
             ["percent"] = run.Percent,
@@ -1463,6 +1891,9 @@ internal sealed class McpStdioServer
 
     private static string FormatAccountFilters(IReadOnlyList<string> accounts) =>
         accounts.Count == 0 ? "all" : string.Join(",", accounts);
+
+    private static bool HasValues(IReadOnlyList<string> values) =>
+        values is not null && values.Any(value => !string.IsNullOrWhiteSpace(value));
 
     private static string FormatOptional(string value) =>
         string.IsNullOrWhiteSpace(value) ? "all" : value;

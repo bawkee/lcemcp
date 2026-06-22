@@ -14,8 +14,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Created, status.InitializationKind);
-        Assert.Equal(4, status.SchemaVersion);
-        Assert.Equal(4, status.TargetSchemaVersion);
+        Assert.Equal(5, status.SchemaVersion);
+        Assert.Equal(5, status.TargetSchemaVersion);
         Assert.Equal(0, status.AccountCount);
         Assert.Equal(0, status.FolderCount);
         Assert.Equal(0, status.MessageCount);
@@ -60,8 +60,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Opened, status.InitializationKind);
-        Assert.Equal(4, status.SchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases"], ReadNames(
+        Assert.Equal(5, status.SchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
     }
@@ -90,9 +90,9 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Migrated, status.InitializationKind);
-        Assert.Equal(4, status.SchemaVersion);
-        Assert.Equal(4, status.TargetSchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases"], ReadNames(
+        Assert.Equal(5, status.SchemaVersion);
+        Assert.Equal(5, status.TargetSchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
         Assert.Contains("message_search_docs", ReadNames(
@@ -128,6 +128,7 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
         var folders = database.ReadFolders("YAHOO");
         var inbox = Assert.Single(folders, folder => folder.Path == "Inbox");
+        var archive = Assert.Single(folders, folder => folder.Path == "Archive");
 
         Assert.Equal(firstAccountId, secondAccountId);
         Assert.Equal(2, persisted);
@@ -135,6 +136,39 @@ public sealed class EmailDatabaseTests
         Assert.Equal(2, status.FolderCount);
         Assert.Equal(@"\Inbox \HasNoChildren", inbox.Attributes);
         Assert.Equal(11, inbox.MessageCount);
+        Assert.True(inbox.SyncEnabled);
+        Assert.True(archive.SyncEnabled);
+    }
+
+    [Fact]
+    public void FolderDiscoveryUsesRoleDefaultsAndPreservesExistingSyncChoices()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox"),
+            TestData.Folder("Trash", role: "trash"),
+            TestData.Folder("Custom", role: "custom")
+        ]);
+
+        Assert.Equal(1, database.SetFolderSyncEnabled("yahoo", "Trash", enabled: true));
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox", attributes: @"\Inbox \HasNoChildren"),
+            TestData.Folder("Trash", role: "trash", attributes: @"\Trash \HasNoChildren"),
+            TestData.Folder("Custom", role: "custom", attributes: @"\HasNoChildren")
+        ]);
+
+        var folders = database.ReadFolders("yahoo");
+        var inbox = Assert.Single(folders, folder => folder.Path == "Inbox");
+        var trash = Assert.Single(folders, folder => folder.Path == "Trash");
+        var custom = Assert.Single(folders, folder => folder.Path == "Custom");
+
+        Assert.True(inbox.SyncEnabled);
+        Assert.True(trash.SyncEnabled);
+        Assert.False(custom.SyncEnabled);
+        Assert.Equal(@"\Trash \HasNoChildren", trash.Attributes);
     }
 
     [Fact]
@@ -304,6 +338,102 @@ public sealed class EmailDatabaseTests
     }
 
     [Fact]
+    public void SearchMessagesSupportsRecipientDateFiltersAndCursorPaging()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:invoice-new",
+                messageIdHeader: "invoice-new@example.com",
+                subject: "Invoice newest",
+                dateSent: "2026-06-21T10:00:00.0000000+00:00"),
+            TestData.Message(
+                providerUid: "101",
+                providerMessageKey: "emailid:invoice-old",
+                messageIdHeader: "invoice-old@example.com",
+                subject: "Invoice older",
+                dateSent: "2026-06-20T10:00:00.0000000+00:00"),
+            TestData.Message(
+                providerUid: "102",
+                providerMessageKey: "emailid:invoice-other-recipient",
+                messageIdHeader: "invoice-other-recipient@example.com",
+                subject: "Invoice other recipient",
+                dateSent: "2026-06-21T09:00:00.0000000+00:00")
+        ], SyncStateJson(sinceDays: 30, matchedCount: 3, selectedCount: 3, fetchedCount: 3), 102);
+
+        var messageIds = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages ORDER BY id;");
+        database.UpsertMessageBody(new(
+            MessageId: messageIds[0],
+            PlainText: "invoice body",
+            HtmlText: null,
+            NormalizedText: "invoice body",
+            Recipients: [new("to", "Billing", "billing@example.com")]));
+        database.UpsertMessageBody(new(
+            MessageId: messageIds[1],
+            PlainText: "invoice body",
+            HtmlText: null,
+            NormalizedText: "invoice body",
+            Recipients: [new("to", "Billing", "billing@example.com")]));
+        database.UpsertMessageBody(new(
+            MessageId: messageIds[2],
+            PlainText: "invoice body",
+            HtmlText: null,
+            NormalizedText: "invoice body",
+            Recipients: [new("to", "Other", "other@example.com")]));
+
+        var dateFrom = EmailSearchDateParser.NormalizeLowerBound("2026-06-20");
+        var dateTo = EmailSearchDateParser.NormalizeUpperBound("2026-06-21");
+        var firstPage = database.SearchMessages(new(
+            Query: "invoice",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 1,
+            SnippetChars: 1024,
+            ToEmail: "billing@example.com",
+            DateFrom: dateFrom,
+            DateTo: dateTo));
+        var secondPage = database.SearchMessages(new(
+            Query: "invoice",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 5,
+            SnippetChars: 1024,
+            ToEmail: "billing@example.com",
+            DateFrom: dateFrom,
+            DateTo: dateTo,
+            Cursor: firstPage.Single().Cursor));
+        var outsideDate = database.SearchMessages(new(
+            Query: "invoice",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 5,
+            SnippetChars: 1024,
+            ToEmail: "billing@example.com",
+            DateFrom: EmailSearchDateParser.NormalizeLowerBound("2026-06-22"),
+            DateTo: null));
+
+        Assert.Single(firstPage);
+        Assert.Single(secondPage);
+        Assert.NotEqual(firstPage[0].MessageId, secondPage[0].MessageId);
+        Assert.All(firstPage.Concat(secondPage), result => Assert.Contains("Invoice", result.Subject));
+        Assert.Empty(outsideDate);
+    }
+
+    [Fact]
     public void MessageSearchReadinessRequiresCompleteMetadataBodiesAndSearchDocs()
     {
         using var temp = TempWorkspace.Create();
@@ -430,6 +560,82 @@ public sealed class EmailDatabaseTests
         Assert.Equal(expectedReady, readiness.MetadataComplete);
         Assert.True(readiness.BodiesComplete);
         Assert.True(readiness.MessageSearchIndexComplete);
+    }
+
+    [Fact]
+    public void MessageSearchReadinessReportsDateCoverageGaps()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(providerUid: "100", providerMessageKey: "emailid:date-gap", messageIdHeader: "date-gap@example.com")
+        ], SyncStateJson(sinceDays: 30), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Indexed body",
+            HtmlText: null,
+            NormalizedText: "Indexed body",
+            Recipients: []));
+
+        var readiness = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            DateFrom: EmailSearchDateParser.NormalizeLowerBound(DateTimeOffset.UtcNow.AddDays(-60).ToString("yyyy-MM-dd"))));
+
+        Assert.False(readiness.SearchReady);
+        Assert.False(readiness.MetadataComplete);
+        Assert.NotNull(readiness.CoverageNote);
+        Assert.Contains("beyond", readiness.CoverageNote, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void MetadataSyncWindowAutoExpandsFromLastUncappedSuccess()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.MarkFolderSyncSucceeded(accountId, inbox.Id, SyncStateJson(sinceDays: 90), highestUid: 100);
+        var oldSuccess = DateTimeOffset.UtcNow.AddDays(-150).ToString("O");
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE sync_state
+            SET last_success_at = '{oldSuccess}'
+            WHERE account_id = {accountId} AND folder_id = {inbox.Id};
+            """);
+
+        var expanded = database.PlanMetadataSyncWindow(accountId, [inbox], requestedSinceDays: 90);
+
+        database.MarkFolderSyncSucceeded(accountId, inbox.Id, SyncStateJson(sinceDays: 90, maxPerFolder: 1, matchedCount: 2, selectedCount: 1, fetchedCount: 1), highestUid: 101);
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE sync_state
+            SET last_success_at = '{oldSuccess}'
+            WHERE account_id = {accountId} AND folder_id = {inbox.Id};
+            """);
+
+        var capped = database.PlanMetadataSyncWindow(accountId, [inbox], requestedSinceDays: 90);
+
+        Assert.True(expanded.AutoExpandedForGap);
+        Assert.True(expanded.EffectiveSinceDays >= 151);
+        Assert.Equal(expanded.EffectiveSinceDays, expanded.EffectiveSinceDaysByFolder[inbox.Id]);
+        Assert.False(capped.AutoExpandedForGap);
+        Assert.Equal(90, capped.EffectiveSinceDays);
     }
 
     [Fact]

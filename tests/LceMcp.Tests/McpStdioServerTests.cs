@@ -33,6 +33,9 @@ public sealed class McpStdioServerTests
         Assert.Equal(2, lines.Length);
         Assert.Equal("2025-11-25", initialize["result"]["protocolVersion"].GetValue<string>());
         Assert.Contains("email_list_accounts", toolNames);
+        Assert.Contains("email_get_setup_status", toolNames);
+        Assert.Contains("email_discover_folders", toolNames);
+        Assert.Contains("email_estimate_sync", toolNames);
         Assert.Contains("email_list_folders", toolNames);
         Assert.Contains("email_search", toolNames);
         Assert.Contains("email_get_message", toolNames);
@@ -102,6 +105,38 @@ public sealed class McpStdioServerTests
         Assert.Contains("refund processed", message["body_text"].GetValue<string>(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains($"email_search|status=ready results=1 has_more=false|{messageId}", auditRows);
         Assert.Contains($"email_get_message|status=ok message=1|{messageId}", auditRows);
+    }
+
+    [Fact]
+    public async Task EmailGetSetupStatusReportsLocalPrerequisitesOnly()
+    {
+        using var temp = TempWorkspace.Create();
+        var account = TestData.Account(id: "missing-credential", email: "missing-credential@example.com");
+        var configStore = new ConfigStore(temp.Paths);
+        var config = new AppConfig();
+        config.UpsertAccount(account);
+        configStore.Save(config);
+
+        var output = new StringWriter();
+        var error = new StringWriter();
+        var input = new StringReader("""
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_get_setup_status","arguments":{"accounts":["missing-credential"]}}}
+            """);
+        var server = new McpStdioServer(configStore, new EmailDatabase(temp.Paths), input, output, error);
+
+        await server.RunAsync(CancellationToken.None);
+
+        var lines = OutputLines(output);
+        var structured = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
+        var statusAccount = structured["accounts"].AsArray()[0].AsObject();
+
+        Assert.Equal("needs_attention", structured["status"].GetValue<string>());
+        Assert.Equal("credential_missing", statusAccount["setup_status"].GetValue<string>());
+        Assert.Equal("missing", statusAccount["credential_status"].GetValue<string>());
+        Assert.False(statusAccount["folders_cached"].GetValue<bool>());
+        Assert.Equal(30, statusAccount["default_history_days"].GetValue<int>());
     }
 
     [Fact]

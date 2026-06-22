@@ -7,7 +7,8 @@ internal static class DatabaseMigrations
         new(1, "initial_metadata_cache", InitialSchemaSql),
         new(2, "message_bodies_and_search", BodySearchSchemaSql),
         new(3, "sync_runs_and_search_readiness", SyncRunsAndReadinessSql),
-        new(4, "sync_queue_and_leases", SyncQueueAndLeasesSql)
+        new(4, "sync_queue_and_leases", SyncQueueAndLeasesSql),
+        new(5, "sync_window_tracking", SyncWindowTrackingSql)
     ];
 
     public static int TargetVersion => All.Select(migration => migration.Version).DefaultIfEmpty(0).Max();
@@ -43,7 +44,7 @@ internal static class DatabaseMigrations
             attributes TEXT,
             role TEXT NOT NULL DEFAULT 'custom',
             selectable INTEGER NOT NULL DEFAULT 1,
-            sync_enabled INTEGER NOT NULL DEFAULT 1,
+            sync_enabled INTEGER NOT NULL DEFAULT 0,
             uidvalidity TEXT,
             message_count INTEGER,
             recent_count INTEGER,
@@ -197,7 +198,7 @@ internal static class DatabaseMigrations
         """;
 
     public const string SyncRunsAndReadinessSql = """
-        ALTER TABLE accounts ADD COLUMN history_days INTEGER NOT NULL DEFAULT 30;
+        ALTER TABLE accounts ADD COLUMN history_days INTEGER NOT NULL DEFAULT 90;
 
         CREATE TABLE IF NOT EXISTS sync_runs (
             id TEXT PRIMARY KEY,
@@ -239,5 +240,11 @@ internal static class DatabaseMigrations
 
         CREATE INDEX IF NOT EXISTS idx_sync_runs_scope_status ON sync_runs(scope_key, status, requested_at);
         CREATE INDEX IF NOT EXISTS idx_sync_leases_expires ON sync_leases(lease_expires_at);
+        """;
+
+    public const string SyncWindowTrackingSql = """
+        ALTER TABLE sync_runs ADD COLUMN requested_since_days INTEGER;
+        ALTER TABLE sync_runs ADD COLUMN effective_since_days INTEGER;
+        ALTER TABLE sync_runs ADD COLUMN auto_expanded_for_gap INTEGER NOT NULL DEFAULT 0;
         """;
 }

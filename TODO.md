@@ -253,6 +253,28 @@ Design decision on 2026-06-22:
 - `email_get_setup_status` is setup-only, not a sync/readiness state machine. Sync progress/readiness remains under `email_get_sync_status`.
 - `email_estimate_sync` should return facts such as selected folders, requested/effective window, estimated messages, estimate source, and confidence. It should not decide whether the result is "too large"; the LLM/user can make that call.
 
+Completed on 2026-06-22:
+
+- Added `date_from` / `date_to` to CLI and MCP `email_search`, normalized date-only bounds inclusively, and included readiness coverage notes when a requested range needs wider or full-history metadata coverage.
+- Added `to_email` filtering over durable `message_recipients` for search results. Readiness remains conservative because recipient rows are only complete after body sync.
+- Added real opaque cursor pagination for MCP and CLI search. Search now uses a deterministic `(score, date, message_id)` order and returns a usable `next_cursor` when more results are available.
+- Updated first-run defaults to `history_days = 90` in config/account defaults and migration defaults. Existing configured accounts are not silently rewritten.
+- Added role-based folder sync defaults for newly discovered folders: inbox/sent/archive/all_mail default on, trash/spam/drafts/custom/unknown default off. Rediscovery preserves existing `sync_enabled` choices.
+- Added automatic metadata sync gap expansion from the latest successful uncapped folder sync, with a small overlap. Sync state records requested/effective windows, and sync runs/status expose `requested_since_days`, `effective_since_days`, and `auto_expanded_for_gap`.
+- Added MCP setup/onboarding tools: `email_get_setup_status`, `email_discover_folders`, and a cached-count MVP of `email_estimate_sync`. The estimate tool accepts `probe` but currently reports `probe_honored=false` rather than performing a provider probe.
+- Added CLI `set-folder-sync` plus help text for folder sync choices, search date/recipient/cursor filters, and automatic effective-window expansion.
+
+Test result:
+
+- `dotnet build lcemcp.slnx` succeeded on 2026-06-22.
+- `dotnet test lcemcp.slnx` passed with 33 tests on 2026-06-22. New coverage includes schema v5 migration, folder role defaults/preservation, search date/recipient/cursor behavior, date coverage readiness notes, sync-window auto expansion ignoring capped runs, expanded MCP tool listing, and setup-status output.
+
+Next work:
+
+- Run a temp-config CLI smoke after the pt 7 implementation, then a live Yahoo discovery/sync/search smoke when credentials/network are available.
+- Consider adding provider-probe estimates to `email_estimate_sync`; the current implementation is deliberately factual but cached-count only.
+- Consider a CLI or MCP folder-list view that highlights both current `sync_enabled` and role default side by side for setup UX.
+
 Known deferred or acceptable for MVP:
 
 - Attachment metadata, attachment text extraction, `search_in`, attachment search, attachment result hits, and `email_get_attachment_text` are already tracked under later milestones. They remain important, especially for invoice PDFs, but are intentionally after the first read-only message-search MVP.

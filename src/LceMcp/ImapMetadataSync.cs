@@ -21,7 +21,8 @@ internal sealed class ImapMetadataSync
         string password,
         int databaseAccountId,
         IReadOnlyList<StoredFolder> folders,
-        int sinceDays,
+        int requestedSinceDays,
+        IReadOnlyDictionary<int, int> effectiveSinceDaysByFolder,
         int maxPerFolder,
         int batchSize,
         CancellationToken cancellationToken,
@@ -47,12 +48,18 @@ internal sealed class ImapMetadataSync
         var completedFolders = 0;
         foreach (var storedFolder in folders)
         {
+            var effectiveSinceDays = effectiveSinceDaysByFolder is not null
+                && effectiveSinceDaysByFolder.TryGetValue(storedFolder.Id, out var value)
+                    ? value
+                    : requestedSinceDays;
+
             results.Add(await SyncFolderAsync(
                 client,
                 discoveredFolders,
                 databaseAccountId,
                 storedFolder,
-                sinceDays,
+                requestedSinceDays,
+                effectiveSinceDays,
                 maxPerFolder,
                 batchSize,
                 cancellationToken,
@@ -70,7 +77,8 @@ internal sealed class ImapMetadataSync
         IReadOnlyCollection<IMailFolder> discoveredFolders,
         int accountId,
         StoredFolder storedFolder,
-        int sinceDays,
+        int requestedSinceDays,
+        int effectiveSinceDays,
         int maxPerFolder,
         int batchSize,
         CancellationToken cancellationToken,
@@ -93,7 +101,7 @@ internal sealed class ImapMetadataSync
 
             await folder.OpenAsync(FolderAccess.ReadOnly, cancellationToken);
 
-            var searchQuery = BuildSearchQuery(sinceDays);
+            var searchQuery = BuildSearchQuery(effectiveSinceDays);
             var matchedUids = await folder.SearchAsync(searchQuery, cancellationToken);
             matchedCount = matchedUids.Count;
             var selectedUids = matchedUids
@@ -108,10 +116,29 @@ internal sealed class ImapMetadataSync
                 _database.MarkFolderSyncSucceeded(
                     accountId,
                     storedFolder.Id,
-                    BuildStateJson(sinceDays, maxPerFolder, matchedCount, 0, 0, 0, null),
+                    BuildStateJson(
+                        requestedSinceDays,
+                        effectiveSinceDays,
+                        maxPerFolder,
+                        matchedCount,
+                        0,
+                        0,
+                        0,
+                        null),
                     highestUid);
 
-                return new(storedFolder.Path, matchedCount, 0, 0, 0, 0, null, Error: null);
+                return new(
+                    storedFolder.Path,
+                    matchedCount,
+                    0,
+                    0,
+                    0,
+                    0,
+                    null,
+                    Error: null,
+                    RequestedSinceDays: requestedSinceDays,
+                    EffectiveSinceDays: effectiveSinceDays,
+                    AutoExpandedForGap: effectiveSinceDays > requestedSinceDays);
             }
 
             var fetchRequest = BuildFetchRequest(client.Capabilities);
@@ -138,13 +165,14 @@ internal sealed class ImapMetadataSync
                 beforePersist?.Invoke();
                 persistedCount += _database.UpsertMessageMetadataBatch(
                     accountId,
-                    storedFolder.Id,
-                    messages,
-                    BuildStateJson(
-                        sinceDays,
-                        maxPerFolder,
-                        matchedCount,
-                        selectedCount,
+                        storedFolder.Id,
+                        messages,
+                        BuildStateJson(
+                            requestedSinceDays,
+                            effectiveSinceDays,
+                            maxPerFolder,
+                            matchedCount,
+                            selectedCount,
                         fetchedCount,
                         missingCount,
                         highestUid),
@@ -159,7 +187,10 @@ internal sealed class ImapMetadataSync
                 missingCount,
                 persistedCount,
                 highestUid,
-                Error: null);
+                Error: null,
+                RequestedSinceDays: requestedSinceDays,
+                EffectiveSinceDays: effectiveSinceDays,
+                AutoExpandedForGap: effectiveSinceDays > requestedSinceDays);
         }
         catch (OperationCanceledException)
         {
@@ -177,7 +208,10 @@ internal sealed class ImapMetadataSync
                 missingCount,
                 persistedCount,
                 highestUid,
-                ex.Message);
+                ex.Message,
+                RequestedSinceDays: requestedSinceDays,
+                EffectiveSinceDays: effectiveSinceDays,
+                AutoExpandedForGap: effectiveSinceDays > requestedSinceDays);
         }
     }
 
@@ -327,7 +361,8 @@ internal sealed class ImapMetadataSync
     }
 
     private static string BuildStateJson(
-        int sinceDays,
+        int requestedSinceDays,
+        int effectiveSinceDays,
         int maxPerFolder,
         int matchedCount,
         int selectedCount,
@@ -337,7 +372,10 @@ internal sealed class ImapMetadataSync
     {
         return JsonSerializer.Serialize(new
         {
-            since_days = sinceDays,
+            since_days = effectiveSinceDays,
+            requested_since_days = requestedSinceDays,
+            effective_since_days = effectiveSinceDays,
+            auto_expanded_for_gap = effectiveSinceDays > requestedSinceDays,
             max_per_folder = maxPerFolder,
             matched_count = matchedCount,
             selected_count = selectedCount,

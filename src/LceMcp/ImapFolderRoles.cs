@@ -29,4 +29,7 @@ internal static class ImapFolderRoles
 
         return "custom";
     }
+
+    public static bool SyncEnabledByDefault(string role) =>
+        role?.Trim().ToLowerInvariant() is "inbox" or "sent" or "archive" or "all_mail";
 }

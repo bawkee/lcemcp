@@ -42,7 +42,7 @@ internal sealed class ConfigStore
                     ImapHost = GetString(item, "imap_host"),
                     ImapPort = GetInt(item, "imap_port", 993),
                     ImapSecurity = GetString(item, "imap_security", "ssl"),
-                    HistoryDays = GetInt(item, "history_days", 30),
+                    HistoryDays = GetInt(item, "history_days", 90),
                     AttachmentPolicy = GetString(item, "attachment_policy", "metadata_only"),
                     CredentialRef = GetString(item, "credential_ref"),
                     Enabled = GetBool(item, "enabled", true)

@@ -28,7 +28,10 @@ internal sealed record MetadataFolderSyncResult(
     int MissingCount,
     int PersistedCount,
     uint? HighestUid,
-    string Error)
+    string Error,
+    int RequestedSinceDays = 0,
+    int EffectiveSinceDays = 0,
+    bool AutoExpandedForGap = false)
 {
     public bool Succeeded => string.IsNullOrWhiteSpace(Error);
 }

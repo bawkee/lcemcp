@@ -10,7 +10,7 @@ internal sealed class AccountConfig
     public string ImapHost { get; init; } = "";
     public int ImapPort { get; init; }
     public string ImapSecurity { get; init; } = "ssl";
-    public int HistoryDays { get; init; } = 30;
+    public int HistoryDays { get; init; } = 90;
     public string AttachmentPolicy { get; init; } = "metadata_only";
     public string CredentialRef { get; init; } = "";
     public bool Enabled { get; init; } = true;

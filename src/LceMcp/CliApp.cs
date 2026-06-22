@@ -25,6 +25,7 @@ internal static class CliApp
             "accounts" => ListAccounts(configStore, credentialStore),
             "discover-folders" => await DiscoverFoldersAsync(configStore, credentialStore, database, options, cancellationToken),
             "folders" => ListFolders(database, options),
+            "set-folder-sync" => SetFolderSync(database, options),
             "sync" => await SyncAsync(configStore, credentialStore, database, options, cancellationToken),
             "sync-bodies" => await SyncBodiesAsync(configStore, credentialStore, database, options, cancellationToken),
             "search" => Search(database, options),
@@ -47,7 +48,7 @@ internal static class CliApp
         var email = options.GetRequired("--email").Trim();
         var displayName = options.Get("--name") ?? "Yahoo";
         var username = options.Get("--username") ?? email;
-        var historyDays = options.GetInt("--history-days", 30);
+        var historyDays = options.GetInt("--history-days", 90);
 
         if (historyDays < 1)
             throw new CliException("--history-days must be at least 1 for this first probe.", 2);
@@ -215,6 +216,21 @@ internal static class CliApp
         return 0;
     }
 
+    private static int SetFolderSync(EmailDatabase database, CommandOptions options)
+    {
+        var account = options.GetRequired("--account");
+        var folder = options.GetRequired("--folder");
+        var enabled = ParseNullableBool(options.GetRequired("--enabled"), "--enabled")
+            ?? throw new CliException("--enabled must be true or false.", 2);
+        var changed = database.SetFolderSyncEnabled(account, folder, enabled);
+
+        if (changed == 0)
+            throw new CliException($"No folder matched account '{account}' and folder '{folder}'.", 2);
+
+        Console.WriteLine($"Updated folder sync setting: account={account} folder={folder} sync_enabled={enabled.ToString().ToLowerInvariant()}");
+        return 0;
+    }
+
     private static async Task<int> SyncAsync(
         ConfigStore configStore,
         WindowsCredentialStore credentialStore,
@@ -245,8 +261,8 @@ internal static class CliApp
             if (password is null)
                 throw new CliException($"Credential not found: {account.CredentialRef}", 3);
 
-            var sinceDays = options.GetInt("--since-days", account.HistoryDays);
-            if (sinceDays < 0)
+            var requestedSinceDays = options.GetInt("--since-days", account.HistoryDays);
+            if (requestedSinceDays < 0)
                 throw new CliException("--since-days must be 0 or greater.", 2);
 
             var databaseAccountId = database.UpsertConfiguredAccount(account);
@@ -269,9 +285,19 @@ internal static class CliApp
                 throw new CliException($"No syncable folders{suffix} are stored for account '{account.Id}'. Run 'discover-folders --account {account.Id}' first.", 2);
             }
 
-            Console.WriteLine($"Syncing metadata for '{account.Id}' from {folders.Count} folder(s), since_days={sinceDays}, max_per_folder={FormatMaxPerFolder(maxPerFolder)}, batch_size={batchSize}...");
+            var syncWindow = database.PlanMetadataSyncWindow(databaseAccountId, folders, requestedSinceDays);
 
-            var syncRun = database.StartOrQueueSyncRun(databaseAccountId, account.Id, folderFilter, "syncing_metadata", folders.Count);
+            Console.WriteLine($"Syncing metadata for '{account.Id}' from {folders.Count} folder(s), requested_since_days={syncWindow.RequestedSinceDays}, effective_since_days={syncWindow.EffectiveSinceDays}, auto_expanded_for_gap={syncWindow.AutoExpandedForGap.ToString().ToLowerInvariant()}, max_per_folder={FormatMaxPerFolder(maxPerFolder)}, batch_size={batchSize}...");
+
+            var syncRun = database.StartOrQueueSyncRun(
+                databaseAccountId,
+                account.Id,
+                folderFilter,
+                "syncing_metadata",
+                folders.Count,
+                syncWindow.RequestedSinceDays,
+                syncWindow.EffectiveSinceDays,
+                syncWindow.AutoExpandedForGap);
             Console.WriteLine($"Sync run: {syncRun.Id} status={syncRun.Status}");
 
             try
@@ -286,7 +312,8 @@ internal static class CliApp
                         password,
                         databaseAccountId,
                         folders,
-                        sinceDays,
+                        syncWindow.RequestedSinceDays,
+                        syncWindow.EffectiveSinceDaysByFolder,
                         maxPerFolder,
                         batchSize,
                         cancellationToken,
@@ -413,6 +440,10 @@ internal static class CliApp
     private static int Search(EmailDatabase database, CommandOptions options)
     {
         var query = options.GetRequired("--query").Trim();
+        var dateFrom = EmailSearchDateParser.NormalizeLowerBound(options.Get("--date-from"));
+        var dateTo = EmailSearchDateParser.NormalizeUpperBound(options.Get("--date-to"));
+        EmailSearchDateParser.ValidateRange(dateFrom, dateTo);
+
         var request = new EmailSearchRequest(
             Query: query,
             AccountFilters: SplitOption(options.Get("--account")),
@@ -421,7 +452,11 @@ internal static class CliApp
             HasAttachment: ParseNullableBool(options.Get("--has-attachment"), "--has-attachment"),
             Limit: options.GetInt("--limit", 20),
             SnippetChars: options.GetInt("--snippet-chars", 1024),
-            AllowPartial: options.Has("--allow-partial"));
+            AllowPartial: options.Has("--allow-partial"),
+            ToEmail: options.Get("--to"),
+            DateFrom: dateFrom,
+            DateTo: dateTo,
+            Cursor: options.Get("--cursor"));
 
         if (request.Limit < 1 || request.Limit > 100)
             throw new CliException("--limit must be between 1 and 100.", 2);
@@ -432,12 +467,16 @@ internal static class CliApp
         Console.WriteLine($"Database: {database.DatabasePath}");
 
         FtsQueryBuilder.Build(request.Query);
+        EmailSearchCursorCodec.Decode(request.Cursor);
 
         var readiness = database.GetMessageSearchReadiness(new(
             AccountFilters: request.AccountFilters,
             FromEmail: request.FromEmail,
             FolderRoles: request.FolderRoles,
-            HasAttachment: request.HasAttachment));
+            HasAttachment: request.HasAttachment,
+            ToEmail: request.ToEmail,
+            DateFrom: request.DateFrom,
+            DateTo: request.DateTo));
 
         if (!readiness.SearchReady && !request.AllowPartial)
         {
@@ -457,8 +496,15 @@ internal static class CliApp
             Console.WriteLine("Search status: ready");
         }
 
-        var results = database.SearchMessages(request);
+        var rawResults = database.SearchMessages(request with { Limit = Math.Min(request.Limit + 1, 101) });
+        var hasMore = rawResults.Count > request.Limit;
+        var results = rawResults.Take(request.Limit).ToList();
+        var nextCursor = hasMore ? results.LastOrDefault()?.Cursor : null;
+
         Console.WriteLine($"Search results: {results.Count}");
+        Console.WriteLine($"Has more: {hasMore.ToString().ToLowerInvariant()}");
+        if (!string.IsNullOrWhiteSpace(nextCursor))
+            Console.WriteLine($"Next cursor: {nextCursor}");
 
         foreach (var result in results)
             PrintSearchResult(result);
@@ -707,9 +753,9 @@ internal static class CliApp
         foreach (var folder in result.Folders)
         {
             if (folder.Succeeded)
-                Console.WriteLine($"{folder.FolderPath}: matched={folder.MatchedCount} selected={folder.SelectedCount} fetched={folder.FetchedCount} persisted={folder.PersistedCount} missing={folder.MissingCount} highest_uid={FormatOptional(folder.HighestUid)}");
+                Console.WriteLine($"{folder.FolderPath}: requested_since_days={folder.RequestedSinceDays} effective_since_days={folder.EffectiveSinceDays} auto_expanded_for_gap={folder.AutoExpandedForGap.ToString().ToLowerInvariant()} matched={folder.MatchedCount} selected={folder.SelectedCount} fetched={folder.FetchedCount} persisted={folder.PersistedCount} missing={folder.MissingCount} highest_uid={FormatOptional(folder.HighestUid)}");
             else
-                Console.WriteLine($"{folder.FolderPath}: error={folder.Error}");
+                Console.WriteLine($"{folder.FolderPath}: requested_since_days={folder.RequestedSinceDays} effective_since_days={folder.EffectiveSinceDays} auto_expanded_for_gap={folder.AutoExpandedForGap.ToString().ToLowerInvariant()} error={folder.Error}");
         }
 
         var succeeded = result.Folders.Count(folder => folder.Succeeded);
@@ -771,6 +817,9 @@ internal static class CliApp
             + $"metadata_folders={readiness.MetadataCompleteFolderCount}/{readiness.ScopeFolderCount} "
             + $"metadata_messages={readiness.MetadataMessages} indexed_bodies={readiness.IndexedMessageBodies} "
             + $"search_docs={readiness.MessageSearchDocs} fts_rows={readiness.FtsRows} pending_bodies={readiness.PendingMessageBodies}");
+
+        if (!string.IsNullOrWhiteSpace(readiness.CoverageNote))
+            Console.WriteLine($"Message search coverage: {readiness.CoverageNote}");
 
         if (readiness.ActiveSyncRun is not null)
             Console.WriteLine($"Active sync run: {FormatSyncRun(readiness.ActiveSyncRun)}");
@@ -888,7 +937,9 @@ internal static class CliApp
     {
         var eta = run.EstimatedRemainingSeconds is int seconds ? seconds.ToString() : "unknown";
         var folder = string.IsNullOrWhiteSpace(run.FolderFilter) ? "all-folders" : run.FolderFilter;
-        return $"{run.Id} account={run.AccountName} folder={folder} status={run.Status} phase={run.Phase} done={run.Done}/{run.Total} percent={run.Percent} elapsed={run.ElapsedSeconds}s eta={eta}s confidence={run.EstimateConfidence}";
+        var requested = run.RequestedSinceDays?.ToString() ?? "unknown";
+        var effective = run.EffectiveSinceDays?.ToString() ?? "unknown";
+        return $"{run.Id} account={run.AccountName} folder={folder} status={run.Status} phase={run.Phase} requested_since_days={requested} effective_since_days={effective} auto_expanded_for_gap={run.AutoExpandedForGap.ToString().ToLowerInvariant()} done={run.Done}/{run.Total} percent={run.Percent} elapsed={run.ElapsedSeconds}s eta={eta}s confidence={run.EstimateConfidence}";
     }
 
     private static void PrintSyncProgress(SyncRunSnapshot run)
@@ -944,6 +995,7 @@ internal static class CliApp
           accounts          List configured accounts and whether their credential is present.
           discover-folders  Connect to IMAP, discover folders, and persist account/folder metadata locally.
           folders           List persisted folders from local SQLite storage.
+          set-folder-sync   Enable or disable syncing for one persisted folder.
           sync              Sync bounded message envelope metadata into local SQLite storage.
           sync-bodies       Download body text for already-synced message metadata and index it locally.
           search            Search local indexed message metadata and body text.
@@ -958,6 +1010,7 @@ internal static class CliApp
           dotnet run --project src/LceMcp -- accounts
           dotnet run --project src/LceMcp -- discover-folders --account yahoo
           dotnet run --project src/LceMcp -- folders --account yahoo
+          dotnet run --project src/LceMcp -- set-folder-sync --account yahoo --folder Inbox --enabled true
           dotnet run --project src/LceMcp -- sync --account yahoo --folder Inbox --max-per-folder 50
           dotnet run --project src/LceMcp -- sync-bodies --account yahoo --folder Inbox --max-per-folder 10
           dotnet run --project src/LceMcp -- search --query "refund processed" --account yahoo
@@ -971,17 +1024,22 @@ internal static class CliApp
           --name <name>            Display name. Default: Yahoo.
           --id <id>                Stable local account id. Default: yahoo, or a unique email-derived id.
           --username <username>    IMAP username. Default: email.
-          --history-days <days>    Stored sync preference. Default: 30 for development.
+          --history-days <days>    Stored default requested sync window. Default: 90.
           --password-stdin         Read password/app password from stdin instead of prompting.
           --skip-password          Write config without storing a credential.
 
         discover-folders/folders options:
           --account <id-or-email>  Required when more than one account exists; optional for folders listing.
 
+        set-folder-sync options:
+          --account <id-or-email>  Required. Account owning the folder.
+          --folder <path-name-id>  Required. Folder path, display name, or local folder id.
+          --enabled <bool>         Required. true to include in default sync, false to skip.
+
         sync options:
           --account <id-or-email>  Optional. Default: all enabled accounts.
           --folder <path-or-name>  Optional. Default: all cached selectable sync-enabled folders.
-          --since-days <days>      Default: account history_days. Use 0 for no date bound.
+          --since-days <days>      Default: account history_days. Use 0 for no date bound; sync may auto-expand to close uncapped-sync gaps.
           --max-per-folder <n>     Default: 200 newest messages per folder. Use 0 for no cap.
           --batch-size <n>         Default: 50. Commits each fetched batch.
 
@@ -995,9 +1053,13 @@ internal static class CliApp
           --query <text>           Required. Local FTS query text; quoted phrases and OR are supported.
           --account <id-or-email>  Optional. Comma-separated values are accepted.
           --from <email>           Optional sender email filter.
+          --to <email>             Optional exact To recipient email filter.
+          --date-from <date>       Optional inclusive lower date bound, YYYY-MM-DD or ISO timestamp.
+          --date-to <date>         Optional inclusive upper date bound, YYYY-MM-DD or ISO timestamp.
           --folder-role <role>     Optional. Comma-separated roles, e.g. inbox,sent,archive.
           --has-attachment <bool>  Optional true/false metadata filter.
           --limit <n>              Default: 20. Maximum 100.
+          --cursor <cursor>        Opaque cursor printed by a prior search page.
           --snippet-chars <n>      Default: 1024. Range 160 to 4096.
           --allow-partial          Debug opt-in. Search even when the requested corpus is not fully indexed.
 
