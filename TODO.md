@@ -229,7 +229,24 @@ Next work:
 - Add `email_get_audit_events` once there is enough audit history to inspect through MCP.
 - Later MCP tools remain `email_get_thread` and attachment-text search/read once those local features exist.
 
-## 7. Add Focused Tests
+## 7. MCP MVP Gaps From User-Context Review
+
+These came from reviewing what happens when a normal Codex user asks something like "find me OpenAI invoices from the past 2 months" after installing/configuring the MCP. Keep this list focused on MVP read-only search quality and avoid re-listing known attachment work as a surprise bug.
+
+Legit near-term issues:
+
+- Add `date_from` / `date_to` to `email_search` and CLI search. This should bind against the message date (`COALESCE(date_sent, date_received)`) instead of making the LLM filter dates from returned snippets. Search readiness/results should also include an explicit coverage note when the requested date range extends beyond the configured/synced account history, rather than silently implying the whole request was searched.
+- Add recipient filtering, starting with `to_email` and likely broader recipient/participant filters over `message_recipients`. Current MCP only supports `from_email`.
+- Implement real pagination/cursors for `email_search`. Current responses can set `has_more=true`, but `next_cursor` is always `null`, so callers cannot continue without changing the query or limit.
+- Make the sync-history default user-visible and deliberately chosen. Current implementation defaults account `history_days` to 30 development days, while `SPEC.md` recommends 1095 days, which is probably too high for normal first-run use. Decide the product default, then show it clearly in setup/help/status/MCP account status and document exactly where/how users change it (`config.toml`, setup options, later admin UI).
+
+Known deferred or acceptable for MVP:
+
+- Attachment metadata, attachment text extraction, `search_in`, attachment search, attachment result hits, and `email_get_attachment_text` are already tracked under later milestones. They remain important, especially for invoice PDFs, but are intentionally after the first read-only message-search MVP.
+- `email_get_thread` is not Gmail-only in the spec. Gmail provider IDs can improve confidence, but the current metadata model already stores provider thread keys when available and falls back toward header/thread heuristics. `SPEC.md` Milestone 1 includes `email_get_thread`; TODO currently tracks it as a later MCP tool after the local message read/search surface is stable.
+- Periodic/background sync is still future service/webserver/admin work. For now, MCP-triggered `email_sync_now` plus pollable `email_get_sync_status` is acceptable.
+
+## 8. Add Focused Tests
 
 The project is still young, so test only the parts where regressions would be annoying or dangerous.
 
@@ -246,7 +263,7 @@ Next work:
 - Completed on 2026-06-20: Expanded MCP tests to cover the full exposed tool catalog plus ready-index `email_search` and `email_get_message`, including affected-message audit ids. `dotnet test lcemcp.slnx` passed with 26 tests.
 - Add an optional manual IMAP smoke test path that requires a configured real account and is not run by default.
 
-## 8. Later Milestones
+## 9. Later Milestones
 
 These are intentionally after read-only local search works.
 
