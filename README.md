@@ -39,6 +39,6 @@ Repo: https://github.com/bawkee/lcemcp
 5. Specifically verify: secrets are stored only in the OS Credential Manager; credentials/PII are not sent to third parties; local email data is stored only in the app's local cache; MCP stdout is reserved for JSON-RPC; diagnostics go to stderr; and the exposed MCP tools in McpStdioServer.cs do not provide raw SQL, raw filesystem access, or destructive email actions by default.
 6. Determine the required .NET SDK/runtime from the source. If it is missing, tell me exactly what must be installed and ask before installing it.
 7. If the audit is acceptable, build from the sanitized review copy with: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1
-8. Run: artifacts\lcemcp\LceMcp.exe mcp-config --client codex
-9. Report your findings, the build result, and the printed Codex MCP config block. Add or update my Codex config only after I approve the exact block.
+8. Run: artifacts\lcemcp\LceMcp.exe mcp-config --client <chosen-client>. Supported clients include codex, claude-code, opencode, github-copilot, and vscode.
+9. Report your findings, the build result, and the printed MCP config block. Add or update my chosen client config only after I approve the exact block.
 ```

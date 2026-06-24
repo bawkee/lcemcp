@@ -1,8 +1,14 @@
+using System.Text.Json;
 using System.Text.RegularExpressions;
 namespace LceMcp;
 
 internal static class CliApp
 {
+    private static readonly JsonSerializerOptions PrettyJson = new()
+    {
+        WriteIndented = true
+    };
+
     public static async Task<int> RunAsync(string[] args, CancellationToken cancellationToken)
     {
         if (args.Length == 0 || IsHelp(args[0]))
@@ -235,9 +241,7 @@ internal static class CliApp
 
     private static int PrintMcpConfig(CommandOptions options)
     {
-        var client = options.Get("--client") ?? "codex";
-        if (!client.Equals("codex", StringComparison.OrdinalIgnoreCase))
-            throw new CliException($"Unsupported MCP client '{client}'. Supported clients: codex.", 2);
+        var client = NormalizeMcpClient(options.Get("--client") ?? "codex");
 
         var serverName = options.Get("--name") ?? "lcemcp";
         if (!Regex.IsMatch(serverName, "^[A-Za-z0-9_-]+$"))
@@ -255,18 +259,161 @@ internal static class CliApp
             command = "dotnet";
         }
 
+        var server = new McpServerCommand(command, args);
+
+        switch (client)
+        {
+            case "codex":
+                PrintCodexMcpConfig(serverName, server);
+                break;
+            case "claude-code":
+                PrintClaudeCodeMcpConfig(serverName, server);
+                break;
+            case "opencode":
+                PrintOpenCodeMcpConfig(serverName, server);
+                break;
+            case "github-copilot":
+                PrintGitHubCopilotMcpConfig(serverName, server);
+                break;
+            case "vscode":
+                PrintVsCodeMcpConfig(serverName, server);
+                break;
+            default:
+                throw new CliException($"Unsupported MCP client '{client}'. Supported clients: {SupportedMcpClients()}.", 2);
+        }
+
+        return 0;
+    }
+
+    private static string NormalizeMcpClient(string client)
+    {
+        var normalized = (client ?? "")
+            .Trim()
+            .ToLowerInvariant()
+            .Replace('_', '-');
+
+        return normalized switch
+        {
+            "codex" => "codex",
+            "claude" or "claude-code" => "claude-code",
+            "opencode" or "open-code" => "opencode",
+            "github-copilot" or "copilot" or "copilot-cli" => "github-copilot",
+            "vscode" or "vs-code" or "visual-studio-code" or "copilot-vscode" or "github-copilot-vscode" => "vscode",
+            _ => throw new CliException($"Unsupported MCP client '{client}'. Supported clients: {SupportedMcpClients()}.", 2)
+        };
+    }
+
+    private static string SupportedMcpClients() =>
+        "codex, claude-code, opencode, github-copilot, vscode";
+
+    private static void PrintCodexMcpConfig(string serverName, McpServerCommand server)
+    {
         Console.WriteLine("Codex MCP configuration");
         Console.WriteLine();
         Console.WriteLine("Add or update this block in %USERPROFILE%\\.codex\\config.toml:");
         Console.WriteLine();
         Console.WriteLine($"[mcp_servers.{serverName}]");
-        Console.WriteLine($"command = {TomlBasicString(command)}");
-        Console.WriteLine($"args = {TomlStringArray(args)}");
+        Console.WriteLine($"command = {TomlBasicString(server.Command)}");
+        Console.WriteLine($"args = {TomlStringArray(server.Args)}");
         Console.WriteLine("startup_timeout_sec = 30");
         Console.WriteLine();
         Console.WriteLine("After changing Codex config, restart Codex or open a new session so the MCP server is loaded.");
         Console.WriteLine("The server command is intentionally stdio-only; run it as an MCP server with the 'serve' argument.");
-        return 0;
+    }
+
+    private static void PrintClaudeCodeMcpConfig(string serverName, McpServerCommand server)
+    {
+        Console.WriteLine("Claude Code MCP configuration");
+        Console.WriteLine();
+        Console.WriteLine("Add or merge this block into .mcp.json in a trusted project, or into your Claude Code user config:");
+        Console.WriteLine();
+        Console.WriteLine(ToJson(new Dictionary<string, object>
+        {
+            ["mcpServers"] = new Dictionary<string, object>
+            {
+                [serverName] = new Dictionary<string, object>
+                {
+                    ["type"] = "stdio",
+                    ["command"] = server.Command,
+                    ["args"] = server.Args
+                }
+            }
+        }));
+        Console.WriteLine();
+        Console.WriteLine("After changing Claude Code config, start a new Claude Code session or run /mcp to check the server.");
+        Console.WriteLine("The server command is intentionally stdio-only; run it as an MCP server with the 'serve' argument.");
+    }
+
+    private static void PrintOpenCodeMcpConfig(string serverName, McpServerCommand server)
+    {
+        Console.WriteLine("OpenCode MCP configuration");
+        Console.WriteLine();
+        Console.WriteLine("Add or merge this block into opencode.json or opencode.jsonc:");
+        Console.WriteLine();
+        Console.WriteLine(ToJson(new Dictionary<string, object>
+        {
+            ["$schema"] = "https://opencode.ai/config.json",
+            ["mcp"] = new Dictionary<string, object>
+            {
+                [serverName] = new Dictionary<string, object>
+                {
+                    ["type"] = "local",
+                    ["command"] = server.CommandLine,
+                    ["enabled"] = true
+                }
+            }
+        }));
+        Console.WriteLine();
+        Console.WriteLine("After changing OpenCode config, restart OpenCode or run 'opencode mcp list' to check the server.");
+        Console.WriteLine("The server command is intentionally stdio-only; run it as an MCP server with the 'serve' argument.");
+    }
+
+    private static void PrintGitHubCopilotMcpConfig(string serverName, McpServerCommand server)
+    {
+        Console.WriteLine("GitHub Copilot CLI MCP configuration");
+        Console.WriteLine();
+        Console.WriteLine("Add or merge this block into %USERPROFILE%\\.copilot\\mcp-config.json:");
+        Console.WriteLine();
+        Console.WriteLine(ToJson(new Dictionary<string, object>
+        {
+            ["mcpServers"] = new Dictionary<string, object>
+            {
+                [serverName] = new Dictionary<string, object>
+                {
+                    ["type"] = "local",
+                    ["command"] = server.Command,
+                    ["args"] = server.Args,
+                    ["env"] = new Dictionary<string, string>(),
+                    ["tools"] = new[] { "*" }
+                }
+            }
+        }));
+        Console.WriteLine();
+        Console.WriteLine("After changing Copilot CLI config, run 'copilot mcp list' or restart Copilot CLI to check the server.");
+        Console.WriteLine("The server command is intentionally stdio-only; run it as an MCP server with the 'serve' argument.");
+    }
+
+    private static void PrintVsCodeMcpConfig(string serverName, McpServerCommand server)
+    {
+        Console.WriteLine("VS Code / GitHub Copilot MCP configuration");
+        Console.WriteLine();
+        Console.WriteLine("Add or merge this block into .vscode\\mcp.json or the VS Code user MCP configuration:");
+        Console.WriteLine();
+        Console.WriteLine(ToJson(new Dictionary<string, object>
+        {
+            ["servers"] = new Dictionary<string, object>
+            {
+                [serverName] = new Dictionary<string, object>
+                {
+                    ["type"] = "stdio",
+                    ["command"] = server.Command,
+                    ["args"] = server.Args
+                }
+            }
+        }));
+        Console.WriteLine();
+        Console.WriteLine("After changing VS Code config, start or restart the MCP server from the MCP Servers view.");
+        Console.WriteLine("The server command is intentionally stdio-only; run it as an MCP server with the 'serve' argument.");
     }
 
     private static async Task<int> SyncAsync(
@@ -778,6 +925,14 @@ internal static class CliApp
     private static string TomlStringArray(IEnumerable<string> values) =>
         "[" + string.Join(", ", values.Select(TomlBasicString)) + "]";
 
+    private static string ToJson(object value) =>
+        JsonSerializer.Serialize(value, PrettyJson);
+
+    private sealed record McpServerCommand(string Command, IReadOnlyList<string> Args)
+    {
+        public IReadOnlyList<string> CommandLine => [Command, .. Args];
+    }
+
     private static bool IsHelp(string arg) =>
         arg.Equals("-h", StringComparison.OrdinalIgnoreCase)
         || arg.Equals("--help", StringComparison.OrdinalIgnoreCase)
@@ -1127,6 +1282,9 @@ internal static class CliApp
           dotnet run --project src/LceMcp -- search --query "refund processed" --account yahoo
           dotnet run --project src/LceMcp -- serve
           dotnet run --project src/LceMcp -- mcp-config --client codex
+          dotnet run --project src/LceMcp -- mcp-config --client claude-code
+          dotnet run --project src/LceMcp -- mcp-config --client opencode
+          dotnet run --project src/LceMcp -- mcp-config --client github-copilot
           dotnet run --project src/LceMcp -- credential-test --account yahoo
           dotnet run --project src/LceMcp -- credential-update --id yahoo
           dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund processed" --limit 5
@@ -1148,13 +1306,18 @@ internal static class CliApp
 
         MCP client install helper:
           lcemcp mcp-config --client codex
+          lcemcp mcp-config --client claude-code
+          lcemcp mcp-config --client opencode
+          lcemcp mcp-config --client github-copilot
+          lcemcp mcp-config --client vscode
 
-          Prints a Codex TOML block for the current executable. Agents can use this
-          to install lcemcp by adding/updating [mcp_servers.lcemcp] in
-          %USERPROFILE%\.codex\config.toml, then restarting Codex or opening a new session.
+          Prints an MCP client config block for the current executable. Agents can
+          use this to install lcemcp after user approval, then restart the chosen
+          client or open a new session so the MCP server is loaded.
 
         mcp-config options:
-          --client <name>          Optional. Currently only codex is supported. Default: codex.
+          --client <name>          Optional. Supported: codex, claude-code, opencode, github-copilot, vscode. Default: codex.
+                                  Aliases include claude, copilot, copilot-cli, and copilot-vscode.
           --name <server-name>     Optional MCP server name. Default: lcemcp.
           --command <path>         Optional executable or DLL path to include in the config.
 

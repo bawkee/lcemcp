@@ -309,6 +309,15 @@ Freshness result on 2026-06-24:
 - `dotnet build lcemcp.slnx /p:UseSharedCompilation=false` succeeded, and a live local CLI/MCP smoke showed ready Yahoo search responses carrying freshness with `requested_range_extends_beyond_cache=true` for an open-ended stale cache.
 - Refreshed the single-file release artifact at `artifacts\lcemcp\LceMcp.exe` after stopping stale `serve` processes that held the old executable open. Release tests passed with 34 tests and the new artifact SHA256 is `FB27613061F4A8751003671ACC308981991495101E7B34040555BDDD9A65DE1C`.
 
+Harness config result on 2026-06-24:
+
+- Extended `mcp-config --client` beyond Codex. Supported targets are now `codex`, `claude-code`, `opencode`, `github-copilot`, and `vscode`, with aliases such as `claude`, `copilot`, `copilot-cli`, and `copilot-vscode`.
+- The helper now emits Codex TOML, Claude Code `.mcp.json`-style JSON, OpenCode `opencode.json` local MCP JSON, GitHub Copilot CLI `~/.copilot/mcp-config.json` JSON, and VS Code/GitHub Copilot `.vscode/mcp.json` JSON. The existing `dotnet <dll> serve` fallback is preserved for framework-dependent builds.
+- Updated the README safe audit/install prompt to use the chosen client rather than assuming Codex.
+- Added focused CLI tests for the new config outputs, aliases, and `.dll` command handling. `dotnet build lcemcp.slnx /p:UseSharedCompilation=false` succeeded, and `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 41 tests.
+- Refreshed the single-file release artifact at `artifacts\lcemcp\LceMcp.exe` after stopping stale artifact processes that held the old executable open. Release tests passed with 41 tests and the new artifact SHA256 is `9BDCAA8D51A3BBA132924885F10C9C585D4A0F4DF52C49C8A40EF2CD33A4DC6B`.
+- Packaged smoke succeeded for `mcp-config --client opencode` and MCP `initialize`/`tools/list` through `artifacts\lcemcp\LceMcp.exe serve`.
+
 Next work:
 
 - Implement filter-only/date-only `email_search` for MCP and CLI, including cursor behavior and readiness handling.
