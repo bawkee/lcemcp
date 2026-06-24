@@ -300,6 +300,15 @@ Packaging result on 2026-06-24:
 - Added `mcp-config --client codex` so the executable can print the exact Codex TOML block for the running package path. `help` now advertises this install helper so an agent can discover it by running the exe. Rebuilt the single-file artifact and verified `mcp-config`, `help`, and MCP `initialize`/`tools-list` against `artifacts\lcemcp\LceMcp.exe`.
 - Added a short README copy/paste prompt for safer agent-mediated audit/install. The prompt tells agents to clone to temp, make a sanitized source/build-only review copy, strip comments, inspect for suspicious behavior and MCP/secret boundaries, build with `scripts/build-release.ps1`, print `mcp-config --client codex`, and only edit Codex config after user approval.
 
+Freshness result on 2026-06-24:
+
+- Added `email_search` freshness output so harnesses can distinguish "local index is ready" from "local cache is current enough for this question." Search responses now include `freshness.source=local_cache`, `response_generated_at`, conservative `search_scope_as_of`, intuitive `last_sync_performed_at`, oldest/newest scoped sync timestamps, `cache_age_seconds`, requested date bounds, requested upper bound, and `requested_range_extends_beyond_cache`.
+- Kept `search_ready` semantics unchanged: it only means the local index is complete for the requested scope. Freshness is a separate axis the LLM can use to decide whether to call `email_sync_now`, especially for "today" or "this week" prompts.
+- CLI `search` now prints a one-line freshness summary after the status line.
+- `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 34 tests, adding coverage for ready local search over two folders where `search_scope_as_of` is the older scoped folder sync and `last_sync_performed_at` is the newer one.
+- `dotnet build lcemcp.slnx /p:UseSharedCompilation=false` succeeded, and a live local CLI/MCP smoke showed ready Yahoo search responses carrying freshness with `requested_range_extends_beyond_cache=true` for an open-ended stale cache.
+- Refreshed the single-file release artifact at `artifacts\lcemcp\LceMcp.exe` after stopping stale `serve` processes that held the old executable open. Release tests passed with 34 tests and the new artifact SHA256 is `FB27613061F4A8751003671ACC308981991495101E7B34040555BDDD9A65DE1C`.
+
 Next work:
 
 - Implement filter-only/date-only `email_search` for MCP and CLI, including cursor behavior and readiness handling.

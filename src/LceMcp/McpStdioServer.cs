@@ -166,7 +166,7 @@ internal sealed class McpStdioServer
                 ["title"] = "Locally Cached Email MCP",
                 ["version"] = typeof(McpStdioServer).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"
             },
-            ["instructions"] = "Use email_get_setup_status when onboarding may be incomplete. Use email_get_sync_status before trusting email_search. If email_search returns not_synced, call email_sync_now and poll email_get_sync_status; not_synced is not evidence that no matching email exists. Use since_days on email_sync_now for one-off wider backfills instead of changing config."
+            ["instructions"] = "Use email_get_setup_status when onboarding may be incomplete. email_search returns local-cache results plus freshness timestamps; compare freshness.search_scope_as_of with the user's requested date range before treating results as current. If email_search returns not_synced, call email_sync_now and poll email_get_sync_status; not_synced is not evidence that no matching email exists. Use since_days on email_sync_now for one-off wider backfills instead of changing config."
         };
     }
 
@@ -233,7 +233,7 @@ internal sealed class McpStdioServer
                 ToolDefinition(
                     "email_search",
                     "Email Search",
-                    "Search the local indexed message corpus. Returns not_synced instead of empty results when the requested corpus is incomplete.",
+                    "Search the local indexed message corpus and report cache freshness. Returns not_synced instead of empty results when the requested corpus is incomplete.",
                     ObjectSchema(new()
                     {
                         ["query"] = StringSchema("Search text. Quoted phrases and OR are supported."),
@@ -710,7 +710,7 @@ internal sealed class McpStdioServer
 
         if (configuredAccounts.Count == 0)
         {
-            var noAccountsReadiness = EmptyReadiness(_database.ReadActiveSyncRun());
+            var noAccountsReadiness = EmptyReadiness(_database.ReadActiveSyncRun(), request);
             var payload = new JsonObject
             {
                 ["status"] = "not_synced",
@@ -719,6 +719,7 @@ internal sealed class McpStdioServer
                 ["sync_run_id"] = StringOrNull(noAccountsReadiness.ActiveSyncRun?.Id),
                 ["readiness"] = ToReadinessJson(noAccountsReadiness),
                 ["coverage_note"] = StringOrNull(noAccountsReadiness.CoverageNote),
+                ["freshness"] = ToFreshnessJson(noAccountsReadiness.Freshness),
                 ["progress"] = noAccountsReadiness.ActiveSyncRun is null ? null : ToSyncProgressJson(noAccountsReadiness.ActiveSyncRun),
                 ["results"] = new JsonArray(),
                 ["has_more"] = false,
@@ -747,6 +748,7 @@ internal sealed class McpStdioServer
                 ["sync_run_id"] = StringOrNull(readiness.ActiveSyncRun?.Id),
                 ["readiness"] = ToReadinessJson(readiness),
                 ["coverage_note"] = StringOrNull(readiness.CoverageNote),
+                ["freshness"] = ToFreshnessJson(readiness.Freshness),
                 ["progress"] = readiness.ActiveSyncRun is null ? null : ToSyncProgressJson(readiness.ActiveSyncRun),
                 ["results"] = new JsonArray(),
                 ["has_more"] = false,
@@ -773,6 +775,7 @@ internal sealed class McpStdioServer
             ["results_may_be_incomplete"] = !readiness.SearchReady,
             ["readiness"] = ToReadinessJson(readiness),
             ["coverage_note"] = StringOrNull(readiness.CoverageNote),
+            ["freshness"] = ToFreshnessJson(readiness.Freshness),
             ["results"] = payloadResults,
             ["has_more"] = hasMore,
             ["next_cursor"] = StringOrNull(nextCursor)
@@ -1468,8 +1471,38 @@ internal sealed class McpStdioServer
             ["active_sync_run"] = readiness.ActiveSyncRun is null ? null : ToSyncProgressJson(readiness.ActiveSyncRun)
         };
 
-    private static MessageSearchReadiness EmptyReadiness(SyncRunSnapshot activeSyncRun) =>
-        new(
+    private static JsonObject ToFreshnessJson(SearchFreshness freshness) =>
+        new()
+        {
+            ["source"] = "local_cache",
+            ["response_generated_at"] = StringOrNull(freshness?.ResponseGeneratedAt),
+            ["search_scope_as_of"] = StringOrNull(freshness?.SearchScopeAsOf),
+            ["last_sync_performed_at"] = StringOrNull(freshness?.LastSyncPerformedAt),
+            ["oldest_scoped_sync_at"] = StringOrNull(freshness?.OldestScopedSyncAt),
+            ["newest_scoped_sync_at"] = StringOrNull(freshness?.NewestScopedSyncAt),
+            ["cache_age_seconds"] = NumberOrNull(freshness?.CacheAgeSeconds),
+            ["requested_date_from"] = StringOrNull(freshness?.RequestedDateFrom),
+            ["requested_date_to"] = StringOrNull(freshness?.RequestedDateTo),
+            ["requested_upper_bound"] = StringOrNull(freshness?.RequestedUpperBound),
+            ["requested_range_extends_beyond_cache"] = freshness is null ? null : freshness.RequestedRangeExtendsBeyondCache
+        };
+
+    private static MessageSearchReadiness EmptyReadiness(SyncRunSnapshot activeSyncRun, EmailSearchRequest request)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var freshness = new SearchFreshness(
+            ResponseGeneratedAt: now.ToString("O"),
+            SearchScopeAsOf: null,
+            LastSyncPerformedAt: null,
+            OldestScopedSyncAt: null,
+            NewestScopedSyncAt: null,
+            CacheAgeSeconds: null,
+            RequestedDateFrom: request.DateFrom,
+            RequestedDateTo: request.DateTo,
+            RequestedUpperBound: request.DateTo ?? now.ToString("O"),
+            RequestedRangeExtendsBeyondCache: true);
+
+        return new(
             SearchReady: false,
             MetadataComplete: false,
             BodiesComplete: false,
@@ -1482,7 +1515,9 @@ internal sealed class McpStdioServer
             MessageSearchDocs: 0,
             FtsRows: 0,
             PendingMessageBodies: 0,
-            ActiveSyncRun: activeSyncRun);
+            ActiveSyncRun: activeSyncRun,
+            Freshness: freshness);
+    }
 
     private static JsonObject ToSyncProgressJson(SyncRunSnapshot run) =>
         new()

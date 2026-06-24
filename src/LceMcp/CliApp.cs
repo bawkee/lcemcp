@@ -519,6 +519,7 @@ internal static class CliApp
         if (!readiness.SearchReady && !request.AllowPartial)
         {
             Console.WriteLine("Search status: not_synced");
+            PrintSearchFreshness(readiness.Freshness);
             PrintMessageSearchReadiness(readiness);
             Console.WriteLine("Search results: not run");
             return 0;
@@ -527,11 +528,13 @@ internal static class CliApp
         if (!readiness.SearchReady)
         {
             Console.WriteLine("Search status: partial");
+            PrintSearchFreshness(readiness.Freshness);
             PrintMessageSearchReadiness(readiness);
         }
         else
         {
             Console.WriteLine("Search status: ready");
+            PrintSearchFreshness(readiness.Freshness);
         }
 
         var rawResults = database.SearchMessages(request with { Limit = Math.Min(request.Limit + 1, 101) });
@@ -918,6 +921,17 @@ internal static class CliApp
 
         if (readiness.ActiveSyncRun is not null)
             Console.WriteLine($"Active sync run: {FormatSyncRun(readiness.ActiveSyncRun)}");
+    }
+
+    private static void PrintSearchFreshness(SearchFreshness freshness)
+    {
+        if (freshness is null)
+            return;
+
+        Console.WriteLine(
+            $"Search freshness: source=local_cache as_of={FormatOptional(freshness.SearchScopeAsOf)} "
+            + $"last_sync={FormatOptional(freshness.LastSyncPerformedAt)} age_seconds={FormatOptional(freshness.CacheAgeSeconds)} "
+            + $"extends_beyond_cache={freshness.RequestedRangeExtendsBeyondCache.ToString().ToLowerInvariant()}");
     }
 
     private static async Task<SyncRunStartResult> WaitForSyncRunLeaseAsync(

@@ -538,7 +538,8 @@ internal sealed class EmailDatabase
 
         using var connection = OpenConnection();
         var accountIds = ResolveAccountIds(connection, request.AccountFilters);
-        ReconcileExpiredSyncWork(connection, DateTimeOffset.UtcNow);
+        var now = DateTimeOffset.UtcNow;
+        ReconcileExpiredSyncWork(connection, now);
         var activeSyncRun = ReadActiveSyncRun(connection);
 
         if (HasValues(request.AccountFilters) && accountIds.Count == 0)
@@ -556,7 +557,8 @@ internal sealed class EmailDatabase
                 MessageSearchDocs: 0,
                 FtsRows: 0,
                 PendingMessageBodies: 0,
-                ActiveSyncRun: activeSyncRun);
+                ActiveSyncRun: activeSyncRun,
+                Freshness: BuildSearchFreshness([], request, now));
         }
 
         var scopedAccountCount = ReadScopedAccountCount(connection, accountIds, request.AccountFilters);
@@ -564,6 +566,7 @@ internal sealed class EmailDatabase
         var counts = ReadMessageSearchCounts(connection, accountIds, request);
         var completeFolderCount = folderStates.Count(folder => IsFolderMetadataComplete(folder, request));
         var coverageNote = BuildCoverageNote(folderStates, request, completeFolderCount);
+        var freshness = BuildSearchFreshness(folderStates, request, now);
 
         var metadataComplete = scopedAccountCount > 0
             && folderStates.Count > 0
@@ -587,7 +590,8 @@ internal sealed class EmailDatabase
             FtsRows: counts.FtsRows,
             PendingMessageBodies: counts.PendingMessageBodies,
             ActiveSyncRun: activeSyncRun,
-            CoverageNote: coverageNote);
+            CoverageNote: coverageNote,
+            Freshness: freshness);
     }
 
     public SyncRunStartResult StartOrQueueSyncRun(
@@ -2017,6 +2021,44 @@ internal sealed class EmailDatabase
             && fetchedSelected
             && state.MissingCount == 0;
     }
+
+    private static SearchFreshness BuildSearchFreshness(
+        IReadOnlyList<MessageSearchFolderState> folders,
+        MessageSearchReadinessRequest request,
+        DateTimeOffset now)
+    {
+        var successfulSyncs = folders
+            .Select(folder => ParseUtc(folder.LastSuccessAt))
+            .Where(value => value.HasValue)
+            .Select(value => value.Value)
+            .ToList();
+        DateTimeOffset? oldest = successfulSyncs.Count == 0 ? null : successfulSyncs.Min();
+        DateTimeOffset? newest = successfulSyncs.Count == 0 ? null : successfulSyncs.Max();
+        var requestedUpperBound = ParseUtc(request.DateTo) ?? now;
+        var cacheAgeSeconds = oldest is null
+            ? (int?)null
+            : Math.Max(0, Convert.ToInt32(Math.Floor((now - oldest.Value).TotalSeconds)));
+
+        return new(
+            ResponseGeneratedAt: now.ToString("O"),
+            SearchScopeAsOf: FormatUtc(oldest),
+            LastSyncPerformedAt: FormatUtc(newest),
+            OldestScopedSyncAt: FormatUtc(oldest),
+            NewestScopedSyncAt: FormatUtc(newest),
+            CacheAgeSeconds: cacheAgeSeconds,
+            RequestedDateFrom: BlankToNull(request.DateFrom),
+            RequestedDateTo: BlankToNull(request.DateTo),
+            RequestedUpperBound: FormatUtc(requestedUpperBound),
+            RequestedRangeExtendsBeyondCache: oldest is null || requestedUpperBound > oldest.Value);
+    }
+
+    private static DateTimeOffset? ParseUtc(string value) =>
+        DateTimeOffset.TryParse(value, out var parsed)
+            ? parsed.ToUniversalTime()
+            : null;
+
+    private static string FormatUtc(DateTimeOffset? value) =>
+        value?.ToUniversalTime().ToString("O");
 
     private static string BuildCoverageNote(
         IReadOnlyList<MessageSearchFolderState> folders,

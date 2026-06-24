@@ -108,6 +108,109 @@ public sealed class McpStdioServerTests
     }
 
     [Fact]
+    public async Task EmailSearchReportsScopedFreshnessForReadyLocalIndex()
+    {
+        using var temp = TempWorkspace.Create();
+        var account = TestData.Account();
+        var configStore = new ConfigStore(temp.Paths);
+        var config = new AppConfig();
+        config.UpsertAccount(account);
+        configStore.Save(config);
+
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(account);
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox"),
+            TestData.Folder("Sent", role: "sent")
+        ]);
+        var folders = database.ReadFolders("yahoo");
+        var inbox = folders.Single(folder => folder.Path == "Inbox");
+        var sent = folders.Single(folder => folder.Path == "Sent");
+        var now = DateTimeOffset.UtcNow;
+        var oldestSync = now.AddHours(-2).ToString("O");
+        var newestSync = now.AddHours(-1).ToString("O");
+        var dateFrom = now.AddDays(-1).ToString("O");
+        var dateTo = now.ToString("O");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:freshness-inbox",
+                messageIdHeader: "freshness-inbox@example.com",
+                subject: "Freshness inbox",
+                dateSent: now.AddMinutes(-30).ToString("O"))
+        ], SyncStateJson(matchedCount: 1, selectedCount: 1, fetchedCount: 1), 100);
+        database.UpsertMessageMetadataBatch(accountId, sent.Id, [
+            TestData.Message(
+                providerUid: "200",
+                providerMessageKey: "emailid:freshness-sent",
+                messageIdHeader: "freshness-sent@example.com",
+                subject: "Freshness sent",
+                dateSent: now.AddMinutes(-20).ToString("O"))
+        ], SyncStateJson(matchedCount: 1, selectedCount: 1, fetchedCount: 1), 200);
+
+        var messageIds = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages ORDER BY id;");
+        foreach (var messageId in messageIds)
+        {
+            database.UpsertMessageBody(new(
+                MessageId: messageId,
+                PlainText: "freshness marker",
+                HtmlText: null,
+                NormalizedText: "freshness marker",
+                Recipients: []));
+        }
+
+        ExecuteNonQuery(
+            temp.Paths.DatabasePath,
+            """
+            UPDATE sync_state
+            SET last_success_at = CASE
+                    WHEN folder_id = $inboxId THEN $oldestSync
+                    WHEN folder_id = $sentId THEN $newestSync
+                    ELSE last_success_at
+                END
+            WHERE folder_id IN ($inboxId, $sentId);
+            """,
+            command =>
+            {
+                command.Parameters.AddWithValue("$inboxId", inbox.Id);
+                command.Parameters.AddWithValue("$sentId", sent.Id);
+                command.Parameters.AddWithValue("$oldestSync", oldestSync);
+                command.Parameters.AddWithValue("$newestSync", newestSync);
+            });
+
+        var output = new StringWriter();
+        var error = new StringWriter();
+        var inputText = """
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_search","arguments":{"query":"freshness","accounts":["yahoo"],"date_from":"__DATE_FROM__","date_to":"__DATE_TO__","limit":5}}}
+            """
+            .Replace("__DATE_FROM__", dateFrom)
+            .Replace("__DATE_TO__", dateTo);
+        var input = new StringReader(inputText);
+        var server = new McpStdioServer(configStore, database, input, output, error);
+
+        await server.RunAsync(CancellationToken.None);
+
+        var lines = OutputLines(output);
+        var search = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
+        var freshness = search["freshness"].AsObject();
+
+        Assert.Equal("ready", search["status"].GetValue<string>());
+        Assert.True(search["search_ready"].GetValue<bool>());
+        Assert.Equal("local_cache", freshness["source"].GetValue<string>());
+        Assert.Equal(oldestSync, freshness["search_scope_as_of"].GetValue<string>());
+        Assert.Equal(newestSync, freshness["last_sync_performed_at"].GetValue<string>());
+        Assert.Equal(oldestSync, freshness["oldest_scoped_sync_at"].GetValue<string>());
+        Assert.Equal(newestSync, freshness["newest_scoped_sync_at"].GetValue<string>());
+        Assert.True(freshness["cache_age_seconds"].GetValue<int>() >= 0);
+        Assert.Equal(dateFrom, freshness["requested_date_from"].GetValue<string>());
+        Assert.Equal(dateTo, freshness["requested_date_to"].GetValue<string>());
+        Assert.True(freshness["requested_range_extends_beyond_cache"].GetValue<bool>());
+    }
+
+    [Fact]
     public async Task EmailGetSetupStatusReportsLocalPrerequisitesOnly()
     {
         using var temp = TempWorkspace.Create();
@@ -216,6 +319,18 @@ public sealed class McpStdioServerTests
             values.Add(reader.GetInt32(0));
 
         return [.. values];
+    }
+
+    private static void ExecuteNonQuery(
+        string databasePath,
+        string sql,
+        Action<SqliteCommand> bind)
+    {
+        using var connection = OpenConnection(databasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        bind(command);
+        command.ExecuteNonQuery();
     }
 
     private static string SyncStateJson(

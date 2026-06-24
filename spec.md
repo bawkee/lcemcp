@@ -1797,12 +1797,27 @@ Output:
       "score": 12.31
     }
   ],
+  "freshness": {
+    "source": "local_cache",
+    "response_generated_at": "2026-06-24T20:05:30Z",
+    "search_scope_as_of": "2026-06-24T18:50:54Z",
+    "last_sync_performed_at": "2026-06-24T18:51:21Z",
+    "oldest_scoped_sync_at": "2026-06-24T18:50:54Z",
+    "newest_scoped_sync_at": "2026-06-24T18:51:21Z",
+    "cache_age_seconds": 4476,
+    "requested_date_from": "2026-06-22T00:00:00Z",
+    "requested_date_to": "2026-06-24T23:59:59Z",
+    "requested_upper_bound": "2026-06-24T23:59:59Z",
+    "requested_range_extends_beyond_cache": true
+  },
   "has_more": false,
   "next_cursor": null
 }
 ```
 
 The result shape should stay message-centric even when searching attachments only. Attachment-only searches should return the parent message with matching attachment hits populated.
+
+`email_search` readiness and freshness are separate. `search_ready = true` means the local index is complete for the requested searchable scope. It does not mean the local cache reflects the provider at response time. Every search response should include `freshness` so LLM clients can decide whether the cached view is current enough for the user's question. For multi-folder or multi-account scopes, `search_scope_as_of` is the oldest successful sync timestamp among the scoped folders; `last_sync_performed_at` is the newest. A query about a fully historical range may tolerate an older `search_scope_as_of`, while a query about "today", "this week", or other current mail usually should sync when `requested_range_extends_beyond_cache` is true.
 
 Default readiness rule:
 

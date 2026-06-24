@@ -23,7 +23,20 @@ internal sealed record MessageSearchReadiness(
     int FtsRows,
     int PendingMessageBodies,
     SyncRunSnapshot ActiveSyncRun,
-    string CoverageNote = null);
+    string CoverageNote = null,
+    SearchFreshness Freshness = null);
+
+internal sealed record SearchFreshness(
+    string ResponseGeneratedAt,
+    string SearchScopeAsOf,
+    string LastSyncPerformedAt,
+    string OldestScopedSyncAt,
+    string NewestScopedSyncAt,
+    int? CacheAgeSeconds,
+    string RequestedDateFrom,
+    string RequestedDateTo,
+    string RequestedUpperBound,
+    bool RequestedRangeExtendsBeyondCache);
 
 internal sealed record SyncRunSnapshot(
     string Id,
