@@ -30,6 +30,7 @@ internal static class CliApp
             "sync-bodies" => await SyncBodiesAsync(configStore, credentialStore, database, options, cancellationToken),
             "search" => Search(database, options),
             "serve" => await McpStdioServer.RunAsync(configStore, database, cancellationToken),
+            "mcp-config" => PrintMcpConfig(options),
             "credential-test" => CredentialTest(configStore, credentialStore, options),
             "credential-update" => CredentialUpdate(configStore, credentialStore, options),
             "credential-delete" => CredentialDelete(configStore, credentialStore, options),
@@ -229,6 +230,42 @@ internal static class CliApp
             throw new CliException($"No folder matched account '{account}' and folder '{folder}'.", 2);
 
         Console.WriteLine($"Updated folder sync setting: account={account} folder={folder} sync_enabled={enabled.ToString().ToLowerInvariant()}");
+        return 0;
+    }
+
+    private static int PrintMcpConfig(CommandOptions options)
+    {
+        var client = options.Get("--client") ?? "codex";
+        if (!client.Equals("codex", StringComparison.OrdinalIgnoreCase))
+            throw new CliException($"Unsupported MCP client '{client}'. Supported clients: codex.", 2);
+
+        var serverName = options.Get("--name") ?? "lcemcp";
+        if (!Regex.IsMatch(serverName, "^[A-Za-z0-9_-]+$"))
+            throw new CliException("--name may contain only letters, numbers, underscores, and hyphens.", 2);
+
+        var commandOverride = options.Get("--command");
+        var command = string.IsNullOrWhiteSpace(commandOverride)
+            ? ResolveCurrentExecutablePath()
+            : Path.GetFullPath(commandOverride);
+        var args = new[] { "serve" };
+
+        if (RequiresDotnetHost(command))
+        {
+            args = [command, "serve"];
+            command = "dotnet";
+        }
+
+        Console.WriteLine("Codex MCP configuration");
+        Console.WriteLine();
+        Console.WriteLine("Add or update this block in %USERPROFILE%\\.codex\\config.toml:");
+        Console.WriteLine();
+        Console.WriteLine($"[mcp_servers.{serverName}]");
+        Console.WriteLine($"command = {TomlBasicString(command)}");
+        Console.WriteLine($"args = {TomlStringArray(args)}");
+        Console.WriteLine("startup_timeout_sec = 30");
+        Console.WriteLine();
+        Console.WriteLine("After changing Codex config, restart Codex or open a new session so the MCP server is loaded.");
+        Console.WriteLine("The server command is intentionally stdio-only; run it as an MCP server with the 'serve' argument.");
         return 0;
     }
 
@@ -707,6 +744,37 @@ internal static class CliApp
         return value.TrimEnd('\r', '\n');
     }
 
+    private static string ResolveCurrentExecutablePath()
+    {
+        var processPath = Environment.ProcessPath;
+        if (!string.IsNullOrWhiteSpace(processPath) && !IsDotnetHostPath(processPath))
+            return Path.GetFullPath(processPath);
+
+        var commandLinePath = Environment.GetCommandLineArgs().FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(commandLinePath)
+            && (RequiresDotnetHost(commandLinePath) || Path.GetExtension(commandLinePath).Equals(".exe", StringComparison.OrdinalIgnoreCase))
+            && File.Exists(commandLinePath))
+            return Path.GetFullPath(commandLinePath);
+
+        var frameworkDependentDll = Path.Combine(AppContext.BaseDirectory, "LceMcp.dll");
+        if (File.Exists(frameworkDependentDll))
+            return Path.GetFullPath(frameworkDependentDll);
+
+        throw new CliException("Could not determine the current executable path. Pass --command <path-to-LceMcp.exe>.", 2);
+    }
+
+    private static bool IsDotnetHostPath(string path) =>
+        Path.GetFileNameWithoutExtension(path).Equals("dotnet", StringComparison.OrdinalIgnoreCase);
+
+    private static bool RequiresDotnetHost(string path) =>
+        Path.GetExtension(path).Equals(".dll", StringComparison.OrdinalIgnoreCase);
+
+    private static string TomlBasicString(string value) =>
+        "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+
+    private static string TomlStringArray(IEnumerable<string> values) =>
+        "[" + string.Join(", ", values.Select(TomlBasicString)) + "]";
+
     private static bool IsHelp(string arg) =>
         arg.Equals("-h", StringComparison.OrdinalIgnoreCase)
         || arg.Equals("--help", StringComparison.OrdinalIgnoreCase)
@@ -1027,6 +1095,7 @@ internal static class CliApp
           sync-bodies       Download body text for already-synced message metadata and index it locally.
           search            Search local indexed message metadata and body text.
           serve             Run the MCP stdio server. Writes protocol messages only to stdout.
+          mcp-config        Print MCP client configuration for this executable.
           credential-test   Check whether an account credential can be found.
           credential-update Update an existing account credential in Windows Credential Manager.
           credential-delete Delete an account credential from Windows Credential Manager.
@@ -1043,6 +1112,7 @@ internal static class CliApp
           dotnet run --project src/LceMcp -- sync-bodies --account yahoo --folder Inbox --max-per-folder 10
           dotnet run --project src/LceMcp -- search --query "refund processed" --account yahoo
           dotnet run --project src/LceMcp -- serve
+          dotnet run --project src/LceMcp -- mcp-config --client codex
           dotnet run --project src/LceMcp -- credential-test --account yahoo
           dotnet run --project src/LceMcp -- credential-update --id yahoo
           dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund processed" --limit 5
@@ -1061,6 +1131,18 @@ internal static class CliApp
           --account <id-or-email>  Optional when only one account exists.
           --id <id-or-email>       Alias for --account.
           --password-stdin         For credential-update, read the new password/app password from stdin.
+
+        MCP client install helper:
+          lcemcp mcp-config --client codex
+
+          Prints a Codex TOML block for the current executable. Agents can use this
+          to install lcemcp by adding/updating [mcp_servers.lcemcp] in
+          %USERPROFILE%\.codex\config.toml, then restarting Codex or opening a new session.
+
+        mcp-config options:
+          --client <name>          Optional. Currently only codex is supported. Default: codex.
+          --name <server-name>     Optional MCP server name. Default: lcemcp.
+          --command <path>         Optional executable or DLL path to include in the config.
 
         discover-folders/folders options:
           --account <id-or-email>  Required when more than one account exists; optional for folders listing.

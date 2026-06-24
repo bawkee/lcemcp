@@ -291,6 +291,15 @@ User-context MCP test result on 2026-06-22:
 - The `Important` folder oddity was not a Yahoo provider issue. Local folder metadata shows `Important` is selectable but `sync_enabled=false` and `last_sync=-`. The implementation path uses `ReadSyncFolders`, which excludes disabled folders before applying the explicit folder filter. Result: a targeted `email_sync_now` for `Important` can be accepted as a run but select no folders, while `email_get_sync_status` continues to report readiness for the default three sync-enabled folders.
 - The likely third issue from the transcript is estimate-scope discoverability: `email_estimate_sync` without explicit `folders` reports only selected sync-enabled folders by design. The agent noticed and explicitly estimated non-selected folders afterward, but the default response should make that scope more obvious.
 
+Packaging result on 2026-06-24:
+
+- Added `scripts/build-release.ps1` to produce a self-contained single-file Windows release artifact. Default output is the ignored folder `artifacts\lcemcp`, not the older redundant `artifacts\lcemcp-mcp`.
+- Ran the build script successfully. It ran `dotnet test lcemcp.slnx -c Release /p:UseSharedCompilation=false` with 33 passing tests, then published `artifacts\lcemcp\LceMcp.exe` for `win-x64`.
+- Verified the published artifact is a single file and smoke-tested `LceMcp.exe serve` with MCP `initialize` and `tools/list`.
+- Removed the stale generated `artifacts\lcemcp-mcp` folder after stopping a leftover old `LceMcp.exe` process that still held files open.
+- Added `mcp-config --client codex` so the executable can print the exact Codex TOML block for the running package path. `help` now advertises this install helper so an agent can discover it by running the exe. Rebuilt the single-file artifact and verified `mcp-config`, `help`, and MCP `initialize`/`tools-list` against `artifacts\lcemcp\LceMcp.exe`.
+- Added a short README copy/paste prompt for safer agent-mediated audit/install. The prompt tells agents to clone to temp, make a sanitized source/build-only review copy, strip comments, inspect for suspicious behavior and MCP/secret boundaries, build with `scripts/build-release.ps1`, print `mcp-config --client codex`, and only edit Codex config after user approval.
+
 Next work:
 
 - Implement filter-only/date-only `email_search` for MCP and CLI, including cursor behavior and readiness handling.

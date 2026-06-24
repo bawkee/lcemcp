@@ -275,6 +275,7 @@ internal sealed class McpStdioServer
                         ["full"] = BoolSchema("Use no date bound when syncing metadata. Defaults to false, which uses account history_days.", defaultValue: false),
                         ["since_days"] = IntSchema("Optional metadata date bound override. Use 0 for no date bound.", 0, 3650, null),
                         ["max_per_folder"] = IntSchema("Optional per-folder cap. Use 0 for no cap; capped runs usually remain not_synced.", 0, 1000000, 0),
+                        // TODO: Codex reported that this is not honored which is true, why do we even have it then? What 'compatibility'? With what?
                         ["wait_for_completion"] = BoolSchema("Accepted for compatibility, but the MCP server still returns immediately; poll email_get_sync_status.", defaultValue: false)
                     }),
                     readOnly: false,
