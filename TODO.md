@@ -337,6 +337,15 @@ Body-sync performance fix on 2026-06-25:
 - Live Yahoo metadata sync with `sync --account yahoo --since-days 60 --max-per-folder 0 --batch-size 50` completed in 47.628 seconds and created 50 fresh pending bodies. The final hybrid body sync completed in 29.969 seconds, about 0.60 seconds/message. Aggregate shape for that batch: 50 messages, about 6.6 MB total, average 132 KB, median 68 KB, p90 233 KB, p95 336 KB, max 1.15 MB, 11 attachment-bearing messages, and 39 messages likely handled by batched full-stream fetch.
 - Final live status after the 60-day run reported 365 messages, 365 bodies, 365 search docs, search readiness `ready`, and 0 pending bodies.
 
+MCP folder-sync configuration result on 2026-06-25:
+
+- Added `email_set_folder_sync` as the MCP equivalent of CLI `set-folder-sync`. It persistently updates one cached folder's `sync_enabled` setting without contacting the mail provider, deleting cached messages, or starting sync work.
+- The tool schema requires `account`, `folder`, and `enabled`, and its description tells LLM clients to inspect folders with `email_list_folders` and call `email_sync_now` afterward only when the changed default scope should be indexed.
+- The handler validates one configured account and one cached folder match, returns structured failed tool results for missing/ambiguous account or folder cases, rejects enabling non-selectable folders, and returns the updated folder object on success.
+- Updated `SPEC.md` with the new MCP tool contract.
+- `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 43 tests. `scripts/build-release.ps1` also passed Release tests with 43 tests and refreshed `artifacts\lcemcp\LceMcp.exe`; new SHA256 is `0A453D56FF6F714DF0893A07402DC3EEB8A57AD028F75C123D495AB4FB83FD0E`.
+- Packaged stdio smoke verified that `tools/list` from `artifacts\lcemcp\LceMcp.exe serve` advertises `email_set_folder_sync`.
+
 Next work:
 
 - Implement filter-only/date-only `email_search` for MCP and CLI, including cursor behavior and readiness handling.

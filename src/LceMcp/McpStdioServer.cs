@@ -232,6 +232,18 @@ internal sealed class McpStdioServer
                     readOnly: true,
                     idempotent: true),
                 ToolDefinition(
+                    "email_set_folder_sync",
+                    "Email Folder Sync Setting",
+                    "Persistently enable or disable one cached mail folder in the default sync scope. This is the MCP equivalent of the CLI set-folder-sync command: it only updates local lcemcp folder configuration, does not contact the mail provider, does not delete cached messages, and does not start a sync. Use email_list_folders to inspect folder names/ids, then call email_sync_now afterward if the changed default scope should be indexed now.",
+                    ObjectSchema(new()
+                    {
+                        ["account"] = StringSchema("Required account id, display name, or email address owning the cached folder."),
+                        ["folder"] = StringSchema("Required folder path, display name, or local folder_id returned by email_list_folders."),
+                        ["enabled"] = BoolSchema("Required. true includes this selectable folder in future default email_sync_now runs; false excludes it from the default sync scope. Existing cached mail is not deleted.")
+                    }, "account", "folder", "enabled"),
+                    readOnly: false,
+                    idempotent: true),
+                ToolDefinition(
                     "email_search",
                     "Email Search",
                     "Search the local indexed message corpus and report cache freshness. Returns not_synced instead of empty results when the requested corpus is incomplete.",
@@ -342,6 +354,7 @@ internal sealed class McpStdioServer
             "email_discover_folders" => ExecuteDiscoverFolders(arguments, cancellationToken),
             "email_estimate_sync" => ExecuteEstimateSync(arguments),
             "email_list_folders" => ExecuteListFolders(arguments),
+            "email_set_folder_sync" => ExecuteSetFolderSync(arguments),
             "email_search" => ExecuteSearch(arguments),
             "email_get_message" => ExecuteGetMessage(arguments),
             "email_sync_now" => ExecuteSyncNow(arguments, cancellationToken),
@@ -644,6 +657,110 @@ internal sealed class McpStdioServer
             "read",
             $"accounts={FormatAccountFilters(accountFilters)}, sync_enabled_only={syncEnabledOnly.ToString().ToLowerInvariant()}",
             $"folders={values.Count}");
+    }
+
+    private ToolExecution ExecuteSetFolderSync(JsonElement arguments)
+    {
+        EnsureArgumentObject(arguments, "email_set_folder_sync");
+        ValidateAllowedArguments(arguments, "account", "folder", "enabled", "_meta");
+
+        var accountFilter = ReadRequiredString(arguments, "account").Trim();
+        var folderFilter = ReadRequiredString(arguments, "folder").Trim();
+        var enabled = ReadRequiredBool(arguments, "enabled");
+        var matchingAccounts = SelectAccounts(_configStore.Load(), [accountFilter], enabledOnly: false);
+        var argumentsSummary = $"account={accountFilter}, folder={folderFilter}, enabled={enabled.ToString().ToLowerInvariant()}";
+
+        if (matchingAccounts.Count == 0)
+            return FolderSyncRejected(
+                accountFilter,
+                folderFilter,
+                "account_not_found",
+                $"No configured account matched '{accountFilter}'.",
+                argumentsSummary);
+
+        if (matchingAccounts.Count > 1)
+            return FolderSyncRejected(
+                accountFilter,
+                folderFilter,
+                "account_ambiguous",
+                $"More than one configured account matched '{accountFilter}'. Use a stable account id or email address.",
+                argumentsSummary);
+
+        var account = matchingAccounts[0];
+        var knownFolders = _database.ReadFolders(account.Id);
+        if (knownFolders.Count == 0)
+            return FolderSyncRejected(
+                account.Id,
+                folderFilter,
+                "folders_not_discovered",
+                $"No cached folders are known for account '{account.Id}'. Run email_discover_folders first.",
+                argumentsSummary);
+
+        var matchedFolders = knownFolders
+            .Where(folder => FolderMatches(folder, folderFilter))
+            .OrderBy(folder => folder.Path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (matchedFolders.Count == 0)
+            return FolderSyncRejected(
+                account.Id,
+                folderFilter,
+                "folder_not_found",
+                $"No cached folder matched '{folderFilter}' for account '{account.Id}'. Use email_list_folders to inspect folder paths, names, and ids.",
+                argumentsSummary);
+
+        if (matchedFolders.Count > 1)
+        {
+            var matches = new JsonArray();
+            foreach (var folder in matchedFolders)
+                matches.Add(ToFolderSyncJson(folder));
+
+            return FolderSyncRejected(
+                account.Id,
+                folderFilter,
+                "folder_ambiguous",
+                $"More than one cached folder matched '{folderFilter}' for account '{account.Id}'. Use a local folder_id from email_list_folders.",
+                argumentsSummary,
+                matches);
+        }
+
+        var matchedFolder = matchedFolders[0];
+        if (enabled && !matchedFolder.Selectable)
+            return FolderSyncRejected(
+                account.Id,
+                folderFilter,
+                "folder_not_selectable",
+                $"Folder '{matchedFolder.Path}' is not selectable and cannot participate in default sync.",
+                argumentsSummary,
+                new JsonArray(ToFolderSyncJson(matchedFolder)));
+
+        var changed = _database.SetFolderSyncEnabled(account.Id, matchedFolder.Id.ToString(), enabled);
+        if (changed == 0)
+            return FolderSyncRejected(
+                account.Id,
+                folderFilter,
+                "folder_not_found",
+                $"No cached folder matched '{folderFilter}' for account '{account.Id}'.",
+                argumentsSummary);
+
+        var updatedFolder = _database.ReadFolders(account.Id).Single(folder => folder.Id == matchedFolder.Id);
+        var payload = new JsonObject
+        {
+            ["status"] = "updated",
+            ["updated"] = true,
+            ["account"] = account.Id,
+            ["folder"] = ToFolderSyncJson(updatedFolder),
+            ["sync_enabled"] = updatedFolder.SyncEnabled,
+            ["message"] = updatedFolder.SyncEnabled
+                ? $"Folder '{updatedFolder.Path}' is now included in future default email_sync_now runs. Existing cached mail was not changed."
+                : $"Folder '{updatedFolder.Path}' is now excluded from future default email_sync_now runs. Existing cached mail was not deleted."
+        };
+
+        return new(
+            payload,
+            "config",
+            argumentsSummary,
+            $"status=updated folder={updatedFolder.Path} sync_enabled={updatedFolder.SyncEnabled.ToString().ToLowerInvariant()}");
     }
 
     private ToolExecution ExecuteSearch(JsonElement arguments)
@@ -1367,6 +1484,50 @@ internal sealed class McpStdioServer
             ["default_sync_enabled"] = folder.Selectable && ImapFolderRoles.SyncEnabledByDefault(folder.Role)
         };
 
+    private ToolExecution FolderSyncRejected(
+        string account,
+        string folder,
+        string reason,
+        string message,
+        string argumentsSummary,
+        JsonArray matches = null)
+    {
+        var payload = new JsonObject
+        {
+            ["status"] = "failed",
+            ["updated"] = false,
+            ["reason"] = reason,
+            ["account"] = account,
+            ["folder"] = folder,
+            ["message"] = message
+        };
+
+        if (matches is not null)
+            payload["matches"] = matches;
+
+        return new(payload, "config", argumentsSummary, $"status=failed reason={reason}", IsError: true);
+    }
+
+    private static bool FolderMatches(StoredFolder folder, string filter) =>
+        folder.Path.Equals(filter, StringComparison.OrdinalIgnoreCase)
+        || folder.Name.Equals(filter, StringComparison.OrdinalIgnoreCase)
+        || folder.Id.ToString().Equals(filter, StringComparison.OrdinalIgnoreCase);
+
+    private static JsonObject ToFolderSyncJson(StoredFolder folder) =>
+        new()
+        {
+            ["folder_id"] = folder.Id,
+            ["account"] = folder.AccountName,
+            ["account_email_address"] = folder.AccountEmailAddress,
+            ["name"] = folder.Name,
+            ["path"] = folder.Path,
+            ["role"] = folder.Role,
+            ["selectable"] = folder.Selectable,
+            ["sync_enabled"] = folder.SyncEnabled,
+            ["last_sync_at"] = StringOrNull(folder.LastSyncAt),
+            ["last_discovered_at"] = StringOrNull(folder.LastDiscoveredAt)
+        };
+
     private static IReadOnlyList<StoredFolder> SelectEstimateFolders(
         IReadOnlyList<StoredFolder> folders,
         IReadOnlyList<string> folderFilters)
@@ -1678,6 +1839,21 @@ internal sealed class McpStdioServer
         throw new JsonRpcError(-32602, $"{name} must be a boolean.");
     }
 
+    private static bool ReadRequiredBool(JsonElement element, string name)
+    {
+        if (element.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
+            || !element.TryGetProperty(name, out var value))
+            throw new JsonRpcError(-32602, $"{name} is required.");
+
+        if (value.ValueKind is JsonValueKind.True)
+            return true;
+
+        if (value.ValueKind is JsonValueKind.False)
+            return false;
+
+        throw new JsonRpcError(-32602, $"{name} must be a boolean.");
+    }
+
     private static bool? ReadOptionalNullableBool(JsonElement element, string name)
     {
         if (element.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
@@ -1887,6 +2063,13 @@ internal sealed class McpStdioServer
             ["type"] = "boolean",
             ["description"] = description,
             ["default"] = defaultValue
+        };
+
+    private static JsonObject BoolSchema(string description) =>
+        new()
+        {
+            ["type"] = "boolean",
+            ["description"] = description
         };
 
     private static JsonObject NullableBoolSchema(string description) =>

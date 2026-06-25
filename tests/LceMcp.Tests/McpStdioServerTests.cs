@@ -28,6 +28,7 @@ public sealed class McpStdioServerTests
         var initialize = JsonNode.Parse(lines[0]).AsObject();
         var tools = JsonNode.Parse(lines[1]).AsObject()["result"]["tools"].AsArray();
         var toolNames = tools.Select(tool => tool["name"].GetValue<string>()).ToArray();
+        var setFolderSyncTool = tools.Single(tool => tool["name"].GetValue<string>() == "email_set_folder_sync").AsObject();
 
         Assert.Equal(0, exitCode);
         Assert.Equal(2, lines.Length);
@@ -37,12 +38,61 @@ public sealed class McpStdioServerTests
         Assert.Contains("email_discover_folders", toolNames);
         Assert.Contains("email_estimate_sync", toolNames);
         Assert.Contains("email_list_folders", toolNames);
+        Assert.Contains("email_set_folder_sync", toolNames);
         Assert.Contains("email_search", toolNames);
         Assert.Contains("email_get_message", toolNames);
         Assert.Contains("email_sync_now", toolNames);
         Assert.Contains("email_get_sync_status", toolNames);
+        Assert.Contains("does not delete cached messages", setFolderSyncTool["description"].GetValue<string>());
         Assert.DoesNotContain("lcemcp MCP stdio server started", output.ToString());
         Assert.Contains("lcemcp MCP stdio server started", error.ToString());
+    }
+
+    [Fact]
+    public async Task EmailSetFolderSyncUpdatesCachedFolderAndWritesAuditLog()
+    {
+        using var temp = TempWorkspace.Create();
+        var account = TestData.Account();
+        var configStore = new ConfigStore(temp.Paths);
+        var config = new AppConfig();
+        config.UpsertAccount(account);
+        configStore.Save(config);
+
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(account);
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Archive", role: "archive"),
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+
+        Assert.True(database.ReadFolders("yahoo").Single(folder => folder.Path == "Archive").SyncEnabled);
+
+        var output = new StringWriter();
+        var error = new StringWriter();
+        var input = new StringReader("""
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_set_folder_sync","arguments":{"account":"yahoo","folder":"Archive","enabled":false}}}
+            """);
+        var server = new McpStdioServer(configStore, database, input, output, error);
+
+        await server.RunAsync(CancellationToken.None);
+
+        var lines = OutputLines(output);
+        var structured = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
+        var updatedFolder = structured["folder"].AsObject();
+        var storedFolder = database.ReadFolders("yahoo").Single(folder => folder.Path == "Archive");
+        var auditRows = ReadStrings(
+            temp.Paths.DatabasePath,
+            "SELECT client_name || '|' || tool_name || '|' || action_type || '|' || result_summary FROM audit_log ORDER BY id;");
+
+        Assert.Equal("updated", structured["status"].GetValue<string>());
+        Assert.True(structured["updated"].GetValue<bool>());
+        Assert.False(structured["sync_enabled"].GetValue<bool>());
+        Assert.False(updatedFolder["sync_enabled"].GetValue<bool>());
+        Assert.False(storedFolder.SyncEnabled);
+        Assert.Contains("Existing cached mail was not deleted", structured["message"].GetValue<string>());
+        Assert.Equal(["test-client|email_set_folder_sync|config|status=updated folder=Archive sync_enabled=false"], auditRows);
     }
 
     [Fact]

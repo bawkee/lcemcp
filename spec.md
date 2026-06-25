@@ -1453,6 +1453,7 @@ email_get_setup_status
 email_discover_folders
 email_estimate_sync
 email_list_folders
+email_set_folder_sync
 email_search
 email_get_message
 email_get_thread
@@ -1705,6 +1706,42 @@ Output:
       "last_sync_at": "2026-06-17T17:18:00Z"
     }
   ]
+}
+```
+
+### 16.6.1 email_set_folder_sync
+
+Persistently enable or disable one cached folder in the default sync scope.
+
+This is the MCP equivalent of `set-folder-sync`. It only updates local folder configuration. It must not contact the provider, delete cached messages, or start sync work. Agents should use `email_list_folders` to inspect folder paths/names/ids before changing a folder, and call `email_sync_now` afterward if the changed default scope should be indexed immediately.
+
+Input:
+
+```json
+{
+  "account": "yahoo",
+  "folder": "Archive",
+  "enabled": false
+}
+```
+
+Output:
+
+```json
+{
+  "status": "updated",
+  "updated": true,
+  "account": "yahoo",
+  "sync_enabled": false,
+  "folder": {
+    "folder_id": 10,
+    "account": "yahoo",
+    "path": "Archive",
+    "role": "archive",
+    "selectable": true,
+    "sync_enabled": false
+  },
+  "message": "Folder 'Archive' is now excluded from future default email_sync_now runs. Existing cached mail was not deleted."
 }
 ```
 
@@ -2497,6 +2534,7 @@ Deliver:
   - email_discover_folders
   - email_estimate_sync
   - email_list_folders
+  - email_set_folder_sync
   - email_search
   - email_get_message
   - email_get_thread
