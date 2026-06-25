@@ -354,27 +354,66 @@ Filter-only search and explicit folder sync fix on 2026-06-25:
 - MCP `email_sync_now` now rejects an explicit cached folder miss before queuing a sync run, instead of accepting a successful-looking zero-folder run.
 - `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 46 tests. New coverage includes filter-only date browsing, MCP search with omitted `query`, and explicit disabled selectable folder selection.
 
-Next work:
+Current priority:
 
-- Improve `email_estimate_sync` scope clarity. Its default estimate intentionally covers selected `sync_enabled` folders only, but the response should make omitted selectable folders obvious enough that an agent does not read it as "all folders."
+- Start the attachment metadata and text extraction milestone below.
+- Keep `email_estimate_sync` scope clarity as a small MCP UX cleanup: its default estimate intentionally covers selected `sync_enabled` folders only, but the response should make omitted selectable folders obvious enough that an agent does not read it as "all folders."
 
 Deferred polish:
 
 - Provider-probe estimates in `email_estimate_sync`; the current implementation is deliberately factual but cached-count only.
 - A CLI or MCP folder-list view that shows both current `sync_enabled` and role default side by side for setup UX.
 - Body-sync fetch-mode counters in sync summaries/status if future tuning needs exact counts rather than manual aggregate measurements.
+- Optional real-account IMAP smoke harness if repeated provider testing becomes painful. Keep it opt-in and never part of default tests.
 
 Known deferred or acceptable for MVP:
 
-- Attachment metadata, attachment text extraction, `search_in`, attachment search, attachment result hits, and `email_get_attachment_text` are already tracked under later milestones. They remain important, especially for invoice PDFs, but are intentionally after the first read-only message-search MVP.
 - `email_get_thread` is not Gmail-only in the spec. Gmail provider IDs can improve confidence, but the current metadata model already stores provider thread keys when available and falls back toward header/thread heuristics. `SPEC.md` Milestone 1 includes `email_get_thread`; TODO currently tracks it as a later MCP tool after the local message read/search surface is stable.
 - Periodic/background sync is still future service/webserver/admin work. For now, MCP-triggered `email_sync_now` plus pollable `email_get_sync_status` is acceptable.
 
-## 8. Add Focused Tests
+## 8. Attachment Metadata And Text Extraction
 
-The project is still young, so test only the parts where regressions would be annoying or dangerous.
+This is the next major milestone. Goal: make invoice and business-document search work across email bodies and document attachments without exposing raw attachment downloads by default.
+
+Spec coverage check on 2026-06-25:
+
+- `SPEC.md` already covers this topic in substantial detail: preferred extractors, attachment and attachment-text storage, attachment search-document and FTS tables, separate attachment readiness, `email_search` attachment filters/result shape, `email_get_attachment_text`, safety boundaries around raw attachment access, and acceptance criteria for attachment search.
+- Preferred extraction path in the spec is PdfPig first for embedded PDF text, optional Poppler/pdftotext fallback, Open XML SDK or `DocumentFormat.OpenXml` for DOCX, and simple built-in parsers for TXT/HTML/CSV.
+- Scope decision on 2026-06-25: pull XLSX into this milestone with PDF, DOCX, TXT, HTML, and CSV because invoices and operational documents often arrive as spreadsheets. `SPEC.md` currently lists XLSX later than PDF/DOCX, so this TODO intentionally promotes XLSX. Scanned-PDF OCR is absolutely in scope for the broader attachment work, but tracked as a separate ticket below because it needs heavier dependency and runtime decisions.
 
 Next work:
+
+- Add schema/migration support for `attachments`, `attachment_text`, `attachment_search_docs`, and `attachments_fts`, preserving the existing safety posture that raw attachment export is not exposed by default.
+- Persist attachment metadata during body sync/MIME processing: parent message, part id, filename, MIME type, size, content hash when available, storage/download status, extraction status, and errors/attempt counts.
+- Add a conservative attachment download/extraction policy for searchable document types and size limits.
+- Implement text extraction for embedded-text PDF, DOCX, XLSX, TXT, HTML, and CSV; mark unsupported, encrypted, too-large, empty, and failed cases explicitly.
+- Index extracted text into attachment FTS and integrate `email_search` with `search_in`, `mime_types`, `filename_contains`, nested matching attachment hits, snippets, and hit counts where practical.
+- Expose bounded reads through `email_get_attachment_text` and include attachment metadata in message reads/search results, while still keeping raw attachment downloads out of the default MCP surface.
+- Add focused tests as part of the feature: migrations, metadata upsert idempotence, extractor fixtures, FTS indexing/stale cleanup, MCP/CLI contract shape, readiness/partial behavior, and safety limits.
+
+## 9. Scanned PDF OCR Extraction
+
+Separate ticket for OCRing PDFs that have no useful embedded text. This is split out because it is a bigger implementation/dependency task, not because OCR should be architecturally separate from embedded text extraction. OCR should feed the same attachment text, readiness, search, snippet, and `email_get_attachment_text` paths as every other extractor.
+
+Next work:
+
+- Decide the OCR execution model: optional external Tesseract worker, bundled dependency, or another local OCR path.
+- Detect OCR candidates during PDF extraction when embedded text is empty, tiny, suspicious, encrypted, or image-only.
+- Render PDF pages safely with bounded page count, resolution, file size, timeout, and temp-file cleanup limits.
+- Feed recognized text into the same attachment extraction result and FTS indexing flow used by embedded PDF/DOCX/XLSX/TXT/HTML/CSV extraction. Store extractor provenance if useful, but avoid a separate MCP-facing OCR model unless the implementation proves it is needed.
+- Represent disabled, skipped, timeout, and failure cases through the same attachment extraction status/error fields used by the rest of the milestone.
+- Add focused fixture tests for image-only PDFs, mixed embedded-text plus scanned PDFs, OCR-disabled behavior, timeouts/failures, and stale index cleanup.
+
+## 10. Testing Posture
+
+Status: the standalone "add focused tests" milestone is complete enough to retire as an active backlog item. The project now has a mature regression suite, so new tests should be attached to each feature or bug fix instead of tracked as a separate phase.
+
+Current posture on 2026-06-25:
+
+- Latest recorded focused run is `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` with 46 passing tests after filter-only search and explicit disabled-folder sync fixes.
+- For the attachment milestone, test coverage should be part of the implementation checkpoint rather than a separate later task.
+
+Historical checkpoints:
 
 - Completed on 2026-06-19: Added `tests/LceMcp.Tests` with unit tests for config load/save round trips, config validation errors, and credential target generation without touching the OS credential store.
 - Completed on 2026-06-19: Added SQLite integration tests for schema v2 initialization, prototype rebuild, account/folder upsert idempotence, message metadata upsert idempotence, Message-ID fallback matching, and rollback on failed message-location insert.
@@ -385,16 +424,14 @@ Next work:
 - Completed on 2026-06-19: Expanded sync lease tests after review to cover expired heartbeat refusal, queued successor claim after a crashed running owner, abandoned queued-run cleanup, and wrong-owner heartbeat/progress/completion refusal. `dotnet test lcemcp.slnx` passed with 23 tests.
 - Completed on 2026-06-20: Added MCP stdio tests for initialize/tools-list, stdout/stderr separation, `email_get_sync_status` structured readiness output, and audit logging. `dotnet test lcemcp.slnx` passed with 25 tests.
 - Completed on 2026-06-20: Expanded MCP tests to cover the full exposed tool catalog plus ready-index `email_search` and `email_get_message`, including affected-message audit ids. `dotnet test lcemcp.slnx` passed with 26 tests.
-- Add an optional manual IMAP smoke test path that requires a configured real account and is not run by default.
 
-## 9. Later Milestones
+## 11. Later Milestones
 
 These are intentionally after read-only local search works.
 
 Next work:
 
-- Attachment metadata and text extraction.
-- PDF embedded text extraction.
+- OCR for standalone image attachments if PDF OCR proves useful enough to extend.
 - Local admin UI.
 - Draft/send support, disabled by default.
 - SQLCipher or other database encryption support.
