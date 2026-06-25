@@ -235,11 +235,11 @@ These came from reviewing what happens when a normal Codex user asks something l
 
 Legit near-term issues:
 
-- Make `email_search` query text optional when the caller supplies bounded metadata filters. The tool should support date-only and filter-only browsing, such as "show Yahoo messages from June", without forcing an LLM to invent broad synthetic search terms. Implementation needs a non-FTS filtered listing path with deterministic date/message-id ordering, normal readiness checks, cursor pagination, and CLI parity.
+- Resolved on 2026-06-25: make `email_search` query text optional when the caller supplies bounded metadata filters. The tool now supports date-only and filter-only browsing, such as "show Yahoo messages from June", without forcing an LLM to invent broad synthetic search terms.
 - Add `date_from` / `date_to` to `email_search` and CLI search. This should bind against the message date (`COALESCE(date_sent, date_received)`) instead of making the LLM filter dates from returned snippets. Search readiness/results should also include an explicit coverage note when the requested date range extends beyond the configured/synced account history, rather than silently implying the whole request was searched.
 - Add recipient filtering, starting with `to_email` and likely broader recipient/participant filters over `message_recipients`. Current MCP only supports `from_email`.
 - Implement real pagination/cursors for `email_search`. Current responses can set `has_more=true`, but `next_cursor` is always `null`, so callers cannot continue without changing the query or limit.
-- Fix explicit one-off folder sync. Today `ReadSyncFolders(account, folder)` filters to `sync_enabled = true` before applying an explicit folder filter, so a direct MCP `email_sync_now` for a disabled-but-selectable folder such as Yahoo `Important` selects zero folders. The spec now says an explicit folder path/name/id should override the default `sync_enabled` scope for that one run; if no selectable folder matches, reject immediately instead of accepting a zero-folder run.
+- Resolved on 2026-06-25: fix explicit one-off folder sync. Default sync still uses `sync_enabled = true`, but an explicit folder path/name/id now overrides the default folder scope for that one run. If cached folders exist and no selectable folder matches, MCP rejects immediately instead of accepting a zero-folder run.
 - Improve estimate/list UX for non-selected folders. `email_estimate_sync` intentionally defaults to selected sync-enabled folders, but the response should make omitted selectable folders obvious enough that an LLM does not mistake the default estimate for "all folders". Consider returning omitted/selectable counts and a hint to call `email_list_folders` or pass explicit `folders`.
 - Make sync setup explicit and harness-friendly:
   - Update implementation defaults to match `SPEC.md`: first-run `history_days = 90`, with larger windows such as 365/1095/everything treated as deliberate per-run or config choices.
@@ -346,15 +346,23 @@ MCP folder-sync configuration result on 2026-06-25:
 - `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 43 tests. `scripts/build-release.ps1` also passed Release tests with 43 tests and refreshed `artifacts\lcemcp\LceMcp.exe`; new SHA256 is `0A453D56FF6F714DF0893A07402DC3EEB8A57AD028F75C123D495AB4FB83FD0E`.
 - Packaged stdio smoke verified that `tools/list` from `artifacts\lcemcp\LceMcp.exe serve` advertises `email_set_folder_sync`.
 
+Filter-only search and explicit folder sync fix on 2026-06-25:
+
+- Added filter-only/date-only local search for CLI and MCP. `query` / `--query` is now optional when another bounded filter is supplied, and blank-query search uses a non-FTS newest-first browse path with the existing readiness checks and cursor pagination.
+- Kept unbounded all-mail browsing rejected. Callers must provide query text or at least one filter such as account, sender, recipient, date range, folder role, or attachment flag.
+- Fixed explicit one-off folder sync selection for disabled selectable folders. Default sync still uses `sync_enabled=true`, but an explicit `--folder` / MCP `folder` now matches any selectable cached folder for that run, including Yahoo `Important`.
+- MCP `email_sync_now` now rejects an explicit cached folder miss before queuing a sync run, instead of accepting a successful-looking zero-folder run.
+- `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 46 tests. New coverage includes filter-only date browsing, MCP search with omitted `query`, and explicit disabled selectable folder selection.
+
 Next work:
 
-- Implement filter-only/date-only `email_search` for MCP and CLI, including cursor behavior and readiness handling.
-- Fix explicit disabled-folder sync selection for MCP and CLI, then add regression tests around a disabled selectable folder such as `Important`.
-- Make `email_sync_now`/`email_get_sync_status` surface zero-folder or failed one-off syncs clearly enough that LLM clients cannot treat them as successful coverage.
-- Improve `email_estimate_sync` output so default selected-folder estimates are clearly distinguished from all-folder estimates.
-- Consider adding provider-probe estimates to `email_estimate_sync`; the current implementation is deliberately factual but cached-count only.
-- Consider a CLI or MCP folder-list view that highlights both current `sync_enabled` and role default side by side for setup UX.
-- Consider adding body-sync fetch-mode counters to sync summaries/status if future tuning needs exact counts rather than the current aggregate/manual measurement.
+- Improve `email_estimate_sync` scope clarity. Its default estimate intentionally covers selected `sync_enabled` folders only, but the response should make omitted selectable folders obvious enough that an agent does not read it as "all folders."
+
+Deferred polish:
+
+- Provider-probe estimates in `email_estimate_sync`; the current implementation is deliberately factual but cached-count only.
+- A CLI or MCP folder-list view that shows both current `sync_enabled` and role default side by side for setup UX.
+- Body-sync fetch-mode counters in sync summaries/status if future tuning needs exact counts rather than manual aggregate measurements.
 
 Known deferred or acceptable for MVP:
 

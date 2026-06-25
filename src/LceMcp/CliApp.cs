@@ -624,7 +624,7 @@ internal static class CliApp
 
     private static int Search(EmailDatabase database, CommandOptions options)
     {
-        var query = options.GetRequired("--query").Trim();
+        var query = options.Get("--query")?.Trim() ?? "";
         var dateFrom = EmailSearchDateParser.NormalizeLowerBound(options.Get("--date-from"));
         var dateTo = EmailSearchDateParser.NormalizeUpperBound(options.Get("--date-to"));
         EmailSearchDateParser.ValidateRange(dateFrom, dateTo);
@@ -649,9 +649,14 @@ internal static class CliApp
         if (request.SnippetChars < 160 || request.SnippetChars > 4096)
             throw new CliException("--snippet-chars must be between 160 and 4096.", 2);
 
+        if (!request.IsBounded)
+            throw new CliException("Search requires --query or at least one filter such as --account, --from, --to, --date-from, --date-to, --folder-role, or --has-attachment.", 2);
+
         Console.WriteLine($"Database: {database.DatabasePath}");
 
-        FtsQueryBuilder.Build(request.Query);
+        if (request.HasTextQuery)
+            FtsQueryBuilder.Build(request.Query);
+
         EmailSearchCursorCodec.Decode(request.Cursor);
 
         var readiness = database.GetMessageSearchReadiness(new(
@@ -1343,7 +1348,7 @@ internal static class CliApp
           --batch-size <n>         Default: 10. Fetches bodies in bounded loops.
 
         search options:
-          --query <text>           Required. Local FTS query text; quoted phrases and OR are supported.
+          --query <text>           Optional when another filter is supplied. Local FTS query text; quoted phrases and OR are supported.
           --account <id-or-email>  Optional. Comma-separated values are accepted.
           --from <email>           Optional sender email filter.
           --to <email>             Optional exact To recipient email filter.

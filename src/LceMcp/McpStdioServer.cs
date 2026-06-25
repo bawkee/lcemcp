@@ -246,10 +246,10 @@ internal sealed class McpStdioServer
                 ToolDefinition(
                     "email_search",
                     "Email Search",
-                    "Search the local indexed message corpus and report cache freshness. Returns not_synced instead of empty results when the requested corpus is incomplete.",
+                    "Search or browse the local indexed message corpus and report cache freshness. Query text is optional when bounded metadata filters such as accounts, dates, sender, recipient, folder roles, or attachments are supplied. Returns not_synced instead of empty results when the requested corpus is incomplete.",
                     ObjectSchema(new()
                     {
-                        ["query"] = StringSchema("Search text. Quoted phrases and OR are supported."),
+                        ["query"] = NullableStringSchema("Optional search text. Quoted phrases and OR are supported. Omit or pass blank only when supplying other filters such as dates, accounts, sender, recipient, folder roles, or attachments."),
                         ["accounts"] = StringArraySchema("Optional account ids, display names, or email addresses. Omit, null, or [] for all configured accounts."),
                         ["from_email"] = NullableStringSchema("Optional exact sender email filter."),
                         ["to_email"] = NullableStringSchema("Optional exact To recipient email filter."),
@@ -261,7 +261,7 @@ internal sealed class McpStdioServer
                         ["cursor"] = NullableStringSchema("Opaque cursor returned by a prior email_search response."),
                         ["snippet_chars"] = IntSchema("Approximate maximum snippet characters, 160 to 4096. Defaults to 1024.", 160, 4096, 1024),
                         ["allow_partial"] = BoolSchema("Debug opt-in. Search even when readiness is incomplete and label results partial.", defaultValue: false)
-                    }, "query"),
+                    }),
                     readOnly: true,
                     idempotent: true),
                 ToolDefinition(
@@ -782,7 +782,7 @@ internal sealed class McpStdioServer
             "allow_partial",
             "_meta");
 
-        var query = ReadRequiredString(arguments, "query").Trim();
+        var query = ReadOptionalString(arguments, "query") ?? "";
         string dateFrom;
         string dateTo;
 
@@ -814,9 +814,14 @@ internal sealed class McpStdioServer
             DateTo: dateTo,
             Cursor: ReadOptionalString(arguments, "cursor"));
 
+        if (!request.IsBounded)
+            throw new JsonRpcError(-32602, "email_search requires query text or at least one bounded filter such as accounts, from_email, to_email, date_from, date_to, folder_roles, or has_attachment.");
+
         try
         {
-            FtsQueryBuilder.Build(request.Query);
+            if (request.HasTextQuery)
+                FtsQueryBuilder.Build(request.Query);
+
             EmailSearchCursorCodec.Decode(request.Cursor);
         }
         catch (CliException ex)
@@ -1017,6 +1022,11 @@ internal sealed class McpStdioServer
         }
 
         var initialTotal = works.Sum(work => _database.ReadSyncFolders(work.Account.Id, request.Folder).Count);
+        if (!string.IsNullOrWhiteSpace(request.Folder)
+            && initialTotal == 0
+            && works.All(work => _database.ReadFolders(work.Account.Id).Count > 0))
+            return SyncRejected(argumentsSummary, $"No selectable cached folder matched '{request.Folder}'. Use email_list_folders to inspect folder paths/names/ids first.");
+
         if (initialTotal == 0)
             initialTotal = works.Count;
 

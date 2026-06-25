@@ -158,6 +158,61 @@ public sealed class McpStdioServerTests
     }
 
     [Fact]
+    public async Task EmailSearchAllowsDateOnlyRequestWithoutQuery()
+    {
+        using var temp = TempWorkspace.Create();
+        var account = TestData.Account();
+        var configStore = new ConfigStore(temp.Paths);
+        var config = new AppConfig();
+        config.UpsertAccount(account);
+        configStore.Save(config);
+
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(account);
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:date-only",
+                messageIdHeader: "date-only@example.com",
+                subject: "Date only browse",
+                dateSent: "2026-06-19T10:00:00.0000000+00:00")
+        ], SyncStateJson(sinceDays: 30, matchedCount: 1, selectedCount: 1, fetchedCount: 1), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "This body should not require an FTS query.",
+            HtmlText: null,
+            NormalizedText: "This body should not require an FTS query.",
+            Recipients: []));
+
+        var output = new StringWriter();
+        var error = new StringWriter();
+        var input = new StringReader("""
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_search","arguments":{"accounts":["yahoo"],"date_from":"2026-06-19","date_to":"2026-06-19","limit":5}}}
+            """);
+        var server = new McpStdioServer(configStore, database, input, output, error);
+
+        await server.RunAsync(CancellationToken.None);
+
+        var lines = OutputLines(output);
+        var search = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
+        var result = search["results"].AsArray()[0].AsObject();
+
+        Assert.Equal("ready", search["status"].GetValue<string>());
+        Assert.Equal(messageId, result["message_id"].GetValue<int>());
+        Assert.Equal("Date only browse", result["subject"].GetValue<string>());
+        Assert.Empty(result["message_snippets"].AsArray());
+        Assert.Equal(0d, result["score"].GetValue<double>());
+    }
+
+    [Fact]
     public async Task EmailSearchReportsScopedFreshnessForReadyLocalIndex()
     {
         using var temp = TempWorkspace.Create();

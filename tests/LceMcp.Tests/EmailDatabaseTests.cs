@@ -172,6 +172,30 @@ public sealed class EmailDatabaseTests
     }
 
     [Fact]
+    public void ReadSyncFoldersAllowsExplicitDisabledSelectableFolder()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox"),
+            TestData.Folder("Important", role: "custom"),
+            TestData.Folder("Container", role: "custom", selectable: false)
+        ]);
+
+        var defaultFolders = database.ReadSyncFolders("yahoo", folderFilter: null);
+        var explicitImportant = database.ReadSyncFolders("yahoo", "Important");
+        var explicitContainer = database.ReadSyncFolders("yahoo", "Container");
+
+        var important = Assert.Single(explicitImportant);
+        Assert.Equal(["Inbox"], defaultFolders.Select(folder => folder.Path).ToArray());
+        Assert.Equal("Important", important.Path);
+        Assert.False(important.SyncEnabled);
+        Assert.Empty(explicitContainer);
+    }
+
+    [Fact]
     public void UpsertMessageMetadataBatchIsIdempotentByLocationAndProviderMessageKey()
     {
         using var temp = TempWorkspace.Create();
@@ -495,6 +519,81 @@ public sealed class EmailDatabaseTests
         Assert.NotEqual(firstPage[0].MessageId, secondPage[0].MessageId);
         Assert.All(firstPage.Concat(secondPage), result => Assert.Contains("Invoice", result.Subject));
         Assert.Empty(outsideDate);
+    }
+
+    [Fact]
+    public void SearchMessagesSupportsFilterOnlyDateBrowsing()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:filter-new",
+                messageIdHeader: "filter-new@example.com",
+                subject: "Newest filtered message",
+                dateSent: "2026-06-21T10:00:00.0000000+00:00"),
+            TestData.Message(
+                providerUid: "101",
+                providerMessageKey: "emailid:filter-old",
+                messageIdHeader: "filter-old@example.com",
+                subject: "Older filtered message",
+                dateSent: "2026-06-20T10:00:00.0000000+00:00"),
+            TestData.Message(
+                providerUid: "102",
+                providerMessageKey: "emailid:outside",
+                messageIdHeader: "outside@example.com",
+                subject: "Outside filtered range",
+                dateSent: "2026-05-01T10:00:00.0000000+00:00")
+        ], SyncStateJson(sinceDays: 90, matchedCount: 3, selectedCount: 3, fetchedCount: 3), 102);
+        var messageIds = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages ORDER BY id;");
+
+        foreach (var messageId in messageIds)
+        {
+            database.UpsertMessageBody(new(
+                MessageId: messageId,
+                PlainText: "filter-only body",
+                HtmlText: null,
+                NormalizedText: "filter-only body",
+                Recipients: [new("to", "Billing", "billing@example.com")]));
+        }
+
+        var dateFrom = EmailSearchDateParser.NormalizeLowerBound("2026-06-01");
+        var dateTo = EmailSearchDateParser.NormalizeUpperBound("2026-06-30");
+        var firstPage = database.SearchMessages(new(
+            Query: "",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 1,
+            SnippetChars: 1024,
+            ToEmail: "billing@example.com",
+            DateFrom: dateFrom,
+            DateTo: dateTo));
+        var secondPage = database.SearchMessages(new(
+            Query: "",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 5,
+            SnippetChars: 1024,
+            ToEmail: "billing@example.com",
+            DateFrom: dateFrom,
+            DateTo: dateTo,
+            Cursor: firstPage.Single().Cursor));
+
+        Assert.Equal("Newest filtered message", firstPage.Single().Subject);
+        Assert.Equal("Older filtered message", secondPage.Single().Subject);
+        Assert.Null(firstPage.Single().Snippet);
+        Assert.Equal(0d, firstPage.Single().Score);
     }
 
     [Fact]

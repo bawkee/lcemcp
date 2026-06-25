@@ -48,7 +48,24 @@ internal sealed record EmailSearchRequest(
     string ToEmail = null,
     string DateFrom = null,
     string DateTo = null,
-    string Cursor = null);
+    string Cursor = null)
+{
+    public bool HasTextQuery => !string.IsNullOrWhiteSpace(Query);
+
+    public bool HasMetadataFilters =>
+        HasValues(AccountFilters)
+        || !string.IsNullOrWhiteSpace(FromEmail)
+        || HasValues(FolderRoles)
+        || HasAttachment.HasValue
+        || !string.IsNullOrWhiteSpace(ToEmail)
+        || !string.IsNullOrWhiteSpace(DateFrom)
+        || !string.IsNullOrWhiteSpace(DateTo);
+
+    public bool IsBounded => HasTextQuery || HasMetadataFilters;
+
+    private static bool HasValues(IReadOnlyList<string> values) =>
+        values is not null && values.Any(value => !string.IsNullOrWhiteSpace(value));
+}
 
 internal sealed record EmailSearchResult(
     int MessageId,

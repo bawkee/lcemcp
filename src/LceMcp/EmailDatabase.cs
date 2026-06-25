@@ -176,7 +176,7 @@ internal sealed class EmailDatabase
     public IReadOnlyList<StoredFolder> ReadSyncFolders(string accountFilter, string folderFilter)
     {
         var folders = ReadFolders(accountFilter)
-            .Where(folder => folder.Selectable && folder.SyncEnabled);
+            .Where(folder => folder.Selectable);
 
         if (!string.IsNullOrWhiteSpace(folderFilter))
         {
@@ -185,6 +185,10 @@ internal sealed class EmailDatabase
                 folder.Path.Equals(requested, StringComparison.OrdinalIgnoreCase)
                 || folder.Name.Equals(requested, StringComparison.OrdinalIgnoreCase)
                 || folder.Id.ToString().Equals(requested, StringComparison.OrdinalIgnoreCase));
+        }
+        else
+        {
+            folders = folders.Where(folder => folder.SyncEnabled);
         }
 
         return folders
@@ -428,7 +432,11 @@ internal sealed class EmailDatabase
     {
         EnsureInitialized();
 
-        var fts = FtsQueryBuilder.Build(request.Query);
+        if (!request.IsBounded)
+            throw new CliException("Search requires query text or at least one bounded filter.", 2);
+
+        var hasTextQuery = !string.IsNullOrWhiteSpace(request.Query);
+        var fts = hasTextQuery ? FtsQueryBuilder.Build(request.Query) : null;
         var limit = Math.Clamp(request.Limit <= 0 ? 20 : request.Limit, 1, 101);
         var snippetTokens = Math.Clamp(request.SnippetChars <= 0 ? 32 : request.SnippetChars / 6, 16, 64);
 
@@ -439,7 +447,7 @@ internal sealed class EmailDatabase
         if (HasValues(request.AccountFilters) && accountIds.Count == 0)
             return [];
 
-        var query = CreateDbQuery(connection, SearchMessagesSql);
+        var query = CreateDbQuery(connection, hasTextQuery ? SearchMessagesSql : BrowseMessagesSql);
         ApplyScopeConditions(
             query,
             accountIds,
@@ -451,16 +459,25 @@ internal sealed class EmailDatabase
             request.DateTo);
 
         using var command = query.CreateCommand();
-        query.AddSqlParameter("$fts", fts);
         query.AddSqlParameter("$limit", limit);
-        query.AddSqlParameter("$snippetTokens", snippetTokens);
         query.AddSqlParameter("$dateFrom", request.DateFrom);
         query.AddSqlParameter("$dateTo", request.DateTo);
-        query.AddSqlParameter("$cursorScore", cursor?.Score);
         query.AddSqlParameter("$cursorDate", cursor?.Date ?? "");
         query.AddSqlParameter("$cursorMessageId", cursor?.MessageId ?? 0);
 
+        if (hasTextQuery)
+        {
+            query.AddSqlParameter("$fts", fts);
+            query.AddSqlParameter("$snippetTokens", snippetTokens);
+            query.AddSqlParameter("$cursorScore", cursor?.Score);
+        }
+
         using var reader = (SqliteDataReader)command.ExecuteReader();
+        return ReadSearchResults(reader);
+    }
+
+    private static IReadOnlyList<EmailSearchResult> ReadSearchResults(SqliteDataReader reader)
+    {
         var results = new List<EmailSearchResult>();
 
         while (reader.Read())
@@ -1955,7 +1972,7 @@ internal sealed class EmailDatabase
             query,
             accountIds,
             request.FromEmail,
-            null,
+            request.ToEmail,
             request.FolderRoles,
             request.HasAttachment,
             request.DateFrom,
@@ -2939,6 +2956,65 @@ internal sealed class EmailDatabase
         LIMIT $limit;
         """;
 
+    private const string BrowseMessagesSql = """
+        SELECT
+            m.id AS message_id,
+            a.name AS account_name,
+            (
+                SELECT group_concat(folder_path, ', ')
+                FROM (
+                    SELECT DISTINCT f.path AS folder_path
+                    FROM message_locations ml
+                    JOIN folders f ON f.id = ml.folder_id
+                    WHERE ml.message_id = m.id
+                      AND ml.deleted_locally = 0
+                      AND ml.expunged = 0
+                    ORDER BY f.path COLLATE NOCASE
+                )
+            ) AS folders,
+            COALESCE(m.date_sent, m.date_received) AS message_date,
+            m.from_name,
+            m.from_email,
+            m.subject,
+            m.has_attachments,
+            NULL AS snippet,
+            0.0 AS score
+        FROM message_search_docs d
+        JOIN messages m ON m.id = d.message_id
+        JOIN accounts a ON a.id = m.account_id
+        WHERE ($dateFrom IS NULL OR COALESCE(m.date_sent, m.date_received) >= $dateFrom)
+          AND ($dateTo IS NULL OR COALESCE(m.date_sent, m.date_received) <= $dateTo)
+          AND (
+              $cursorMessageId = 0
+              OR COALESCE(m.date_sent, m.date_received, '') < $cursorDate
+              OR (
+                  COALESCE(m.date_sent, m.date_received, '') = $cursorDate
+                  AND m.id < $cursorMessageId
+              )
+          )
+        {AND
+            {m.account_id [accountIds]}
+            {m.from_email COLLATE NOCASE [fromEmail]}
+            {m.has_attachments [hasAttachments]}
+            {m.id IN (
+                SELECT r_to.message_id
+                FROM message_recipients r_to
+                WHERE r_to.type = 'to'
+                  {AND {r_to.email COLLATE NOCASE [toEmail]}}
+            )}
+            {EXISTS (
+                SELECT 1
+                FROM message_locations ml_filter
+                JOIN folders f_filter ON f_filter.id = ml_filter.folder_id
+                WHERE ml_filter.message_id = m.id
+                  AND ml_filter.deleted_locally = 0
+                  AND ml_filter.expunged = 0
+                  {AND {f_filter.role [folderRoles]}}
+            )}}
+        ORDER BY COALESCE(m.date_sent, m.date_received, '') DESC, m.id DESC
+        LIMIT $limit;
+        """;
+
     private const string SearchReadinessFoldersSql = """
         SELECT
             f.id AS folder_id,
@@ -2988,6 +3064,12 @@ internal sealed class EmailDatabase
             {m.account_id [accountIds]}
             {m.from_email COLLATE NOCASE [fromEmail]}
             {m.has_attachments [hasAttachments]}
+            {m.id IN (
+                SELECT r_to.message_id
+                FROM message_recipients r_to
+                WHERE r_to.type = 'to'
+                  {AND {r_to.email COLLATE NOCASE [toEmail]}}
+            )}
             {f.role [folderRoles]}}
         """;
 }
