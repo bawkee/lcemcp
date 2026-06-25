@@ -359,7 +359,9 @@ internal sealed class EmailDatabase
                     ml.folder_id,
                     f.path AS folder_path,
                     ml.provider_uid,
-                    m.subject
+                    m.subject,
+                    m.has_attachments,
+                    m.size_bytes
                 FROM message_locations ml
                 JOIN messages m ON m.id = ml.message_id
                 JOIN folders f ON f.id = ml.folder_id
@@ -382,7 +384,9 @@ internal sealed class EmailDatabase
                     FolderId: reader.GetInt32(reader.GetOrdinal("folder_id")),
                     FolderPath: reader.GetString(reader.GetOrdinal("folder_path")),
                     ProviderUid: reader.GetString(reader.GetOrdinal("provider_uid")),
-                    Subject: GetNullableString(reader, "subject")));
+                    Subject: GetNullableString(reader, "subject"),
+                    HasAttachments: reader.GetInt32(reader.GetOrdinal("has_attachments")) != 0,
+                    SizeBytes: GetNullableInt64(reader, "size_bytes")));
             }
         }
 
@@ -399,6 +403,24 @@ internal sealed class EmailDatabase
         var now = DateTimeOffset.UtcNow.ToString("O");
 
         UpsertMessageBody(connection, transaction, body, now);
+        transaction.Commit();
+    }
+
+    public void UpsertMessageBodies(IReadOnlyList<MessageBodyContent> bodies)
+    {
+        if (bodies is null || bodies.Count == 0)
+            return;
+
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        var now = DateTimeOffset.UtcNow.ToString("O");
+
+        foreach (var body in bodies)
+            UpsertMessageBody(connection, transaction, body, now);
+
         transaction.Commit();
     }
 
@@ -2808,6 +2830,12 @@ internal sealed class EmailDatabase
     {
         var ordinal = reader.GetOrdinal(name);
         return reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal);
+    }
+
+    private static long? GetNullableInt64(SqliteDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal) ? null : reader.GetInt64(ordinal);
     }
 
     private sealed record MessageSearchFolderState(

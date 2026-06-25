@@ -6,6 +6,7 @@ namespace LceMcp;
 internal sealed class McpStdioServer
 {
     private const string LatestProtocolVersion = "2025-11-25";
+    private const int RecommendedSyncPollIntervalSeconds = 15;
     private static readonly HashSet<string> SupportedProtocolVersions = new(StringComparer.Ordinal)
     {
         "2025-11-25",
@@ -166,7 +167,7 @@ internal sealed class McpStdioServer
                 ["title"] = "Locally Cached Email MCP",
                 ["version"] = typeof(McpStdioServer).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"
             },
-            ["instructions"] = "Use email_get_setup_status when onboarding may be incomplete. email_search returns local-cache results plus freshness timestamps; compare freshness.search_scope_as_of with the user's requested date range before treating results as current. If email_search returns not_synced, call email_sync_now and poll email_get_sync_status; not_synced is not evidence that no matching email exists. Use since_days on email_sync_now for one-off wider backfills instead of changing config."
+            ["instructions"] = $"Use email_get_setup_status when onboarding may be incomplete. email_search returns local-cache results plus freshness timestamps; compare freshness.search_scope_as_of with the user's requested date range before treating results as current. If email_search returns not_synced, call email_sync_now and poll email_get_sync_status about every {RecommendedSyncPollIntervalSeconds} seconds; not_synced is not evidence that no matching email exists. Sync touches remote IMAP providers and may take minutes for body indexing. Use since_days on email_sync_now for one-off wider backfills instead of changing config."
         };
     }
 
@@ -267,7 +268,7 @@ internal sealed class McpStdioServer
                 ToolDefinition(
                     "email_sync_now",
                     "Email Sync",
-                    "Start or queue local metadata and body indexing for configured accounts. Returns quickly with a sync_run_id; poll email_get_sync_status for progress.",
+                    $"Start or queue local metadata and body indexing for configured accounts. Returns quickly with a sync_run_id; poll email_get_sync_status for progress at about {RecommendedSyncPollIntervalSeconds}s intervals because IMAP body indexing is provider-paced.",
                     ObjectSchema(new()
                     {
                         ["accounts"] = StringArraySchema("Optional account ids, display names, or email addresses. Omit, null, or [] for all enabled accounts."),
@@ -276,7 +277,7 @@ internal sealed class McpStdioServer
                         ["since_days"] = IntSchema("Optional metadata date bound override. Use 0 for no date bound.", 0, 3650, null),
                         ["max_per_folder"] = IntSchema("Optional per-folder cap. Use 0 for no cap; capped runs usually remain not_synced.", 0, 1000000, 0),
                         // TODO: Codex reported that this is not honored which is true, why do we even have it then? What 'compatibility'? With what?
-                        ["wait_for_completion"] = BoolSchema("Accepted for compatibility, but the MCP server still returns immediately; poll email_get_sync_status.", defaultValue: false)
+                        ["wait_for_completion"] = BoolSchema($"Accepted for compatibility, but the MCP server still returns immediately; poll email_get_sync_status at about {RecommendedSyncPollIntervalSeconds}s intervals.", defaultValue: false)
                     }),
                     readOnly: false,
                     idempotent: false,
@@ -284,7 +285,7 @@ internal sealed class McpStdioServer
                 ToolDefinition(
                     "email_get_sync_status",
                     "Email Sync Status",
-                    "Return local email sync progress and binary message-search readiness.",
+                    $"Return local email sync progress and binary message-search readiness. During active sync, poll at about {RecommendedSyncPollIntervalSeconds}s intervals.",
                     ObjectSchema(new()
                     {
                         ["accounts"] = StringArraySchema("Optional account ids, display names, or email addresses. Omit, null, or [] for all configured accounts."),
@@ -928,6 +929,7 @@ internal sealed class McpStdioServer
                 ? "Sync started. Poll email_get_sync_status for progress."
                 : "A sync is already running or queued; this request is queued. Poll email_get_sync_status for progress.",
             ["wait_for_completion_honored"] = false,
+            ["polling"] = SyncPollingJson(),
             ["progress"] = syncRun.ActiveRun is null ? null : ToSyncProgressJson(syncRun.ActiveRun)
         };
 
@@ -972,6 +974,7 @@ internal sealed class McpStdioServer
             ["schema_version"] = databaseStatus.SchemaVersion,
             ["target_schema_version"] = databaseStatus.TargetSchemaVersion,
             ["active_sync_run_id"] = StringOrNull(activeSyncRun?.Id),
+            ["polling"] = SyncPollingJson(),
             ["accounts"] = accountStatuses
         };
     }
@@ -1536,10 +1539,18 @@ internal sealed class McpStdioServer
             ["elapsed_seconds"] = run.ElapsedSeconds,
             ["estimated_remaining_seconds"] = NumberOrNull(run.EstimatedRemainingSeconds),
             ["estimate_confidence"] = run.EstimateConfidence,
+            ["recommended_poll_after_seconds"] = RecommendedSyncPollIntervalSeconds,
             ["started_at"] = run.StartedAt,
             ["last_progress_at"] = run.LastProgressAt,
             ["completed_at"] = StringOrNull(run.CompletedAt),
             ["last_error"] = StringOrNull(run.LastError)
+        };
+
+    private static JsonObject SyncPollingJson() =>
+        new()
+        {
+            ["recommended_interval_seconds"] = RecommendedSyncPollIntervalSeconds,
+            ["note"] = "Sync is limited by remote IMAP provider latency and body download/indexing work; use the recommended interval for normal progress checks."
         };
 
     private static JsonArray ToFoldersJson(IReadOnlyList<StoredFolder> folders)

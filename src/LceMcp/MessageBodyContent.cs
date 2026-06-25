@@ -17,7 +17,9 @@ internal sealed record BodySyncTarget(
     int FolderId,
     string FolderPath,
     string ProviderUid,
-    string Subject);
+    string Subject,
+    bool HasAttachments,
+    long? SizeBytes);
 
 internal sealed record BodyFolderSyncResult(
     string FolderPath,

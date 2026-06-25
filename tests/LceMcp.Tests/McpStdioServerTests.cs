@@ -272,6 +272,7 @@ public sealed class McpStdioServerTests
         var lines = OutputLines(output);
         var call = JsonNode.Parse(lines[1]).AsObject();
         var structured = call["result"]["structuredContent"].AsObject();
+        var polling = structured["polling"].AsObject();
         var statusAccount = structured["accounts"].AsArray()[0].AsObject();
         var readiness = statusAccount["readiness"].AsObject();
         var folders = statusAccount["folders"].AsArray();
@@ -280,6 +281,7 @@ public sealed class McpStdioServerTests
             "SELECT client_name || '|' || tool_name || '|' || action_type || '|' || result_summary FROM audit_log ORDER BY id;");
 
         Assert.False(statusAccount["search_ready"].GetValue<bool>());
+        Assert.Equal(15, polling["recommended_interval_seconds"].GetValue<int>());
         Assert.False(readiness["metadata_complete"].GetValue<bool>());
         Assert.Equal(1, readiness["scope_folder_count"].GetValue<int>());
         Assert.Equal("Inbox", folders[0]["folder"].GetValue<string>());

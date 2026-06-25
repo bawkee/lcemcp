@@ -10,6 +10,18 @@ internal static class MessageBodyNormalizer
     {
         var plainText = BlankToNull(message.TextBody);
         var htmlText = BlankToNull(message.HtmlBody);
+
+        return FromParts(messageId, plainText, htmlText, ReadRecipients(message));
+    }
+
+    public static MessageBodyContent FromParts(
+        int messageId,
+        string plainText,
+        string htmlText,
+        IReadOnlyList<MessageRecipient> recipients)
+    {
+        plainText = BlankToNull(plainText);
+        htmlText = BlankToNull(htmlText);
         var normalizedText = NormalizeText(plainText ?? HtmlToText(htmlText));
 
         return new(
@@ -17,7 +29,7 @@ internal static class MessageBodyNormalizer
             PlainText: plainText,
             HtmlText: htmlText,
             NormalizedText: normalizedText,
-            Recipients: ReadRecipients(message));
+            Recipients: recipients ?? []);
     }
 
     private static IReadOnlyList<MessageRecipient> ReadRecipients(MimeMessage message)

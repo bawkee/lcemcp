@@ -318,6 +318,25 @@ Harness config result on 2026-06-24:
 - Refreshed the single-file release artifact at `artifacts\lcemcp\LceMcp.exe` after stopping stale artifact processes that held the old executable open. Release tests passed with 41 tests and the new artifact SHA256 is `9BDCAA8D51A3BBA132924885F10C9C585D4A0F4DF52C49C8A40EF2CD33A4DC6B`.
 - Packaged smoke succeeded for `mcp-config --client opencode` and MCP `initialize`/`tools/list` through `artifacts\lcemcp\LceMcp.exe serve`.
 
+Manual Yahoo body-sync performance result on 2026-06-24:
+
+- `dotnet build lcemcp.slnx /p:UseSharedCompilation=false` succeeded before the live run.
+- Live Yahoo metadata sync with `sync --account yahoo --since-days 40 --max-per-folder 0 --batch-size 50` completed in 36.758 seconds. It synced the configured 30-day scope plus 10 more days across the three enabled folders: Archive matched 0, Inbox matched/fetched 214, Sent matched/fetched 20, and 234 metadata rows were current afterward.
+- The 40-day metadata run left 33 pending bodies. Live Yahoo body sync with `sync-bodies --account yahoo --max-per-folder 0 --batch-size 10` completed in 37.324 seconds: Inbox selected/fetched/persisted 33, missing 0. Final status reported 234 messages, 234 bodies, 234 search docs, and search readiness `ready`.
+- Aggregate local stats for that 33-message body run: total message size about 3.2 MB, average message size about 98 KB, median 87 KB, p90 161 KB, p95 201 KB, max 418 KB, and 2 messages had attachment metadata. Stored body text was not unusually large for the elapsed time.
+- Current evidence points to per-message IMAP round-trip latency and full-message MIME download as the main body-sync scaling problem. `ImapBodySync` currently calls `folder.GetMessageAsync(new UniqueId(uid))` once per pending body, which downloads a full `MimeMessage` even though the app only indexes text and recipients.
+- Before changing behavior, decide whether to first add per-message/body-phase instrumentation, or directly prototype fetching only selected body sections from the already-stored body structure and batching database writes.
+
+Body-sync performance fix on 2026-06-25:
+
+- Changed body sync from one full `GetMessageAsync` per UID to a hybrid fetch strategy: small messages without attachments are fetched as batched full-message streams with `IImapFolder.GetStreamsAsync`, while attachment-bearing or large messages fetch only text body parts and fall back to full MIME only when no useful text part is available.
+- Added batched SQLite body persistence so a sync batch commits multiple `message_bodies`/recipient/search-doc updates in one transaction while reusing the existing per-message search-index refresh logic.
+- Added MCP polling guidance in initialization instructions, `email_sync_now`, `email_get_sync_status`, and active progress JSON: recommended poll interval 15 seconds, with a note that remote IMAP/body indexing is provider-paced.
+- `dotnet build lcemcp.slnx /p:UseSharedCompilation=false` succeeded and `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 42 tests after the fix.
+- Live Yahoo metadata sync with `sync --account yahoo --since-days 50 --max-per-folder 0 --batch-size 50` completed in 50.223 seconds and created 81 pending bodies. The intermediate text-part-only implementation synced those 81 bodies in 82.139 seconds, about 1.01 seconds/message, only a modest improvement from the old 1.13 seconds/message baseline.
+- Live Yahoo metadata sync with `sync --account yahoo --since-days 60 --max-per-folder 0 --batch-size 50` completed in 47.628 seconds and created 50 fresh pending bodies. The final hybrid body sync completed in 29.969 seconds, about 0.60 seconds/message. Aggregate shape for that batch: 50 messages, about 6.6 MB total, average 132 KB, median 68 KB, p90 233 KB, p95 336 KB, max 1.15 MB, 11 attachment-bearing messages, and 39 messages likely handled by batched full-stream fetch.
+- Final live status after the 60-day run reported 365 messages, 365 bodies, 365 search docs, search readiness `ready`, and 0 pending bodies.
+
 Next work:
 
 - Implement filter-only/date-only `email_search` for MCP and CLI, including cursor behavior and readiness handling.
@@ -326,6 +345,7 @@ Next work:
 - Improve `email_estimate_sync` output so default selected-folder estimates are clearly distinguished from all-folder estimates.
 - Consider adding provider-probe estimates to `email_estimate_sync`; the current implementation is deliberately factual but cached-count only.
 - Consider a CLI or MCP folder-list view that highlights both current `sync_enabled` and role default side by side for setup UX.
+- Consider adding body-sync fetch-mode counters to sync summaries/status if future tuning needs exact counts rather than the current aggregate/manual measurement.
 
 Known deferred or acceptable for MVP:
 

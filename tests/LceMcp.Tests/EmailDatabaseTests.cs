@@ -338,6 +338,70 @@ public sealed class EmailDatabaseTests
     }
 
     [Fact]
+    public void UpsertMessageBodiesRefreshesSearchIndexInOneBatch()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:batch-a",
+                messageIdHeader: "batch-a@example.com",
+                subject: "Batch Alpha"),
+            TestData.Message(
+                providerUid: "101",
+                providerMessageKey: "emailid:batch-b",
+                messageIdHeader: "batch-b@example.com",
+                subject: "Batch Beta")
+        ], """{"batch":1}""", 101);
+        var messageIds = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages ORDER BY id;");
+
+        database.UpsertMessageBodies([
+            new(
+                MessageId: messageIds[0],
+                PlainText: "alpha body",
+                HtmlText: null,
+                NormalizedText: "alpha body",
+                Recipients: [new("to", "Alpha", "alpha@example.com")]),
+            new(
+                MessageId: messageIds[1],
+                PlainText: "beta body",
+                HtmlText: null,
+                NormalizedText: "beta body",
+                Recipients: [new("to", "Beta", "beta@example.com")])
+        ]);
+
+        var status = database.GetStatus();
+        var alphaResults = database.SearchMessages(new(
+            Query: "alpha@example.com",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 10,
+            SnippetChars: 1024));
+        var betaResults = database.SearchMessages(new(
+            Query: "beta",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 10,
+            SnippetChars: 1024));
+
+        Assert.Equal(2, status.MessageBodyCount);
+        Assert.Equal(2, status.MessageSearchDocCount);
+        Assert.Single(alphaResults);
+        Assert.Single(betaResults);
+    }
+
+    [Fact]
     public void SearchMessagesSupportsRecipientDateFiltersAndCursorPaging()
     {
         using var temp = TempWorkspace.Create();
