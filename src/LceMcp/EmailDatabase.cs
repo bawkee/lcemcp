@@ -486,6 +486,7 @@ internal sealed class EmailDatabase
             request.HasAttachment,
             request.DateFrom,
             request.DateTo);
+        ApplyAttachmentConditions(query, request.MimeTypes, request.FilenameContains);
 
         using var command = query.CreateCommand();
         query.AddSqlParameter("$limit", limit);
@@ -3675,6 +3676,14 @@ internal sealed class EmailDatabase
             )}
             {EXISTS (
                 SELECT 1
+                FROM attachments att_filter
+                WHERE att_filter.message_id = m.id
+                  {AND
+                      {LOWER(COALESCE(att_filter.sniffed_mime_type, att_filter.mime_type, '')) [mimeTypes]}
+                      {att_filter.display_path [filenameContains]}}
+            )}
+            {EXISTS (
+                SELECT 1
                 FROM message_locations ml_filter
                 JOIN folders f_filter ON f_filter.id = ml_filter.folder_id
                 WHERE ml_filter.message_id = m.id
@@ -3731,6 +3740,14 @@ internal sealed class EmailDatabase
                 FROM message_recipients r_to
                 WHERE r_to.type = 'to'
                   {AND {r_to.email COLLATE NOCASE [toEmail]}}
+            )}
+            {EXISTS (
+                SELECT 1
+                FROM attachments att_filter
+                WHERE att_filter.message_id = m.id
+                  {AND
+                      {LOWER(COALESCE(att_filter.sniffed_mime_type, att_filter.mime_type, '')) [mimeTypes]}
+                      {att_filter.display_path [filenameContains]}}
             )}
             {EXISTS (
                 SELECT 1

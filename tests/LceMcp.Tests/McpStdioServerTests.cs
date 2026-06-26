@@ -226,8 +226,9 @@ public sealed class McpStdioServerTests
         var inputText = """
             {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
             {"jsonrpc":"2.0","method":"notifications/initialized"}
-            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_get_attachment_text","arguments":{"attachment_id":__ATTACHMENT_ID__,"max_chars":500}}}
-            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"email_prepare_attachment_access","arguments":{"attachment_ids":[__ATTACHMENT_ID__],"access_kind":"managed_export_file"}}}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_search","arguments":{"query":"DDV","accounts":["yahoo"],"search_in":["attachments"],"mime_types":["text/plain"],"limit":5}}}
+            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"email_get_attachment_text","arguments":{"attachment_id":__ATTACHMENT_ID__,"max_chars":500}}}
+            {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"email_prepare_attachment_access","arguments":{"attachment_ids":[__ATTACHMENT_ID__],"access_kind":"managed_export_file"}}}
             """.Replace("__ATTACHMENT_ID__", attachmentId.ToString());
         var input = new StringReader(inputText);
         var server = new McpStdioServer(configStore, database, input, output, error);
@@ -235,13 +236,18 @@ public sealed class McpStdioServerTests
         await server.RunAsync(CancellationToken.None);
 
         var lines = OutputLines(output);
-        var textPayload = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
-        var accessPayload = JsonNode.Parse(lines[2]).AsObject()["result"]["structuredContent"].AsObject();
+        var searchPayload = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
+        var textPayload = JsonNode.Parse(lines[2]).AsObject()["result"]["structuredContent"].AsObject();
+        var accessPayload = JsonNode.Parse(lines[3]).AsObject()["result"]["structuredContent"].AsObject();
+        var searchAttachment = searchPayload["results"].AsArray()[0]["matching_attachments"].AsArray()[0].AsObject();
         var access = accessPayload["attachments"].AsArray()[0]["access"].AsObject();
         var auditRows = ReadStrings(
             temp.Paths.DatabasePath,
             "SELECT tool_name || '|' || result_summary || '|' || COALESCE(affected_message_ids, '') || '|' || COALESCE(affected_attachment_ids, '') FROM audit_log ORDER BY id;");
 
+        Assert.Equal("ready", searchPayload["status"].GetValue<string>());
+        Assert.Equal(attachmentId, searchAttachment["attachment_id"].GetValue<int>());
+        Assert.Equal("statement.txt", searchAttachment["display_path"].GetValue<string>());
         Assert.Equal("ok", textPayload["status"].GetValue<string>());
         Assert.Contains("DDV", textPayload["attachment"]["combined_text"].GetValue<string>(), StringComparison.OrdinalIgnoreCase);
         Assert.Equal("ok", accessPayload["status"].GetValue<string>());

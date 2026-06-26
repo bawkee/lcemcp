@@ -404,6 +404,15 @@ Implementation checkpoint on 2026-06-26:
 - Status/readiness now reports attachment counts and attachment index completeness separately from message-body readiness.
 - `dotnet build lcemcp.slnx /p:UseSharedCompilation=false` succeeded, and `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 48 tests. New coverage includes migration/schema presence, attachment text FTS, stale attachment cleanup, managed export behavior, MCP attachment text/access calls, and attachment audit IDs.
 
+Sanity-check/test hardening on 2026-06-26:
+
+- Found and fixed an attachment-filter search bug: `mime_types` / `filename_contains` made a request bounded but the message branch did not apply those attachment-specific filters, so unrelated body hits or broad browse rows could leak into attachment-filtered searches. Message search SQL now uses parameterized attachment `EXISTS` filters when those options are active.
+- Hardened terminal document extraction so corrupt/unexpected PDF/DOCX/XLSX/etc. bytes become `extraction_status = failed` instead of failing the whole body-sync batch. Also fixed case-insensitive `.HTML` / `.HTM` extension handling.
+- Added processor fixture coverage for ZIP traversal rejection, safe ZIP child extraction, uppercase HTML extraction, DOCX/XLSX as terminal documents rather than archive trees, and corrupt DOCX failure status.
+- Added database regressions for attachment-specific filters constraining message results and attachment readiness staying separate from message readiness.
+- Extended MCP stdio coverage for attachment-scoped `email_search` with MIME filters in addition to `email_get_attachment_text` and `email_prepare_attachment_access`.
+- `dotnet build lcemcp.slnx /p:UseSharedCompilation=false` succeeded and `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 53 tests.
+
 Next work:
 
 - Run a bounded live Yahoo body sync against attachment-bearing messages and verify attachment rows, text extraction statuses, and attachment search results without recording private snippets in TODO.

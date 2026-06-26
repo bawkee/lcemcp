@@ -410,7 +410,7 @@ internal sealed class AttachmentProcessor
 
             return new("unsupported", null, null, null);
         }
-        catch (Exception ex) when (ex is InvalidDataException or IOException or ArgumentException or NotSupportedException)
+        catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             return new("failed", null, ex.Message, null);
         }
@@ -611,7 +611,8 @@ internal sealed class AttachmentProcessor
 
     private static bool IsHtml(string mimeType, string filename) =>
         mimeType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase)
-        || Path.GetExtension(filename) is ".html" or ".htm";
+        || Path.GetExtension(filename).Equals(".html", StringComparison.OrdinalIgnoreCase)
+        || Path.GetExtension(filename).Equals(".htm", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsCsv(string mimeType, string filename) =>
         mimeType.StartsWith("text/csv", StringComparison.OrdinalIgnoreCase)

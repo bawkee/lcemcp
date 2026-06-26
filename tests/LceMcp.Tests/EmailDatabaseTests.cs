@@ -539,6 +539,134 @@ public sealed class EmailDatabaseTests
     }
 
     [Fact]
+    public void AttachmentSpecificFiltersConstrainMessageBranch()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:body-only-ddv",
+                messageIdHeader: "body-only-ddv@example.com",
+                subject: "Body only"),
+            TestData.Message(
+                providerUid: "101",
+                providerMessageKey: "emailid:pdf-ddv",
+                messageIdHeader: "pdf-ddv@example.com",
+                subject: "PDF attachment",
+                hasAttachments: true)
+        ], SyncStateJson(matchedCount: 2, selectedCount: 2, fetchedCount: 2), 101);
+        var messageIds = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages ORDER BY id;");
+        var stored = new AttachmentObjectStore(temp.Paths).Store(Encoding.UTF8.GetBytes("pdf bytes"));
+
+        database.UpsertMessageBody(new(
+            MessageId: messageIds[0],
+            PlainText: "This body mentions DDV but has no PDF.",
+            HtmlText: null,
+            NormalizedText: "This body mentions DDV but has no PDF.",
+            Recipients: []));
+        database.UpsertMessageBody(new(
+            MessageId: messageIds[1],
+            PlainText: "See attached statement.",
+            HtmlText: null,
+            NormalizedText: "See attached statement.",
+            Recipients: [],
+            Attachments: [
+                Attachment(
+                    stored,
+                    filename: "statement.pdf",
+                    mimeType: "application/pdf",
+                    extractedText: "PDF text includes DDV.")
+            ]));
+
+        var textResults = database.SearchMessages(new(
+            Query: "DDV",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 10,
+            SnippetChars: 1024,
+            MimeTypes: ["application/pdf"]));
+        var browseResults = database.SearchMessages(new(
+            Query: "",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            Limit: 10,
+            SnippetChars: 1024,
+            MimeTypes: ["application/pdf"]));
+
+        var textResult = Assert.Single(textResults);
+        var browseResult = Assert.Single(browseResults);
+        Assert.Equal(messageIds[1], textResult.MessageId);
+        Assert.Equal(messageIds[1], browseResult.MessageId);
+        Assert.Equal("statement.pdf", Assert.Single(textResult.MatchingAttachments).Attachment.DisplayPath);
+        Assert.Equal("statement.pdf", Assert.Single(browseResult.MatchingAttachments).Attachment.DisplayPath);
+    }
+
+    [Fact]
+    public void AttachmentReadinessIsSeparateFromMessageReadiness()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:pending-attachment",
+                messageIdHeader: "pending-attachment@example.com",
+                hasAttachments: true)
+        ], SyncStateJson(matchedCount: 1, selectedCount: 1, fetchedCount: 1), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+        var stored = new AttachmentObjectStore(temp.Paths).Store(Encoding.UTF8.GetBytes("pending bytes"));
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Body is indexed.",
+            HtmlText: null,
+            NormalizedText: "Body is indexed.",
+            Recipients: [],
+            Attachments: [
+                Attachment(
+                    stored,
+                    filename: "pending.pdf",
+                    mimeType: "application/pdf",
+                    extractedText: null,
+                    extractionStatus: "pending")
+            ]));
+
+        var messageOnly = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null));
+        var withAttachments = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            IncludeAttachments: true));
+
+        Assert.True(messageOnly.SearchReady);
+        Assert.True(messageOnly.MessageSearchIndexComplete);
+        Assert.False(withAttachments.SearchReady);
+        Assert.False(withAttachments.AttachmentSearchIndexComplete);
+        Assert.Equal(1, withAttachments.PendingAttachments);
+    }
+
+    [Fact]
     public void SearchMessagesSupportsRecipientDateFiltersAndCursorPaging()
     {
         using var temp = TempWorkspace.Create();
@@ -1228,6 +1356,36 @@ public sealed class EmailDatabaseTests
         connection.Open();
         return connection;
     }
+
+    private static AttachmentContent Attachment(
+        StoredAttachmentObject stored,
+        string filename,
+        string mimeType,
+        string extractedText,
+        string extractionStatus = "done") =>
+        new(
+            SourceKind: "email_part",
+            PartId: "2",
+            Filename: filename,
+            DisplayPath: filename,
+            ArchiveEntryPath: null,
+            MimeType: mimeType,
+            SniffedMimeType: mimeType,
+            SizeBytes: stored.SizeBytes,
+            CompressedSizeBytes: null,
+            UncompressedSizeBytes: stored.SizeBytes,
+            ContentHash: stored.ContentHash,
+            StorageKey: stored.StorageKey,
+            IsContainer: false,
+            NestingDepth: 0,
+            DownloadStatus: "stored",
+            DownloadError: null,
+            ExtractionStatus: extractionStatus,
+            ExtractionError: null,
+            ExtractedText: extractedText,
+            OcrText: null,
+            Extractor: extractedText is null ? null : "fixture",
+            Children: []);
 
     private static string SyncStateJson(
         int sinceDays = 30,
