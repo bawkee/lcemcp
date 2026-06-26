@@ -2,6 +2,8 @@
 
 This file is the project working memory as a dev log appendix to the far more important `SPEC.md` which is the initial app's dev specification. Keep it in sensible implementation order, and add context here when a test result or decision is not already captured in `spec.md`.
 
+**IMPORTANT NOTE:** Don't worry about backward compatibility, this app has not been released anywhere yet. I am the only user of this app right now. If my local db that I use for myself has to be scrambled/recreated for a change to be applied without some major backward-compat hackery, just ask me for permission.
+
 ## 1. Close The Yahoo IMAP Probe Slice
 
 The first live Yahoo account probe succeeded on 2026-06-17 using `imap.mail.yahoo.com:993` with SSL and an app password stored in Windows Credential Manager.
@@ -373,7 +375,7 @@ Known deferred or acceptable for MVP:
 
 ## 8. Attachment Metadata And Text Extraction
 
-This is the next major milestone. Goal: make invoice and business-document search work across email bodies and document attachments without exposing raw attachment downloads by default.
+This is the next major milestone. Goal: make invoice and business-document search work across email bodies and document attachments while keeping raw bytes, internal storage paths, and arbitrary-path exports out of the default MCP surface.
 
 Spec coverage check on 2026-06-25:
 
@@ -381,15 +383,27 @@ Spec coverage check on 2026-06-25:
 - Preferred extraction path in the spec is PdfPig first for embedded PDF text, optional Poppler/pdftotext fallback, Open XML SDK or `DocumentFormat.OpenXml` for DOCX, and simple built-in parsers for TXT/HTML/CSV.
 - Scope decision on 2026-06-25: pull XLSX into this milestone with PDF, DOCX, TXT, HTML, and CSV because invoices and operational documents often arrive as spreadsheets. `SPEC.md` currently lists XLSX later than PDF/DOCX, so this TODO intentionally promotes XLSX. Scanned-PDF OCR is absolutely in scope for the broader attachment work, but tracked as a separate ticket below because it needs heavier dependency and runtime decisions.
 
+Spec update on 2026-06-26:
+
+- Tightened the attachment model for generic document search rather than only flat PDF extraction. Attachment rows are now specified as a tree: top-level email MIME parts, archive/container rows, and recursively discovered child files all use stable local attachment IDs.
+- Added explicit archive/nesting fields to the spec: `parent_attachment_id`, `root_attachment_id`, `source_kind`, `display_path`, `archive_entry_path`, `sniffed_mime_type`, compressed/uncompressed sizes, `is_container`, `nesting_depth`, and internal `storage_key`.
+- Decided not to store original attachment binaries as SQLite BLOBs by default. SQLite remains the authority for metadata and status, while binaries live in a managed content-addressed attachment object store.
+- Added archive-processing requirements: ZIP in this milestone, 7z where practical, recursive expansion into child attachment rows, safety limits for depth/entries/sizes/compression ratio/timeouts, path traversal rejection, encrypted/too-large/unsupported statuses, and DOCX/XLSX treated as terminal Open XML documents before generic archive expansion.
+- Added `display_path` to attachment search documents/FTS so filenames inside archives are searchable and show up naturally as paths such as `statements.zip!/2026-06/statement.pdf`.
+- Added `email_prepare_attachment_access` to the spec for user-facing attachment links/exports. This tool prepares scoped localhost URLs or app-managed export files for specific known attachment IDs. It must not return raw bytes/base64, internal storage paths, arbitrary filesystem access, or accept caller-supplied output paths.
+- Added separate permission semantics: scoped attachment access links are read-only and may default on as user convenience, while raw attachment export remains disabled by default.
+
 Next work:
 
-- Add schema/migration support for `attachments`, `attachment_text`, `attachment_search_docs`, and `attachments_fts`, preserving the existing safety posture that raw attachment export is not exposed by default.
-- Persist attachment metadata during body sync/MIME processing: parent message, part id, filename, MIME type, size, content hash when available, storage/download status, extraction status, and errors/attempt counts.
-- Add a conservative attachment download/extraction policy for searchable document types and size limits.
-- Implement text extraction for embedded-text PDF, DOCX, XLSX, TXT, HTML, and CSV; mark unsupported, encrypted, too-large, empty, and failed cases explicitly.
-- Index extracted text into attachment FTS and integrate `email_search` with `search_in`, `mime_types`, `filename_contains`, nested matching attachment hits, snippets, and hit counts where practical.
-- Expose bounded reads through `email_get_attachment_text` and include attachment metadata in message reads/search results, while still keeping raw attachment downloads out of the default MCP surface.
-- Add focused tests as part of the feature: migrations, metadata upsert idempotence, extractor fixtures, FTS indexing/stale cleanup, MCP/CLI contract shape, readiness/partial behavior, and safety limits.
+- Add schema/migration support for recursive `attachments`, `attachment_text`, `attachment_search_docs`, and `attachments_fts`, preserving the safety posture that raw bytes/arbitrary filesystem access are not exposed through MCP.
+- Add managed attachment object storage: content-addressed binaries on disk, internal storage keys in SQLite, hash-based dedupe, temp-file writes plus atomic moves, and cleanup rules for stale temp/export files.
+- Persist attachment metadata during body sync/MIME processing: parent message, parent/root attachment links, part id, source kind, display path, filename, declared/sniffed MIME type, size/compressed/uncompressed size, content hash when available, storage/download status, extraction status, and errors/attempt counts.
+- Add a conservative attachment download/extraction policy for searchable document types, archive containers, and size/depth limits.
+- Implement an extractor registry for embedded-text PDF, DOCX, XLSX, TXT, HTML, CSV, ZIP, and 7z where practical. Container extractors should create child attachment rows; terminal document extractors should write extracted text. Mark unsupported, encrypted, too-large, empty, skipped, and failed cases explicitly.
+- Index extracted text and attachment metadata into attachment FTS, including archive `display_path`, and integrate `email_search` with `search_in`, `mime_types`, `filename_contains`, nested matching attachment hits, attachment previews for filter-only searches, snippets, and hit counts where practical.
+- Expose bounded reads through `email_get_attachment_text` and include attachment metadata/tree fields in message reads/search results.
+- Add `email_prepare_attachment_access` for user-facing access to attachment binaries: scoped localhost URLs when available or sanitized files in an app-managed export directory. Support child archive entries as first-class downloadable attachments when their binaries are stored. Audit every access-preparation call and do not return raw bytes, internal object-store paths, or arbitrary caller-chosen paths.
+- Add focused tests as part of the feature: migrations, metadata upsert idempotence, content-addressed storage, archive tree expansion, zip-slip/zip-bomb/limit handling, extractor fixtures, FTS indexing/stale cleanup, MCP/CLI contract shape, readiness/partial behavior, access-link/export behavior, permission failures, and safety limits.
 
 ## 9. Scanned PDF OCR Extraction
 

@@ -109,7 +109,7 @@ Do not implement these in v1:
 - Autonomous unsubscribe.
 - Raw SQL exposed to AI clients.
 - Raw filesystem access exposed to AI clients.
-- Raw attachment file download by default.
+- Raw attachment bytes, bulk export, or arbitrary-path attachment download by default.
 - Embeddings/vector DB as the primary search mechanism.
 - Thunderbird profile parsing as the primary backend.
 - Full OCR pipeline as a required dependency.
@@ -482,10 +482,14 @@ Default Windows data directory:
   config.toml
   email.db
   attachments\
-    <account_id>\
-      <message_id>\
-        original\
-        extracted\
+    objects\
+      sha256\
+        ab\
+          cd\
+            abcdef...   # original or extracted binary, content-addressed
+    exports\
+      <access_token_or_run_id>\
+        invoice.pdf     # optional user-facing copies/links
   logs\
     audit.log
     sync.log
@@ -509,6 +513,10 @@ Future profile support:
 ```
 
 Do not expose this filesystem layout directly through MCP tools.
+
+SQLite should store attachment metadata, extraction state, content hashes, and storage keys. Original attachment binaries should not be stored as SQLite BLOBs by default. Keep them in the app-managed attachment store so large files can be streamed, deduplicated by hash, cleaned up independently, and served/exported without bloating the database.
+
+`storage_key` values are internal app keys relative to the managed attachment store, not caller-controlled paths. MCP tools must not return internal storage keys or paths directly. User-facing access should be prepared through a bounded access/export tool that returns scoped local links or managed export paths.
 
 ---
 
@@ -700,12 +708,22 @@ CREATE TABLE message_recipients (
 CREATE TABLE attachments (
     id INTEGER PRIMARY KEY,
     message_id INTEGER NOT NULL,
+    parent_attachment_id INTEGER,
+    root_attachment_id INTEGER,
+    source_kind TEXT NOT NULL DEFAULT 'email_part',
     part_id TEXT,
     filename TEXT,
+    display_path TEXT,
+    archive_entry_path TEXT,
     mime_type TEXT,
+    sniffed_mime_type TEXT,
     size_bytes INTEGER,
+    compressed_size_bytes INTEGER,
+    uncompressed_size_bytes INTEGER,
     content_hash TEXT,
-    storage_path TEXT,
+    storage_key TEXT,
+    is_container INTEGER NOT NULL DEFAULT 0,
+    nesting_depth INTEGER NOT NULL DEFAULT 0,
     download_status TEXT NOT NULL DEFAULT 'not_downloaded',
     download_attempts INTEGER NOT NULL DEFAULT 0,
     download_error TEXT,
@@ -718,15 +736,40 @@ CREATE TABLE attachments (
     ocr_text_available INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    FOREIGN KEY(message_id) REFERENCES messages(id)
+    FOREIGN KEY(message_id) REFERENCES messages(id),
+    FOREIGN KEY(parent_attachment_id) REFERENCES attachments(id),
+    FOREIGN KEY(root_attachment_id) REFERENCES attachments(id)
 );
 
 CREATE INDEX idx_attachments_message ON attachments(message_id);
+CREATE INDEX idx_attachments_parent ON attachments(parent_attachment_id);
+CREATE INDEX idx_attachments_root ON attachments(root_attachment_id);
 CREATE INDEX idx_attachments_hash ON attachments(content_hash);
+CREATE INDEX idx_attachments_display_path ON attachments(message_id, display_path);
 CREATE INDEX idx_attachments_extraction_status ON attachments(extraction_status, extraction_lease_until);
 ```
 
 Use status strings rather than a generic jobs table in v1. On startup, reset stale `running` extraction rows whose lease expired.
+
+Attachment rows are a document tree:
+
+- Top-level email MIME parts use `source_kind = email_part`, no parent, and a `part_id`.
+- Files discovered inside archives use `source_kind = archive_entry`, point to `parent_attachment_id`, inherit `message_id`, and set `archive_entry_path`.
+- `display_path` is the user/LLM-facing path, for example `invoice.pdf` or `bundle.zip!/invoices/openai.pdf`.
+- `root_attachment_id` points at the top-level email attachment when practical. It may be null during insertion and backfilled after the root row exists.
+- `is_container = 1` means the attachment can contain child documents, such as ZIP or 7z.
+- `nesting_depth` starts at 0 for top-level email parts and increments for archive children.
+- `mime_type` is provider/MIME-declared; `sniffed_mime_type` is the app's best-effort type from file signatures/content.
+- `storage_key` is an internal key into the managed attachment object store, not a raw path exposed to MCP clients.
+
+Use one row for every searchable or user-accessible binary. A ZIP attachment gets its own row, and each supported file inside it gets a child row. DOCX and XLSX are ZIP-based internally, but they are terminal document formats for this model; do not expose their internal Open XML package files as child attachments except in debug tooling.
+
+Recommended status values:
+
+```text
+download_status: not_downloaded | stored | skipped | failed
+extraction_status: not_ready | pending | running | done | empty | unsupported | encrypted | too_large | failed | skipped
+```
 
 ### 11.8 attachment_text
 
@@ -916,6 +959,7 @@ Index content:
 CREATE TABLE attachment_search_docs (
     attachment_id INTEGER PRIMARY KEY,
     filename TEXT,
+    display_path TEXT,
     mime_type TEXT,
     extracted_text TEXT,
     FOREIGN KEY(attachment_id) REFERENCES attachments(id)
@@ -923,6 +967,7 @@ CREATE TABLE attachment_search_docs (
 
 CREATE VIRTUAL TABLE attachments_fts USING fts5(
     filename,
+    display_path,
     mime_type,
     extracted_text,
     content='attachment_search_docs',
@@ -934,6 +979,7 @@ CREATE VIRTUAL TABLE attachments_fts USING fts5(
 Index content:
 
 - Filename.
+- Display path, including archive paths such as `bundle.zip!/invoice.pdf`.
 - MIME type.
 - Extracted PDF/document text.
 - OCR text when available.
@@ -1130,6 +1176,10 @@ download_small_attachments
 
 with configurable limit, e.g. 25 MB.
 
+Attachment download policy controls whether the app stores original attachment binaries for extraction and later user access. It should not mean "return raw bytes to the MCP client." Binaries are stored in the managed attachment object store, with SQLite as the authority for metadata and status.
+
+Container attachments, such as ZIP and 7z, should follow the same policy as other attachments. If a container is downloaded and within safety limits, the extraction worker may expand it into child attachment rows and store supported child binaries in the same managed object store.
+
 ### 14.2 Initial Sync
 
 Initial sync should happen in phases:
@@ -1143,9 +1193,10 @@ Initial sync should happen in phases:
 6. Build/update message search documents and FTS.
 7. Download attachment metadata.
 8. Download attachments according to policy.
-9. Extract text from attachments.
-10. OCR images/scanned PDFs if enabled.
-11. Build/update attachment search documents and FTS.
+9. Expand supported archive/container attachments into child attachment rows.
+10. Extract text from attachments and supported child documents.
+11. OCR images/scanned PDFs if enabled.
+12. Build/update attachment search documents and FTS.
 ```
 
 This allows useful search before all attachments are processed.
@@ -1331,6 +1382,18 @@ commit DB state and atomic file moves carefully
 on startup, reset expired running rows back to pending
 ```
 
+For archive/container extraction:
+
+```text
+create child attachment rows idempotently from the parent attachment row
+preserve archive entry filenames through display_path and archive_entry_path
+sanitize entry paths and reject path traversal
+enforce depth, entry count, per-entry size, total uncompressed size, compression-ratio, and timeout limits
+mark encrypted, too-large, unsupported, and failed entries explicitly
+write child binaries through the same content-addressed object store
+do not expose archive extraction temp paths through MCP
+```
+
 If a generic work queue is added later, it must have leases, attempts, heartbeats, retry limits, and startup recovery. Do not create fire-and-forget work records that can be abandoned forever after a crash.
 
 ### 14.5 Provider Quirks
@@ -1386,6 +1449,9 @@ TXT
 HTML
 CSV
 DOCX
+XLSX
+ZIP archive expansion
+7z archive expansion where practical
 ```
 
 Milestone 3 or later:
@@ -1396,7 +1462,7 @@ JPG/JPEG
 WEBP
 TIFF
 scanned PDF OCR
-XLSX
+RAR and other archive formats if there is a safe, maintained local extractor
 ```
 
 ### 15.2 PDF Processing
@@ -1433,6 +1499,38 @@ For image attachments:
 
 OCR should be disabled or optional by default until the rest of the system is reliable.
 
+### 15.4 Archive and Nested Document Processing
+
+Archive processing should feed the same attachment, extraction, readiness, search, snippet, and user-access paths as top-level attachments.
+
+For each supported archive/container:
+
+```text
+1. Store or verify the parent container binary according to attachment policy.
+2. Open the container with bounded limits and a timeout.
+3. Enumerate entries without trusting entry paths.
+4. Create one child attachment row per supported file entry.
+5. Store child binaries in the managed object store when policy and limits allow.
+6. Recurse into supported nested containers until max depth or another safety limit is reached.
+7. Run the normal extractor registry for terminal child documents.
+8. Update attachment search documents and FTS for every extracted child.
+```
+
+Safety limits should be explicit config values with conservative defaults:
+
+```text
+max_archive_depth
+max_archive_entries
+max_archive_entry_mb
+max_archive_total_uncompressed_mb
+max_archive_compression_ratio
+archive_extraction_timeout_seconds
+```
+
+Archive entries must never write directly to caller-controlled paths. Normalize separators, reject absolute paths and `..` traversal, preserve the original entry name for display, and expose a safe `display_path` such as `statements.zip!/2026-06/statement.pdf`.
+
+DOCX and XLSX are Open XML documents and should be handled by document extractors before generic archive expansion. Their internal ZIP entries are implementation detail, not user-facing child attachments.
+
 ---
 
 ## 16. MCP Tool Design
@@ -1458,6 +1556,7 @@ email_search
 email_get_message
 email_get_thread
 email_get_attachment_text
+email_prepare_attachment_access
 email_sync_now
 email_get_sync_status
 email_get_audit_events
@@ -1775,6 +1874,7 @@ Input:
   "folder_roles": ["inbox", "sent", "archive", "all_mail"],
   "mime_types": ["application/pdf"],
   "filename_contains": null,
+  "include_attachment_metadata": true,
   "include_hit_counts": true,
   "snippet_chars": 1024,
   "max_snippets_per_message": 5,
@@ -1821,7 +1921,13 @@ Output:
         {
           "attachment_id": 987,
           "filename": "statement.pdf",
+          "display_path": "statements.zip!/statement.pdf",
           "mime_type": "application/pdf",
+          "size_bytes": 240120,
+          "source_kind": "archive_entry",
+          "parent_attachment_id": 456,
+          "extracted_text_available": true,
+          "access_preparable": true,
           "hit_count": 4,
           "snippets": [
             {
@@ -1853,6 +1959,12 @@ Output:
 ```
 
 The result shape should stay message-centric even when searching attachments only. Attachment-only searches should return the parent message with matching attachment hits populated.
+
+`matching_attachments` should include attachments that matched attachment text, filename, MIME type, or attachment-only filter criteria. In filter-only mode, for example `has_attachment = true` or `filename_contains = "statement"`, return bounded attachment metadata even when there are no text snippets. If the query only filters by `has_attachment = true`, return a compact attachment preview up to `max_attachment_hits_per_message` so the agent can inspect filenames without fetching the full message.
+
+For archive children, return the child attachment ID and `display_path`. The parent archive may also be returned when it matched by filename or text, but child document hits should not be hidden behind the archive row.
+
+Search does not need to create downloadable links as a side effect. It should return `access_preparable = true` when the original binary or child binary can be prepared for user access through `email_prepare_attachment_access`.
 
 `email_search` readiness and freshness are separate. `search_ready = true` means the local index is complete for the requested searchable scope. It does not mean the local cache reflects the provider at response time. Every search response should include `freshness` so LLM clients can decide whether the cached view is current enough for the user's question. For multi-folder or multi-account scopes, `search_scope_as_of` is the oldest successful sync timestamp among the scoped folders; `last_sync_performed_at` is the newest. A query about a fully historical range may tolerate an older `search_scope_as_of`, while a query about "today", "this week", or other current mail usually should sync when `requested_range_extends_beyond_cache` is true.
 
@@ -1948,9 +2060,15 @@ Output:
       {
         "attachment_id": 987,
         "filename": "statement.pdf",
+        "display_path": "statements.zip!/statement.pdf",
         "mime_type": "application/pdf",
         "size_bytes": 240120,
-        "extracted_text_available": true
+        "source_kind": "archive_entry",
+        "parent_attachment_id": 456,
+        "is_container": false,
+        "extraction_status": "done",
+        "extracted_text_available": true,
+        "access_preparable": true
       }
     ]
   }
@@ -2024,7 +2142,10 @@ Output:
     "attachment_id": 987,
     "message_id": 123,
     "filename": "statement.pdf",
+    "display_path": "statements.zip!/statement.pdf",
     "mime_type": "application/pdf",
+    "source_kind": "archive_entry",
+    "parent_attachment_id": 456,
     "extracted_text": "Statement text...",
     "ocr_text": null,
     "combined_text_truncated": false,
@@ -2034,9 +2155,78 @@ Output:
 }
 ```
 
-If raw attachment access is ever added, make it a separate disabled-by-default dangerous capability.
+### 16.11 email_prepare_attachment_access
 
-### 16.11 email_sync_now
+Prepare user-facing access links or managed export files for known attachment IDs.
+
+This tool is for user convenience, not for LLM binary inspection. It must not return raw bytes, base64 content, arbitrary filesystem access, or internal attachment-store paths. It may return scoped localhost URLs when the local admin/access server is available, or sanitized files copied into an app-managed export directory.
+
+Input:
+
+```json
+{
+  "attachment_ids": [987, 988],
+  "access_kind": "auto",
+  "expires_minutes": 60
+}
+```
+
+`access_kind` values:
+
+```text
+auto
+localhost_url
+managed_export_file
+```
+
+Output:
+
+```json
+{
+  "attachments": [
+    {
+      "attachment_id": 987,
+      "message_id": 123,
+      "filename": "openai-invoice.pdf",
+      "display_path": "invoices.zip!/openai-invoice.pdf",
+      "mime_type": "application/pdf",
+      "size_bytes": 240120,
+      "access": {
+        "kind": "localhost_url",
+        "url": "http://127.0.0.1:8765/attachments/tokens/abc123/openai-invoice.pdf",
+        "expires_at": "2026-06-26T15:30:00Z"
+      }
+    }
+  ]
+}
+```
+
+If localhost access is not available, a managed export-file response is acceptable:
+
+```json
+{
+  "access": {
+    "kind": "managed_export_file",
+    "path": "C:\\Users\\User\\AppData\\Local\\LceMcp\\attachments\\exports\\abc123\\openai-invoice.pdf",
+    "expires_at": null
+  }
+}
+```
+
+Rules:
+
+- Accept only stable local `attachment_id` values already present in SQLite.
+- Never accept caller-supplied output paths.
+- Sanitize filenames, avoid collisions, and preserve extensions where safe.
+- Scope localhost tokens to specific attachment IDs and short expirations.
+- Audit every prepared access event with attachment IDs.
+- For archive children, prepare the child file itself when stored; otherwise return a clear status explaining whether the parent archive must be downloaded/extracted first.
+- If the original binary is not stored yet and policy allows on-demand download, the tool may queue or perform bounded download/extraction work and return a pending/not-ready result.
+- If access-link permission is disabled, fail clearly rather than returning storage paths.
+
+Raw attachment export remains a separate dangerous capability. It would mean returning raw bytes/base64 through MCP, bulk exporting without specific attachment IDs, or writing to arbitrary caller-supplied paths. Keep that disabled by default.
+
+### 16.12 email_sync_now
 
 Manually trigger sync.
 
@@ -2115,7 +2305,7 @@ For long-running sync, return a run/status ID rather than blocking indefinitely 
 
 `email_sync_now` should bring the requested corpus to search-ready state. For message search this means metadata, bodies, search docs, and FTS rows are complete for the requested or default history window, after automatic gap expansion. Attachment extraction may remain a separate phase unless the request explicitly includes attachment search readiness.
 
-### 16.12 email_get_sync_status
+### 16.13 email_get_sync_status
 
 Return account/folder sync state.
 
@@ -2180,7 +2370,7 @@ Output:
 
 `email_get_sync_status` is the authoritative readiness endpoint for LLM clients. It must make the distinction between synced and not synced visible without requiring the model to infer it from raw counts.
 
-### 16.13 email_get_audit_events
+### 16.14 email_get_audit_events
 
 Return recent audit log entries.
 
@@ -2212,7 +2402,7 @@ Output:
 }
 ```
 
-### 16.14 Future Draft Tools
+### 16.15 Future Draft Tools
 
 These are not v1.
 
@@ -2307,6 +2497,7 @@ allow_delete = false
 allow_move = false
 allow_unsubscribe = false
 allow_bulk_actions = false
+allow_attachment_access_links = true
 allow_raw_attachment_export = false
 ```
 
@@ -2322,8 +2513,11 @@ archive
 bulk label/folder changes
 unsubscribe
 forward
-download raw attachment file
+raw/bulk attachment export
+arbitrary-path attachment download
 ```
+
+Scoped, app-managed attachment access links are read-only user convenience. They should still be bounded and audited, but they are not the same as raw attachment export because they require specific known attachment IDs and do not return bytes or accept arbitrary output paths.
 
 For sending:
 
@@ -2548,9 +2742,11 @@ Deliver:
 
 ```text
 - Attachment metadata sync.
-- Attachment download policy.
+- Attachment download policy and managed file-backed binary store.
+- Recursive attachment/document tree for archive children.
 - PDF embedded text extraction.
-- TXT/HTML/CSV/DOCX text extraction where practical.
+- TXT/HTML/CSV/DOCX/XLSX text extraction where practical.
+- ZIP/7z archive expansion with bounded safety limits.
 - attachment_search_docs and attachments_fts index.
 - `email_search` supports `search_in = ["attachments"]`.
 - `email_search` supports `search_in = ["messages", "attachments"]`.
@@ -2558,6 +2754,7 @@ Deliver:
 - `email_search` returns message/attachment hit counts when practical.
 - MCP tool:
   - email_get_attachment_text
+  - email_prepare_attachment_access
 ```
 
 Do not require OCR yet.
@@ -2636,6 +2833,12 @@ history_days = 90
 periodic_sync_minutes = 10
 download_attachments = "small"
 max_attachment_mb = 25
+max_archive_depth = 3
+max_archive_entries = 500
+max_archive_entry_mb = 25
+max_archive_total_uncompressed_mb = 250
+max_archive_compression_ratio = 100
+archive_extraction_timeout_seconds = 60
 ocr_enabled = false
 
 [search]
@@ -2655,6 +2858,7 @@ allow_delete = false
 allow_move = false
 allow_unsubscribe = false
 allow_bulk_actions = false
+allow_attachment_access_links = true
 allow_raw_attachment_export = false
 
 [security]
