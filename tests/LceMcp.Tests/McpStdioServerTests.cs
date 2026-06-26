@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using System.Text;
 using System.Text.Json.Nodes;
 
 namespace LceMcp.Tests;
@@ -41,6 +42,8 @@ public sealed class McpStdioServerTests
         Assert.Contains("email_set_folder_sync", toolNames);
         Assert.Contains("email_search", toolNames);
         Assert.Contains("email_get_message", toolNames);
+        Assert.Contains("email_get_attachment_text", toolNames);
+        Assert.Contains("email_prepare_attachment_access", toolNames);
         Assert.Contains("email_sync_now", toolNames);
         Assert.Contains("email_get_sync_status", toolNames);
         Assert.Contains("does not delete cached messages", setFolderSyncTool["description"].GetValue<string>());
@@ -155,6 +158,97 @@ public sealed class McpStdioServerTests
         Assert.Contains("refund processed", message["body_text"].GetValue<string>(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains($"email_search|status=ready results=1 has_more=false|{messageId}", auditRows);
         Assert.Contains($"email_get_message|status=ok message=1|{messageId}", auditRows);
+    }
+
+    [Fact]
+    public async Task EmailAttachmentToolsReadTextPrepareAccessAndWriteAuditLog()
+    {
+        using var temp = TempWorkspace.Create();
+        var account = TestData.Account();
+        var configStore = new ConfigStore(temp.Paths);
+        var config = new AppConfig();
+        config.UpsertAccount(account);
+        configStore.Save(config);
+
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(account);
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:mcp-attachment",
+                messageIdHeader: "mcp-attachment@example.com",
+                subject: "Attachment tools",
+                hasAttachments: true)
+        ], SyncStateJson(matchedCount: 1, selectedCount: 1, fetchedCount: 1), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+        var stored = new AttachmentObjectStore(temp.Paths).Store(Encoding.UTF8.GetBytes("statement bytes"));
+
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Statement attached.",
+            HtmlText: null,
+            NormalizedText: "Statement attached.",
+            Recipients: [],
+            Attachments: [
+                new(
+                    SourceKind: "email_part",
+                    PartId: "2",
+                    Filename: "statement.txt",
+                    DisplayPath: "statement.txt",
+                    ArchiveEntryPath: null,
+                    MimeType: "text/plain",
+                    SniffedMimeType: "text/plain",
+                    SizeBytes: stored.SizeBytes,
+                    CompressedSizeBytes: null,
+                    UncompressedSizeBytes: stored.SizeBytes,
+                    ContentHash: stored.ContentHash,
+                    StorageKey: stored.StorageKey,
+                    IsContainer: false,
+                    NestingDepth: 0,
+                    DownloadStatus: "stored",
+                    DownloadError: null,
+                    ExtractionStatus: "done",
+                    ExtractionError: null,
+                    ExtractedText: "Statement text mentions DDV.",
+                    OcrText: null,
+                    Extractor: "text",
+                    Children: [])
+            ]));
+        var attachmentId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM attachments;").Single();
+
+        var output = new StringWriter();
+        var error = new StringWriter();
+        var inputText = """
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_get_attachment_text","arguments":{"attachment_id":__ATTACHMENT_ID__,"max_chars":500}}}
+            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"email_prepare_attachment_access","arguments":{"attachment_ids":[__ATTACHMENT_ID__],"access_kind":"managed_export_file"}}}
+            """.Replace("__ATTACHMENT_ID__", attachmentId.ToString());
+        var input = new StringReader(inputText);
+        var server = new McpStdioServer(configStore, database, input, output, error);
+
+        await server.RunAsync(CancellationToken.None);
+
+        var lines = OutputLines(output);
+        var textPayload = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
+        var accessPayload = JsonNode.Parse(lines[2]).AsObject()["result"]["structuredContent"].AsObject();
+        var access = accessPayload["attachments"].AsArray()[0]["access"].AsObject();
+        var auditRows = ReadStrings(
+            temp.Paths.DatabasePath,
+            "SELECT tool_name || '|' || result_summary || '|' || COALESCE(affected_message_ids, '') || '|' || COALESCE(affected_attachment_ids, '') FROM audit_log ORDER BY id;");
+
+        Assert.Equal("ok", textPayload["status"].GetValue<string>());
+        Assert.Contains("DDV", textPayload["attachment"]["combined_text"].GetValue<string>(), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("ok", accessPayload["status"].GetValue<string>());
+        Assert.Equal("managed_export_file", access["kind"].GetValue<string>());
+        Assert.True(File.Exists(access["path"].GetValue<string>()));
+        Assert.Contains($"email_get_attachment_text|status=ok attachment=1|{messageId}|{attachmentId}", auditRows);
+        Assert.Contains($"email_prepare_attachment_access|prepared=1 failed=0|{messageId}|{attachmentId}", auditRows);
     }
 
     [Fact]

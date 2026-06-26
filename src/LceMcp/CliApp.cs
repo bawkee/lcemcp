@@ -144,6 +144,9 @@ internal static class CliApp
         Console.WriteLine($"Database message locations: {databaseStatus.MessageLocationCount}");
         Console.WriteLine($"Database message bodies: {databaseStatus.MessageBodyCount}");
         Console.WriteLine($"Database message search docs: {databaseStatus.MessageSearchDocCount}");
+        Console.WriteLine($"Database attachments: {databaseStatus.AttachmentCount}");
+        Console.WriteLine($"Database attachment texts: {databaseStatus.AttachmentTextCount}");
+        Console.WriteLine($"Database attachment search docs: {databaseStatus.AttachmentSearchDocCount}");
         Console.WriteLine($"Last sync state: {FormatSyncState(databaseStatus.LastSyncState)}");
         PrintMessageSearchReadiness(database.GetMessageSearchReadiness(new(
             AccountFilters: [],
@@ -641,7 +644,12 @@ internal static class CliApp
             ToEmail: options.Get("--to"),
             DateFrom: dateFrom,
             DateTo: dateTo,
-            Cursor: options.Get("--cursor"));
+            Cursor: options.Get("--cursor"),
+            SearchIn: SplitOption(options.Get("--search-in")),
+            MimeTypes: SplitOption(options.Get("--mime-type")),
+            FilenameContains: options.Get("--filename-contains"),
+            IncludeAttachmentMetadata: !options.Has("--no-attachment-metadata"),
+            MaxAttachmentHitsPerMessage: options.GetInt("--max-attachment-hits-per-message", 5));
 
         if (request.Limit < 1 || request.Limit > 100)
             throw new CliException("--limit must be between 1 and 100.", 2);
@@ -649,8 +657,18 @@ internal static class CliApp
         if (request.SnippetChars < 160 || request.SnippetChars > 4096)
             throw new CliException("--snippet-chars must be between 160 and 4096.", 2);
 
+        if (request.MaxAttachmentHitsPerMessage < 1 || request.MaxAttachmentHitsPerMessage > 20)
+            throw new CliException("--max-attachment-hits-per-message must be between 1 and 20.", 2);
+
+        foreach (var searchTarget in request.SearchIn ?? [])
+        {
+            if (!searchTarget.Equals("messages", StringComparison.OrdinalIgnoreCase)
+                && !searchTarget.Equals("attachments", StringComparison.OrdinalIgnoreCase))
+                throw new CliException("--search-in values must be messages or attachments.", 2);
+        }
+
         if (!request.IsBounded)
-            throw new CliException("Search requires --query or at least one filter such as --account, --from, --to, --date-from, --date-to, --folder-role, or --has-attachment.", 2);
+            throw new CliException("Search requires --query or at least one filter such as --account, --from, --to, --date-from, --date-to, --folder-role, --has-attachment, --mime-type, or --filename-contains.", 2);
 
         Console.WriteLine($"Database: {database.DatabasePath}");
 
@@ -666,7 +684,10 @@ internal static class CliApp
             HasAttachment: request.HasAttachment,
             ToEmail: request.ToEmail,
             DateFrom: request.DateFrom,
-            DateTo: request.DateTo));
+            DateTo: request.DateTo,
+            IncludeAttachments: request.SearchesAttachments,
+            MimeTypes: request.MimeTypes,
+            FilenameContains: request.FilenameContains));
 
         if (!readiness.SearchReady && !request.AllowPartial)
         {
@@ -1063,6 +1084,14 @@ internal static class CliApp
 
         if (!string.IsNullOrWhiteSpace(result.Snippet))
             Console.WriteLine($"snippet={result.Snippet}");
+
+        foreach (var match in result.MatchingAttachments ?? [])
+        {
+            var attachment = match.Attachment;
+            Console.WriteLine($"attachment_id={attachment.AttachmentId} path={attachment.DisplayPath} mime={FormatOptional(attachment.SniffedMimeType ?? attachment.MimeType)} extraction={attachment.ExtractionStatus} access_preparable={!string.IsNullOrWhiteSpace(attachment.StorageKey)}");
+            if (!string.IsNullOrWhiteSpace(match.Snippet))
+                Console.WriteLine($"attachment_snippet={match.Snippet}");
+        }
     }
 
     private static void PrintMessageSearchReadiness(MessageSearchReadiness readiness)
@@ -1075,6 +1104,10 @@ internal static class CliApp
             + $"metadata_folders={readiness.MetadataCompleteFolderCount}/{readiness.ScopeFolderCount} "
             + $"metadata_messages={readiness.MetadataMessages} indexed_bodies={readiness.IndexedMessageBodies} "
             + $"search_docs={readiness.MessageSearchDocs} fts_rows={readiness.FtsRows} pending_bodies={readiness.PendingMessageBodies}");
+        Console.WriteLine(
+            $"Attachment search scope: attachments={readiness.Attachments} "
+            + $"search_docs={readiness.AttachmentSearchDocs} fts_rows={readiness.AttachmentFtsRows} "
+            + $"pending={readiness.PendingAttachments} index={FormatBool(readiness.AttachmentSearchIndexComplete)}");
 
         if (!string.IsNullOrWhiteSpace(readiness.CoverageNote))
             Console.WriteLine($"Message search coverage: {readiness.CoverageNote}");
@@ -1356,6 +1389,11 @@ internal static class CliApp
           --date-to <date>         Optional inclusive upper date bound, YYYY-MM-DD or ISO timestamp.
           --folder-role <role>     Optional. Comma-separated roles, e.g. inbox,sent,archive.
           --has-attachment <bool>  Optional true/false metadata filter.
+          --search-in <targets>    Optional. Comma-separated messages,attachments. Default: messages.
+          --mime-type <types>      Optional. Comma-separated attachment MIME type filter.
+          --filename-contains <s>  Optional attachment display-path/filename substring filter.
+          --no-attachment-metadata Do not include attachment hit metadata in output.
+          --max-attachment-hits-per-message <n> Default: 5. Maximum 20.
           --limit <n>              Default: 20. Maximum 100.
           --cursor <cursor>        Opaque cursor printed by a prior search page.
           --snippet-chars <n>      Default: 1024. Range 160 to 4096.

@@ -7,13 +7,17 @@ internal sealed record MessageSearchReadinessRequest(
     bool? HasAttachment,
     string ToEmail = null,
     string DateFrom = null,
-    string DateTo = null);
+    string DateTo = null,
+    bool IncludeAttachments = false,
+    IReadOnlyList<string> MimeTypes = null,
+    string FilenameContains = null);
 
 internal sealed record MessageSearchReadiness(
     bool SearchReady,
     bool MetadataComplete,
     bool BodiesComplete,
     bool MessageSearchIndexComplete,
+    bool AttachmentSearchIndexComplete,
     int ScopeAccountCount,
     int ScopeFolderCount,
     int MetadataCompleteFolderCount,
@@ -22,6 +26,10 @@ internal sealed record MessageSearchReadiness(
     int MessageSearchDocs,
     int FtsRows,
     int PendingMessageBodies,
+    int Attachments,
+    int AttachmentSearchDocs,
+    int AttachmentFtsRows,
+    int PendingAttachments,
     SyncRunSnapshot ActiveSyncRun,
     string CoverageNote = null,
     SearchFreshness Freshness = null);

@@ -5,7 +5,8 @@ internal sealed record MessageBodyContent(
     string PlainText,
     string HtmlText,
     string NormalizedText,
-    IReadOnlyList<MessageRecipient> Recipients);
+    IReadOnlyList<MessageRecipient> Recipients,
+    IReadOnlyList<AttachmentContent> Attachments = null);
 
 internal sealed record MessageRecipient(
     string Type,
@@ -48,9 +49,23 @@ internal sealed record EmailSearchRequest(
     string ToEmail = null,
     string DateFrom = null,
     string DateTo = null,
-    string Cursor = null)
+    string Cursor = null,
+    IReadOnlyList<string> SearchIn = null,
+    IReadOnlyList<string> MimeTypes = null,
+    string FilenameContains = null,
+    bool IncludeAttachmentMetadata = true,
+    int MaxAttachmentHitsPerMessage = 5)
 {
     public bool HasTextQuery => !string.IsNullOrWhiteSpace(Query);
+
+    public bool SearchesMessages =>
+        !HasValues(SearchIn)
+        || SearchIn.Any(value => value.Equals("messages", StringComparison.OrdinalIgnoreCase));
+
+    public bool SearchesAttachments =>
+        SearchIn?.Any(value => value.Equals("attachments", StringComparison.OrdinalIgnoreCase)) == true
+        || HasValues(MimeTypes)
+        || !string.IsNullOrWhiteSpace(FilenameContains);
 
     public bool HasMetadataFilters =>
         HasValues(AccountFilters)
@@ -59,7 +74,9 @@ internal sealed record EmailSearchRequest(
         || HasAttachment.HasValue
         || !string.IsNullOrWhiteSpace(ToEmail)
         || !string.IsNullOrWhiteSpace(DateFrom)
-        || !string.IsNullOrWhiteSpace(DateTo);
+        || !string.IsNullOrWhiteSpace(DateTo)
+        || HasValues(MimeTypes)
+        || !string.IsNullOrWhiteSpace(FilenameContains);
 
     public bool IsBounded => HasTextQuery || HasMetadataFilters;
 
@@ -78,4 +95,5 @@ internal sealed record EmailSearchResult(
     bool HasAttachments,
     string Snippet,
     double Score,
-    string Cursor = null);
+    string Cursor = null,
+    IReadOnlyList<AttachmentSearchMatch> MatchingAttachments = null);

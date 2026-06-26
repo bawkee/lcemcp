@@ -257,6 +257,11 @@ internal sealed class McpStdioServer
                         ["date_to"] = NullableStringSchema("Optional inclusive upper date bound. Accepts YYYY-MM-DD or an ISO timestamp."),
                         ["folder_roles"] = StringArraySchema("Optional folder-role filter such as inbox, sent, archive, trash, or custom."),
                         ["has_attachment"] = NullableBoolSchema("Optional attachment metadata filter."),
+                        ["search_in"] = StringArraySchema("Optional search targets: messages, attachments, or both. Defaults to messages for backward-compatible message search."),
+                        ["mime_types"] = StringArraySchema("Optional attachment MIME type filters such as application/pdf or text/csv."),
+                        ["filename_contains"] = NullableStringSchema("Optional attachment filename/display-path substring filter."),
+                        ["include_attachment_metadata"] = BoolSchema("Include matching attachment metadata in results. Defaults to true.", defaultValue: true),
+                        ["max_attachment_hits_per_message"] = IntSchema("Maximum matching attachment hits per message, 1 to 20. Defaults to 5.", 1, 20, 5),
                         ["limit"] = IntSchema("Maximum result count, 1 to 100. Defaults to 20.", 1, 100, 20),
                         ["cursor"] = NullableStringSchema("Opaque cursor returned by a prior email_search response."),
                         ["snippet_chars"] = IntSchema("Approximate maximum snippet characters, 160 to 4096. Defaults to 1024.", 160, 4096, 1024),
@@ -277,6 +282,29 @@ internal sealed class McpStdioServer
                     }, "message_id"),
                     readOnly: true,
                     idempotent: true),
+                ToolDefinition(
+                    "email_get_attachment_text",
+                    "Email Attachment Text",
+                    "Fetch extracted local text for one known attachment_id. Returns bounded text and attachment metadata only; never returns raw bytes, base64, or internal storage paths.",
+                    ObjectSchema(new()
+                    {
+                        ["attachment_id"] = IntSchema("Stable local attachment id returned by email_search or email_get_message.", 1, int.MaxValue, null),
+                        ["max_chars"] = IntSchema("Maximum returned combined text characters, 500 to 100000. Defaults to 50000.", 500, 100000, 50000)
+                    }, "attachment_id"),
+                    readOnly: true,
+                    idempotent: true),
+                ToolDefinition(
+                    "email_prepare_attachment_access",
+                    "Email Attachment Access",
+                    "Prepare user-facing access for specific known attachment IDs. Returns app-managed export-file paths when binaries are stored; never returns raw bytes/base64, internal object-store paths, or caller-chosen output paths.",
+                    ObjectSchema(new()
+                    {
+                        ["attachment_ids"] = IntArraySchema("Required stable local attachment ids returned by email_search or email_get_message."),
+                        ["access_kind"] = NullableStringSchema("Optional. Supported values: auto or managed_export_file. localhost_url is not available in this build."),
+                        ["expires_minutes"] = IntSchema("Accepted for forward compatibility; managed export files currently do not expire automatically. Defaults to 60.", 1, 1440, 60)
+                    }, "attachment_ids"),
+                    readOnly: false,
+                    idempotent: false),
                 ToolDefinition(
                     "email_sync_now",
                     "Email Sync",
@@ -328,7 +356,8 @@ internal sealed class McpStdioServer
                 execution.ActionType,
                 execution.ArgumentsSummary,
                 execution.ResultSummary,
-                execution.AffectedMessageIds);
+                execution.AffectedMessageIds,
+                execution.AffectedAttachmentIds);
             return ToolResult(execution.Payload, execution.IsError);
         }
         catch (JsonRpcError)
@@ -357,6 +386,8 @@ internal sealed class McpStdioServer
             "email_set_folder_sync" => ExecuteSetFolderSync(arguments),
             "email_search" => ExecuteSearch(arguments),
             "email_get_message" => ExecuteGetMessage(arguments),
+            "email_get_attachment_text" => ExecuteGetAttachmentText(arguments),
+            "email_prepare_attachment_access" => ExecutePrepareAttachmentAccess(arguments),
             "email_sync_now" => ExecuteSyncNow(arguments, cancellationToken),
             "email_get_sync_status" => ExecuteGetSyncStatus(arguments),
             _ => throw new JsonRpcError(-32602, $"Unknown tool: {toolName}")
@@ -776,6 +807,11 @@ internal sealed class McpStdioServer
             "date_to",
             "folder_roles",
             "has_attachment",
+            "search_in",
+            "mime_types",
+            "filename_contains",
+            "include_attachment_metadata",
+            "max_attachment_hits_per_message",
             "limit",
             "cursor",
             "snippet_chars",
@@ -812,10 +848,22 @@ internal sealed class McpStdioServer
             ToEmail: ReadOptionalString(arguments, "to_email"),
             DateFrom: dateFrom,
             DateTo: dateTo,
-            Cursor: ReadOptionalString(arguments, "cursor"));
+            Cursor: ReadOptionalString(arguments, "cursor"),
+            SearchIn: ReadOptionalStringArray(arguments, "search_in"),
+            MimeTypes: ReadOptionalStringArray(arguments, "mime_types"),
+            FilenameContains: ReadOptionalString(arguments, "filename_contains"),
+            IncludeAttachmentMetadata: ReadOptionalBool(arguments, "include_attachment_metadata", defaultValue: true),
+            MaxAttachmentHitsPerMessage: ReadOptionalInt(arguments, "max_attachment_hits_per_message", defaultValue: 5, min: 1, max: 20));
 
         if (!request.IsBounded)
-            throw new JsonRpcError(-32602, "email_search requires query text or at least one bounded filter such as accounts, from_email, to_email, date_from, date_to, folder_roles, or has_attachment.");
+            throw new JsonRpcError(-32602, "email_search requires query text or at least one bounded filter such as accounts, from_email, to_email, date_from, date_to, folder_roles, has_attachment, mime_types, or filename_contains.");
+
+        foreach (var searchTarget in request.SearchIn ?? [])
+        {
+            if (!searchTarget.Equals("messages", StringComparison.OrdinalIgnoreCase)
+                && !searchTarget.Equals("attachments", StringComparison.OrdinalIgnoreCase))
+                throw new JsonRpcError(-32602, "email_search search_in values must be messages or attachments.");
+        }
 
         try
         {
@@ -859,7 +907,10 @@ internal sealed class McpStdioServer
             HasAttachment: request.HasAttachment,
             ToEmail: request.ToEmail,
             DateFrom: request.DateFrom,
-            DateTo: request.DateTo));
+            DateTo: request.DateTo,
+            IncludeAttachments: request.SearchesAttachments,
+            MimeTypes: request.MimeTypes,
+            FilenameContains: request.FilenameContains));
 
         if (!readiness.SearchReady && !request.AllowPartial)
         {
@@ -961,12 +1012,118 @@ internal sealed class McpStdioServer
                 ["body_available"] = message.BodyText is not null,
                 ["body_truncated"] = truncated,
                 ["has_attachments"] = message.HasAttachments,
-                ["attachments"] = includeAttachments ? new JsonArray() : null,
-                ["attachment_metadata_available"] = false
+                ["attachments"] = includeAttachments ? ToAttachmentsJson(message.Attachments) : null,
+                ["attachment_metadata_available"] = includeAttachments && message.Attachments.Count > 0
             }
         };
 
         return new(payload, "read", argumentsSummary, "status=ok message=1", [message.MessageId]);
+    }
+
+    private ToolExecution ExecuteGetAttachmentText(JsonElement arguments)
+    {
+        EnsureArgumentObject(arguments, "email_get_attachment_text");
+        ValidateAllowedArguments(arguments, "attachment_id", "max_chars", "_meta");
+
+        var attachmentId = ReadRequiredInt(arguments, "attachment_id", min: 1, max: int.MaxValue);
+        var maxChars = ReadOptionalInt(arguments, "max_chars", defaultValue: 50000, min: 500, max: 100000);
+        var text = _database.ReadAttachmentText(attachmentId);
+        var argumentsSummary = $"attachment_id={attachmentId}, max_chars={maxChars}";
+
+        if (text is null)
+        {
+            var notFound = new JsonObject
+            {
+                ["status"] = "not_found",
+                ["message"] = $"Attachment {attachmentId} is not available in local storage."
+            };
+
+            return new(notFound, "read", argumentsSummary, "status=not_found", AffectedAttachmentIds: [attachmentId], IsError: true);
+        }
+
+        var combinedText = text.CombinedText;
+        var truncated = combinedText is not null && combinedText.Length > maxChars;
+        if (truncated)
+            combinedText = combinedText[..maxChars];
+        var extractedText = TruncateText(text.ExtractedText, maxChars);
+        var ocrText = TruncateText(text.OcrText, maxChars);
+
+        var payload = new JsonObject
+        {
+            ["status"] = "ok",
+            ["attachment"] = new JsonObject
+            {
+                ["metadata"] = ToAttachmentMetadataJson(text.Attachment),
+                ["extracted_text"] = StringOrNull(extractedText),
+                ["ocr_text"] = StringOrNull(ocrText),
+                ["combined_text"] = StringOrNull(combinedText),
+                ["combined_text_available"] = text.CombinedText is not null,
+                ["combined_text_truncated"] = truncated,
+                ["extractor"] = StringOrNull(text.Extractor),
+                ["extracted_at"] = StringOrNull(text.ExtractedAt)
+            }
+        };
+
+        return new(payload, "read", argumentsSummary, "status=ok attachment=1", AffectedMessageIds: [text.Attachment.MessageId], AffectedAttachmentIds: [attachmentId]);
+    }
+
+    private ToolExecution ExecutePrepareAttachmentAccess(JsonElement arguments)
+    {
+        EnsureArgumentObject(arguments, "email_prepare_attachment_access");
+        ValidateAllowedArguments(arguments, "attachment_ids", "access_kind", "expires_minutes", "_meta");
+
+        var attachmentIds = ReadRequiredIntArray(arguments, "attachment_ids", min: 1, max: int.MaxValue);
+        var accessKind = ReadOptionalString(arguments, "access_kind") ?? "auto";
+        _ = ReadOptionalInt(arguments, "expires_minutes", defaultValue: 60, min: 1, max: 1440);
+
+        if (!accessKind.Equals("auto", StringComparison.OrdinalIgnoreCase)
+            && !accessKind.Equals("managed_export_file", StringComparison.OrdinalIgnoreCase))
+            throw new JsonRpcError(-32602, "email_prepare_attachment_access supports access_kind auto or managed_export_file in this build.");
+
+        var prepared = _database.PrepareAttachmentAccess(attachmentIds);
+        var payloadItems = new JsonArray();
+        var affectedMessageIds = new List<int>();
+        var affectedAttachmentIds = new List<int>();
+
+        foreach (var item in prepared)
+        {
+            if (item.Attachment is not null)
+            {
+                affectedMessageIds.Add(item.Attachment.MessageId);
+                affectedAttachmentIds.Add(item.Attachment.AttachmentId);
+            }
+
+            payloadItems.Add(new JsonObject
+            {
+                ["attachment"] = item.Attachment is null ? null : ToAttachmentMetadataJson(item.Attachment),
+                ["attachment_id"] = NumberOrNull(item.Attachment?.AttachmentId),
+                ["status"] = item.Error is null ? "ok" : item.Kind,
+                ["error"] = StringOrNull(item.Error),
+                ["access"] = item.Error is null
+                    ? new JsonObject
+                    {
+                        ["kind"] = item.Kind,
+                        ["path"] = StringOrNull(item.Path),
+                        ["expires_at"] = null
+                    }
+                    : null
+            });
+        }
+
+        var payload = new JsonObject
+        {
+            ["status"] = prepared.Any(item => item.Error is null) ? "ok" : "not_ready",
+            ["attachments"] = payloadItems
+        };
+        var argumentsSummary = $"attachment_ids={attachmentIds.Count}, access_kind={accessKind}";
+
+        return new(
+            payload,
+            "read",
+            argumentsSummary,
+            $"prepared={prepared.Count(item => item.Error is null)} failed={prepared.Count(item => item.Error is not null)}",
+            AffectedMessageIds: affectedMessageIds.Distinct().ToList(),
+            AffectedAttachmentIds: affectedAttachmentIds.Distinct().ToList());
     }
 
     private ToolExecution ExecuteSyncNow(JsonElement arguments, CancellationToken cancellationToken)
@@ -1139,7 +1296,7 @@ internal sealed class McpStdioServer
                 ["history_days"] = account.HistoryDays,
                 ["history_source"] = "config.toml",
                 ["message_search_ready"] = readiness.SearchReady,
-                ["attachment_search_ready"] = false
+                ["attachment_search_ready"] = readiness.AttachmentSearchIndexComplete
             },
             ["readiness"] = ToReadinessJson(readiness),
             ["sync_progress"] = IsActiveForAccount(activeSyncRun, account)
@@ -1148,8 +1305,8 @@ internal sealed class McpStdioServer
             ["metadata_messages"] = readiness.MetadataMessages,
             ["message_bodies_indexed"] = readiness.IndexedMessageBodies,
             ["messages_indexed"] = readiness.MessageSearchDocs,
-            ["attachments_indexed"] = 0,
-            ["extraction_pending"] = 0,
+            ["attachments_indexed"] = readiness.AttachmentSearchDocs,
+            ["extraction_pending"] = readiness.PendingAttachments,
             ["folders"] = includeFolders ? ToFoldersJson(folders) : null
         };
     }
@@ -1597,8 +1754,13 @@ internal sealed class McpStdioServer
             && (account.Id.Equals(accountName, StringComparison.OrdinalIgnoreCase)
                 || account.EmailAddress.Equals(accountEmailAddress, StringComparison.OrdinalIgnoreCase)));
 
-    private static JsonObject ToSearchResultJson(EmailSearchResult result) =>
-        new()
+    private static JsonObject ToSearchResultJson(EmailSearchResult result)
+    {
+        var matchingAttachments = new JsonArray();
+        foreach (var match in result.MatchingAttachments ?? [])
+            matchingAttachments.Add(ToAttachmentHitJson(match));
+
+        return new()
         {
             ["message_id"] = result.MessageId,
             ["account"] = result.AccountName,
@@ -1620,10 +1782,84 @@ internal sealed class McpStdioServer
                         ["field"] = "body",
                         ["text"] = result.Snippet
                     }
-                },
+            },
             ["has_attachments"] = result.HasAttachments,
-            ["matching_attachments"] = new JsonArray(),
+            ["matching_attachments"] = matchingAttachments,
             ["score"] = result.Score
+        };
+    }
+
+    private static JsonObject ToAttachmentHitJson(AttachmentSearchMatch match)
+    {
+        var attachment = match.Attachment;
+        return new()
+        {
+            ["attachment_id"] = attachment.AttachmentId,
+            ["message_id"] = attachment.MessageId,
+            ["filename"] = StringOrNull(attachment.Filename),
+            ["display_path"] = StringOrNull(attachment.DisplayPath),
+            ["mime_type"] = StringOrNull(attachment.SniffedMimeType ?? attachment.MimeType),
+            ["size_bytes"] = NumberOrNull(attachment.SizeBytes),
+            ["source_kind"] = attachment.SourceKind,
+            ["parent_attachment_id"] = NumberOrNull(attachment.ParentAttachmentId),
+            ["root_attachment_id"] = NumberOrNull(attachment.RootAttachmentId),
+            ["is_container"] = attachment.IsContainer,
+            ["nesting_depth"] = attachment.NestingDepth,
+            ["download_status"] = attachment.DownloadStatus,
+            ["extraction_status"] = attachment.ExtractionStatus,
+            ["extracted_text_available"] = attachment.ExtractedTextAvailable,
+            ["ocr_text_available"] = attachment.OcrTextAvailable,
+            ["access_preparable"] = !string.IsNullOrWhiteSpace(attachment.StorageKey),
+            ["hit_count"] = null,
+            ["snippets"] = string.IsNullOrWhiteSpace(match.Snippet)
+                ? new JsonArray()
+                : new JsonArray
+                {
+                    new JsonObject
+                    {
+                        ["field"] = "extracted_text",
+                        ["text"] = match.Snippet
+                    }
+                }
+        };
+    }
+
+    private static JsonArray ToAttachmentsJson(IReadOnlyList<StoredAttachment> attachments)
+    {
+        var values = new JsonArray();
+
+        foreach (var attachment in attachments ?? [])
+            values.Add(ToAttachmentMetadataJson(attachment));
+
+        return values;
+    }
+
+    private static JsonObject ToAttachmentMetadataJson(StoredAttachment attachment) =>
+        new()
+        {
+            ["attachment_id"] = attachment.AttachmentId,
+            ["message_id"] = attachment.MessageId,
+            ["filename"] = StringOrNull(attachment.Filename),
+            ["display_path"] = StringOrNull(attachment.DisplayPath),
+            ["mime_type"] = StringOrNull(attachment.SniffedMimeType ?? attachment.MimeType),
+            ["declared_mime_type"] = StringOrNull(attachment.MimeType),
+            ["sniffed_mime_type"] = StringOrNull(attachment.SniffedMimeType),
+            ["size_bytes"] = NumberOrNull(attachment.SizeBytes),
+            ["compressed_size_bytes"] = NumberOrNull(attachment.CompressedSizeBytes),
+            ["uncompressed_size_bytes"] = NumberOrNull(attachment.UncompressedSizeBytes),
+            ["source_kind"] = attachment.SourceKind,
+            ["parent_attachment_id"] = NumberOrNull(attachment.ParentAttachmentId),
+            ["root_attachment_id"] = NumberOrNull(attachment.RootAttachmentId),
+            ["archive_entry_path"] = StringOrNull(attachment.ArchiveEntryPath),
+            ["is_container"] = attachment.IsContainer,
+            ["nesting_depth"] = attachment.NestingDepth,
+            ["download_status"] = attachment.DownloadStatus,
+            ["download_error"] = StringOrNull(attachment.DownloadError),
+            ["extraction_status"] = attachment.ExtractionStatus,
+            ["extraction_error"] = StringOrNull(attachment.ExtractionError),
+            ["extracted_text_available"] = attachment.ExtractedTextAvailable,
+            ["ocr_text_available"] = attachment.OcrTextAvailable,
+            ["access_preparable"] = !string.IsNullOrWhiteSpace(attachment.StorageKey)
         };
 
     private static JsonObject ToReadinessJson(MessageSearchReadiness readiness) =>
@@ -1633,6 +1869,7 @@ internal sealed class McpStdioServer
             ["metadata_complete"] = readiness.MetadataComplete,
             ["bodies_complete"] = readiness.BodiesComplete,
             ["message_search_index_complete"] = readiness.MessageSearchIndexComplete,
+            ["attachment_search_index_complete"] = readiness.AttachmentSearchIndexComplete,
             ["scope_account_count"] = readiness.ScopeAccountCount,
             ["scope_folder_count"] = readiness.ScopeFolderCount,
             ["metadata_complete_folder_count"] = readiness.MetadataCompleteFolderCount,
@@ -1641,6 +1878,10 @@ internal sealed class McpStdioServer
             ["message_search_docs"] = readiness.MessageSearchDocs,
             ["fts_rows"] = readiness.FtsRows,
             ["pending_message_bodies"] = readiness.PendingMessageBodies,
+            ["attachments"] = readiness.Attachments,
+            ["attachment_search_docs"] = readiness.AttachmentSearchDocs,
+            ["attachment_fts_rows"] = readiness.AttachmentFtsRows,
+            ["pending_attachments"] = readiness.PendingAttachments,
             ["coverage_note"] = StringOrNull(readiness.CoverageNote),
             ["active_sync_run"] = readiness.ActiveSyncRun is null ? null : ToSyncProgressJson(readiness.ActiveSyncRun)
         };
@@ -1681,6 +1922,7 @@ internal sealed class McpStdioServer
             MetadataComplete: false,
             BodiesComplete: false,
             MessageSearchIndexComplete: false,
+            AttachmentSearchIndexComplete: false,
             ScopeAccountCount: 0,
             ScopeFolderCount: 0,
             MetadataCompleteFolderCount: 0,
@@ -1689,6 +1931,10 @@ internal sealed class McpStdioServer
             MessageSearchDocs: 0,
             FtsRows: 0,
             PendingMessageBodies: 0,
+            Attachments: 0,
+            AttachmentSearchDocs: 0,
+            AttachmentFtsRows: 0,
+            PendingAttachments: 0,
             ActiveSyncRun: activeSyncRun,
             Freshness: freshness);
     }
@@ -1909,6 +2155,25 @@ internal sealed class McpStdioServer
         return ReadIntValue(value, name, min, max);
     }
 
+    private static IReadOnlyList<int> ReadRequiredIntArray(JsonElement element, string name, int min, int max)
+    {
+        if (element.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
+            || !element.TryGetProperty(name, out var value))
+            throw new JsonRpcError(-32602, $"{name} is required.");
+
+        if (value.ValueKind != JsonValueKind.Array)
+            throw new JsonRpcError(-32602, $"{name} must be an array of integers.");
+
+        var values = new List<int>();
+        foreach (var item in value.EnumerateArray())
+            values.Add(ReadIntValue(item, name, min, max));
+
+        if (values.Count == 0)
+            throw new JsonRpcError(-32602, $"{name} must contain at least one id.");
+
+        return values;
+    }
+
     private static int ReadIntValue(JsonElement value, string name, int min, int max)
     {
         if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var parsed))
@@ -2100,6 +2365,18 @@ internal sealed class McpStdioServer
             }
         };
 
+    private static JsonObject IntArraySchema(string description) =>
+        new()
+        {
+            ["type"] = "array",
+            ["description"] = description,
+            ["items"] = new JsonObject
+            {
+                ["type"] = "integer",
+                ["minimum"] = 1
+            }
+        };
+
     private static JsonObject IntSchema(string description, int minimum, int maximum, int? defaultValue)
     {
         var schema = new JsonObject
@@ -2174,12 +2451,19 @@ internal sealed class McpStdioServer
     private static JsonNode NumberOrNull(int? value) =>
         value is null ? null : JsonValue.Create(value.Value);
 
+    private static JsonNode NumberOrNull(long? value) =>
+        value is null ? null : JsonValue.Create(value.Value);
+
+    private static string TruncateText(string value, int maxChars) =>
+        value is not null && value.Length > maxChars ? value[..maxChars] : value;
+
     private sealed record ToolExecution(
         JsonObject Payload,
         string ActionType,
         string ArgumentsSummary,
         string ResultSummary,
         IReadOnlyList<int> AffectedMessageIds = null,
+        IReadOnlyList<int> AffectedAttachmentIds = null,
         bool IsError = false);
 
     private sealed record McpSyncStatusRequest(

@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using System.Text;
 using System.Text.Json;
 
 namespace LceMcp.Tests;
@@ -14,14 +15,17 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Created, status.InitializationKind);
-        Assert.Equal(5, status.SchemaVersion);
-        Assert.Equal(5, status.TargetSchemaVersion);
+        Assert.Equal(6, status.SchemaVersion);
+        Assert.Equal(6, status.TargetSchemaVersion);
         Assert.Equal(0, status.AccountCount);
         Assert.Equal(0, status.FolderCount);
         Assert.Equal(0, status.MessageCount);
         Assert.Equal(0, status.MessageLocationCount);
         Assert.Equal(0, status.MessageBodyCount);
         Assert.Equal(0, status.MessageSearchDocCount);
+        Assert.Equal(0, status.AttachmentCount);
+        Assert.Equal(0, status.AttachmentTextCount);
+        Assert.Equal(0, status.AttachmentSearchDocCount);
         Assert.Null(status.LastSyncState);
         Assert.True(File.Exists(temp.Paths.DatabasePath));
         Assert.True(Directory.Exists(temp.Paths.AttachmentsDirectory));
@@ -35,6 +39,10 @@ public sealed class EmailDatabaseTests
         {
             "accounts",
             "audit_log",
+            "attachment_search_docs",
+            "attachment_text",
+            "attachments",
+            "attachments_fts",
             "folders",
             "message_bodies",
             "message_locations",
@@ -60,8 +68,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Opened, status.InitializationKind);
-        Assert.Equal(5, status.SchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking"], ReadNames(
+        Assert.Equal(6, status.SchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
     }
@@ -90,9 +98,9 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Migrated, status.InitializationKind);
-        Assert.Equal(5, status.SchemaVersion);
-        Assert.Equal(5, status.TargetSchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking"], ReadNames(
+        Assert.Equal(6, status.SchemaVersion);
+        Assert.Equal(6, status.TargetSchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
         Assert.Contains("message_search_docs", ReadNames(
@@ -423,6 +431,111 @@ public sealed class EmailDatabaseTests
         Assert.Equal(2, status.MessageSearchDocCount);
         Assert.Single(alphaResults);
         Assert.Single(betaResults);
+    }
+
+    [Fact]
+    public void UpsertMessageBodyIndexesAttachmentTextAndManagedAccess()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:attachment-a",
+                messageIdHeader: "attachment-a@example.com",
+                subject: "Invoice attached",
+                hasAttachments: true)
+        ], SyncStateJson(matchedCount: 1, selectedCount: 1, fetchedCount: 1), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+        var stored = new AttachmentObjectStore(temp.Paths).Store(Encoding.UTF8.GetBytes("invoice binary"));
+
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Please see attached invoice.",
+            HtmlText: null,
+            NormalizedText: "Please see attached invoice.",
+            Recipients: [],
+            Attachments: [
+                new(
+                    SourceKind: "email_part",
+                    PartId: "2",
+                    Filename: "invoice.txt",
+                    DisplayPath: "invoice.txt",
+                    ArchiveEntryPath: null,
+                    MimeType: "text/plain",
+                    SniffedMimeType: "text/plain",
+                    SizeBytes: stored.SizeBytes,
+                    CompressedSizeBytes: null,
+                    UncompressedSizeBytes: stored.SizeBytes,
+                    ContentHash: stored.ContentHash,
+                    StorageKey: stored.StorageKey,
+                    IsContainer: false,
+                    NestingDepth: 0,
+                    DownloadStatus: "stored",
+                    DownloadError: null,
+                    ExtractionStatus: "done",
+                    ExtractionError: null,
+                    ExtractedText: "Invoice total includes VAT and DDV.",
+                    OcrText: null,
+                    Extractor: "text",
+                    Children: [])
+            ]));
+
+        var status = database.GetStatus();
+        var results = database.SearchMessages(new(
+            Query: "DDV",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: true,
+            Limit: 10,
+            SnippetChars: 1024,
+            SearchIn: ["attachments"]));
+        var result = Assert.Single(results);
+        var match = Assert.Single(result.MatchingAttachments);
+        var text = database.ReadAttachmentText(match.Attachment.AttachmentId);
+        var access = Assert.Single(database.PrepareAttachmentAccess([match.Attachment.AttachmentId]));
+
+        Assert.Equal(1, status.AttachmentCount);
+        Assert.Equal(1, status.AttachmentTextCount);
+        Assert.Equal(1, status.AttachmentSearchDocCount);
+        Assert.Equal(messageId, result.MessageId);
+        Assert.Equal("invoice.txt", match.Attachment.DisplayPath);
+        Assert.Contains("DDV", match.Snippet, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("VAT", text.CombinedText, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("managed_export_file", access.Kind);
+        Assert.True(File.Exists(access.Path));
+
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Please see attached invoice.",
+            HtmlText: null,
+            NormalizedText: "Please see attached invoice.",
+            Recipients: [],
+            Attachments: []));
+
+        var afterCleanup = database.GetStatus();
+        var staleResults = database.SearchMessages(new(
+            Query: "DDV",
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: true,
+            Limit: 10,
+            SnippetChars: 1024,
+            SearchIn: ["attachments"],
+            AllowPartial: true));
+
+        Assert.Equal(0, afterCleanup.AttachmentCount);
+        Assert.Equal(0, afterCleanup.AttachmentTextCount);
+        Assert.Equal(0, afterCleanup.AttachmentSearchDocCount);
+        Assert.Empty(staleResults);
     }
 
     [Fact]

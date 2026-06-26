@@ -393,17 +393,26 @@ Spec update on 2026-06-26:
 - Added `email_prepare_attachment_access` to the spec for user-facing attachment links/exports. This tool prepares scoped localhost URLs or app-managed export files for specific known attachment IDs. It must not return raw bytes/base64, internal storage paths, arbitrary filesystem access, or accept caller-supplied output paths.
 - Added separate permission semantics: scoped attachment access links are read-only and may default on as user convenience, while raw attachment export remains disabled by default.
 
+Implementation checkpoint on 2026-06-26:
+
+- Added migration 6, `attachment_metadata_and_search`, with recursive `attachments`, `attachment_text`, `attachment_search_docs`, and `attachments_fts` plus FTS maintenance triggers.
+- Added a managed content-addressed attachment object store under the existing app attachments directory, with temp writes, hash-based dedupe, and app-managed export-file preparation for specific known attachment IDs.
+- Body sync now persists attachment trees while indexing message bodies. Full-message fetches enumerate MIME attachments directly; body-structure fetches download attachment body parts and feed them into the same processor.
+- Added an attachment processor for PDF embedded text via PdfPig, DOCX/XLSX via DocumentFormat.OpenXml, TXT/CSV/HTML via built-in text extraction, ZIP archive expansion with conservative nesting/entry/size/compression limits, and explicit unsupported 7z status for now.
+- Attachment search integrates with local `search`/MCP `email_search` using `search_in`, `mime_types`, and `filename_contains`, returning message-centric results with nested matching attachment metadata/snippets. Message-only search remains backward-compatible unless attachment scope/filters are requested.
+- `email_get_message` now returns attachment metadata when available. Added MCP `email_get_attachment_text` for bounded extracted-text reads and `email_prepare_attachment_access` for app-managed export-file access without raw bytes, base64, internal storage paths, or caller-supplied paths.
+- Status/readiness now reports attachment counts and attachment index completeness separately from message-body readiness.
+- `dotnet build lcemcp.slnx /p:UseSharedCompilation=false` succeeded, and `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 48 tests. New coverage includes migration/schema presence, attachment text FTS, stale attachment cleanup, managed export behavior, MCP attachment text/access calls, and attachment audit IDs.
+
 Next work:
 
-- Add schema/migration support for recursive `attachments`, `attachment_text`, `attachment_search_docs`, and `attachments_fts`, preserving the safety posture that raw bytes/arbitrary filesystem access are not exposed through MCP.
-- Add managed attachment object storage: content-addressed binaries on disk, internal storage keys in SQLite, hash-based dedupe, temp-file writes plus atomic moves, and cleanup rules for stale temp/export files.
-- Persist attachment metadata during body sync/MIME processing: parent message, parent/root attachment links, part id, source kind, display path, filename, declared/sniffed MIME type, size/compressed/uncompressed size, content hash when available, storage/download status, extraction status, and errors/attempt counts.
-- Add a conservative attachment download/extraction policy for searchable document types, archive containers, and size/depth limits.
-- Implement an extractor registry for embedded-text PDF, DOCX, XLSX, TXT, HTML, CSV, ZIP, and 7z where practical. Container extractors should create child attachment rows; terminal document extractors should write extracted text. Mark unsupported, encrypted, too-large, empty, skipped, and failed cases explicitly.
-- Index extracted text and attachment metadata into attachment FTS, including archive `display_path`, and integrate `email_search` with `search_in`, `mime_types`, `filename_contains`, nested matching attachment hits, attachment previews for filter-only searches, snippets, and hit counts where practical.
-- Expose bounded reads through `email_get_attachment_text` and include attachment metadata/tree fields in message reads/search results.
-- Add `email_prepare_attachment_access` for user-facing access to attachment binaries: scoped localhost URLs when available or sanitized files in an app-managed export directory. Support child archive entries as first-class downloadable attachments when their binaries are stored. Audit every access-preparation call and do not return raw bytes, internal object-store paths, or arbitrary caller-chosen paths.
-- Add focused tests as part of the feature: migrations, metadata upsert idempotence, content-addressed storage, archive tree expansion, zip-slip/zip-bomb/limit handling, extractor fixtures, FTS indexing/stale cleanup, MCP/CLI contract shape, readiness/partial behavior, access-link/export behavior, permission failures, and safety limits.
+- Run a bounded live Yahoo body sync against attachment-bearing messages and verify attachment rows, text extraction statuses, and attachment search results without recording private snippets in TODO.
+- Add focused extractor fixture tests for actual PDF, DOCX, XLSX, HTML/CSV, and ZIP inputs, including archive child search and zip-slip/limit cases.
+- Add ZIP safety status rows for skipped individual entries where useful; the first implementation skips unsafe/too-large entries inside an otherwise processed archive.
+- Decide whether to add SharpCompress or another maintained dependency for 7z. For now, 7z attachments are stored when within size limits but marked `unsupported` for expansion.
+- Add cleanup policy for stale temp/export files under the managed attachment directory.
+- Consider scoped localhost access links later. The current `email_prepare_attachment_access` implementation uses managed export files only.
+- Expand attachment readiness/search polish: separate attachment hit counts where practical, richer filter-only previews, and MCP status language that distinguishes message-ready from attachment-ready more clearly.
 
 ## 9. Scanned PDF OCR Extraction
 

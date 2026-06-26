@@ -8,7 +8,8 @@ internal static class DatabaseMigrations
         new(2, "message_bodies_and_search", BodySearchSchemaSql),
         new(3, "sync_runs_and_search_readiness", SyncRunsAndReadinessSql),
         new(4, "sync_queue_and_leases", SyncQueueAndLeasesSql),
-        new(5, "sync_window_tracking", SyncWindowTrackingSql)
+        new(5, "sync_window_tracking", SyncWindowTrackingSql),
+        new(6, "attachment_metadata_and_search", AttachmentSearchSchemaSql)
     ];
 
     public static int TargetVersion => All.Select(migration => migration.Version).DefaultIfEmpty(0).Max();
@@ -246,5 +247,98 @@ internal static class DatabaseMigrations
         ALTER TABLE sync_runs ADD COLUMN requested_since_days INTEGER;
         ALTER TABLE sync_runs ADD COLUMN effective_since_days INTEGER;
         ALTER TABLE sync_runs ADD COLUMN auto_expanded_for_gap INTEGER NOT NULL DEFAULT 0;
+        """;
+
+    public const string AttachmentSearchSchemaSql = """
+        CREATE TABLE IF NOT EXISTS attachments (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            parent_attachment_id INTEGER,
+            root_attachment_id INTEGER,
+            source_kind TEXT NOT NULL DEFAULT 'email_part',
+            part_id TEXT,
+            filename TEXT,
+            display_path TEXT NOT NULL,
+            archive_entry_path TEXT,
+            mime_type TEXT,
+            sniffed_mime_type TEXT,
+            size_bytes INTEGER,
+            compressed_size_bytes INTEGER,
+            uncompressed_size_bytes INTEGER,
+            content_hash TEXT,
+            storage_key TEXT,
+            is_container INTEGER NOT NULL DEFAULT 0,
+            nesting_depth INTEGER NOT NULL DEFAULT 0,
+            download_status TEXT NOT NULL DEFAULT 'not_downloaded',
+            download_attempts INTEGER NOT NULL DEFAULT 0,
+            download_error TEXT,
+            extraction_status TEXT NOT NULL DEFAULT 'not_ready',
+            extraction_attempts INTEGER NOT NULL DEFAULT 0,
+            extraction_started_at TEXT,
+            extraction_lease_until TEXT,
+            extraction_error TEXT,
+            extracted_text_available INTEGER NOT NULL DEFAULT 0,
+            ocr_text_available INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+            FOREIGN KEY(parent_attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+            FOREIGN KEY(root_attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+            UNIQUE(message_id, source_kind, display_path)
+        );
+
+        CREATE TABLE IF NOT EXISTS attachment_text (
+            attachment_id INTEGER PRIMARY KEY,
+            extracted_text TEXT,
+            ocr_text TEXT,
+            combined_text TEXT,
+            extractor TEXT,
+            extracted_at TEXT,
+            FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS attachment_search_docs (
+            attachment_id INTEGER PRIMARY KEY,
+            filename TEXT,
+            display_path TEXT,
+            mime_type TEXT,
+            extracted_text TEXT,
+            FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS attachments_fts USING fts5(
+            filename,
+            display_path,
+            mime_type,
+            extracted_text,
+            content='attachment_search_docs',
+            content_rowid='attachment_id',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS attachment_search_docs_ai AFTER INSERT ON attachment_search_docs BEGIN
+            INSERT INTO attachments_fts(rowid, filename, display_path, mime_type, extracted_text)
+            VALUES (new.attachment_id, new.filename, new.display_path, new.mime_type, new.extracted_text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS attachment_search_docs_ad AFTER DELETE ON attachment_search_docs BEGIN
+            INSERT INTO attachments_fts(attachments_fts, rowid, filename, display_path, mime_type, extracted_text)
+            VALUES('delete', old.attachment_id, old.filename, old.display_path, old.mime_type, old.extracted_text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS attachment_search_docs_au AFTER UPDATE ON attachment_search_docs BEGIN
+            INSERT INTO attachments_fts(attachments_fts, rowid, filename, display_path, mime_type, extracted_text)
+            VALUES('delete', old.attachment_id, old.filename, old.display_path, old.mime_type, old.extracted_text);
+            INSERT INTO attachments_fts(rowid, filename, display_path, mime_type, extracted_text)
+            VALUES (new.attachment_id, new.filename, new.display_path, new.mime_type, new.extracted_text);
+        END;
+
+        CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+        CREATE INDEX IF NOT EXISTS idx_attachments_parent ON attachments(parent_attachment_id);
+        CREATE INDEX IF NOT EXISTS idx_attachments_root ON attachments(root_attachment_id);
+        CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
+        CREATE INDEX IF NOT EXISTS idx_attachments_display_path ON attachments(message_id, display_path);
+        CREATE INDEX IF NOT EXISTS idx_attachments_extraction_status ON attachments(extraction_status, extraction_lease_until);
+        CREATE INDEX IF NOT EXISTS idx_attachments_mime ON attachments(sniffed_mime_type, mime_type);
         """;
 }

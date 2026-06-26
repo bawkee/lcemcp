@@ -12,4 +12,5 @@ internal sealed record StoredEmailMessage(
     bool HasAttachments,
     string BodyText,
     IReadOnlyList<string> Folders,
-    IReadOnlyList<MessageRecipient> Recipients);
+    IReadOnlyList<MessageRecipient> Recipients,
+    IReadOnlyList<StoredAttachment> Attachments);

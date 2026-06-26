@@ -9,6 +9,9 @@ internal sealed record DatabaseStatus(
     int MessageLocationCount,
     int MessageBodyCount,
     int MessageSearchDocCount,
+    int AttachmentCount,
+    int AttachmentTextCount,
+    int AttachmentSearchDocCount,
     SyncStateStatus LastSyncState,
     DatabaseInitializationKind InitializationKind);
 

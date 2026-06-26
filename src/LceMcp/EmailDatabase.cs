@@ -16,6 +16,7 @@ internal sealed class EmailDatabase
     }
 
     public string DatabasePath => _paths.DatabasePath;
+    public AppPaths Paths => _paths;
 
     public DatabaseInitializationKind EnsureInitialized()
     {
@@ -38,6 +39,9 @@ internal sealed class EmailDatabase
             MessageLocationCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM message_locations;"),
             MessageBodyCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM message_bodies;"),
             MessageSearchDocCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM message_search_docs;"),
+            AttachmentCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM attachments;"),
+            AttachmentTextCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM attachment_text;"),
+            AttachmentSearchDocCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM attachment_search_docs;"),
             LastSyncState: ReadLastSyncState(connection),
             InitializationKind: initializationKind);
     }
@@ -299,7 +303,8 @@ internal sealed class EmailDatabase
         string actionType,
         string argumentsSummary,
         string resultSummary,
-        IReadOnlyList<int> affectedMessageIds = null)
+        IReadOnlyList<int> affectedMessageIds = null,
+        IReadOnlyList<int> affectedAttachmentIds = null)
     {
         EnsureInitialized();
 
@@ -324,7 +329,7 @@ internal sealed class EmailDatabase
                 $actionType,
                 $argumentsSummary,
                 $affectedMessageIds,
-                NULL,
+                $affectedAttachmentIds,
                 NULL,
                 $resultSummary
             );
@@ -335,6 +340,7 @@ internal sealed class EmailDatabase
         AddParameter(command, "$actionType", actionType);
         AddParameter(command, "$argumentsSummary", BlankToNull(argumentsSummary));
         AddParameter(command, "$affectedMessageIds", affectedMessageIds is { Count: > 0 } ? string.Join(",", affectedMessageIds) : null);
+        AddParameter(command, "$affectedAttachmentIds", affectedAttachmentIds is { Count: > 0 } ? string.Join(",", affectedAttachmentIds) : null);
         AddParameter(command, "$resultSummary", BlankToNull(resultSummary));
         command.ExecuteNonQuery();
     }
@@ -447,6 +453,29 @@ internal sealed class EmailDatabase
         if (HasValues(request.AccountFilters) && accountIds.Count == 0)
             return [];
 
+        var messageResults = request.SearchesMessages
+            ? SearchMessageBranch(connection, request, accountIds, cursor, fts, hasTextQuery, limit, snippetTokens)
+            : [];
+        var shouldSearchAttachments = request.SearchesAttachments
+            || (request.HasAttachment == true && request.IncludeAttachmentMetadata);
+        var attachmentResults = shouldSearchAttachments
+            ? SearchAttachmentBranch(connection, request, accountIds, fts, hasTextQuery, limit, snippetTokens)
+            : [];
+
+        var merged = MergeSearchResults(messageResults, attachmentResults, hasTextQuery);
+        return merged.Take(limit).ToList();
+    }
+
+    private static IReadOnlyList<EmailSearchResult> SearchMessageBranch(
+        SqliteConnection connection,
+        EmailSearchRequest request,
+        IReadOnlyList<int> accountIds,
+        EmailSearchCursor cursor,
+        string fts,
+        bool hasTextQuery,
+        int limit,
+        int snippetTokens)
+    {
         var query = CreateDbQuery(connection, hasTextQuery ? SearchMessagesSql : BrowseMessagesSql);
         ApplyScopeConditions(
             query,
@@ -473,10 +502,46 @@ internal sealed class EmailDatabase
         }
 
         using var reader = (SqliteDataReader)command.ExecuteReader();
-        return ReadSearchResults(reader);
+        return ReadSearchResults(reader, readAttachment: false);
     }
 
-    private static IReadOnlyList<EmailSearchResult> ReadSearchResults(SqliteDataReader reader)
+    private static IReadOnlyList<EmailSearchResult> SearchAttachmentBranch(
+        SqliteConnection connection,
+        EmailSearchRequest request,
+        IReadOnlyList<int> accountIds,
+        string fts,
+        bool hasTextQuery,
+        int limit,
+        int snippetTokens)
+    {
+        var query = CreateDbQuery(connection, hasTextQuery ? SearchAttachmentsSql : BrowseAttachmentsSql);
+        ApplyScopeConditions(
+            query,
+            accountIds,
+            request.FromEmail,
+            request.ToEmail,
+            request.FolderRoles,
+            request.HasAttachment,
+            request.DateFrom,
+            request.DateTo);
+        ApplyAttachmentConditions(query, request.MimeTypes, request.FilenameContains);
+
+        using var command = query.CreateCommand();
+        query.AddSqlParameter("$limit", Math.Clamp(limit * Math.Max(1, request.MaxAttachmentHitsPerMessage), 1, 500));
+        query.AddSqlParameter("$dateFrom", request.DateFrom);
+        query.AddSqlParameter("$dateTo", request.DateTo);
+
+        if (hasTextQuery)
+        {
+            query.AddSqlParameter("$fts", fts);
+            query.AddSqlParameter("$snippetTokens", snippetTokens);
+        }
+
+        using var reader = (SqliteDataReader)command.ExecuteReader();
+        return ReadSearchResults(reader, readAttachment: true);
+    }
+
+    private static IReadOnlyList<EmailSearchResult> ReadSearchResults(SqliteDataReader reader, bool readAttachment)
     {
         var results = new List<EmailSearchResult>();
 
@@ -485,6 +550,9 @@ internal sealed class EmailDatabase
             var messageId = reader.GetInt32(reader.GetOrdinal("message_id"));
             var messageDate = GetNullableString(reader, "message_date");
             var score = reader.GetDouble(reader.GetOrdinal("score"));
+            var attachmentMatches = readAttachment
+                ? new[] { ReadAttachmentSearchMatch(reader) }
+                : null;
             results.Add(new(
                 MessageId: messageId,
                 AccountName: reader.GetString(reader.GetOrdinal("account_name")),
@@ -496,10 +564,68 @@ internal sealed class EmailDatabase
                 HasAttachments: reader.GetInt32(reader.GetOrdinal("has_attachments")) != 0,
                 Snippet: GetNullableString(reader, "snippet"),
                 Score: score,
-                Cursor: EmailSearchCursorCodec.Encode(score, messageDate, messageId)));
+                Cursor: EmailSearchCursorCodec.Encode(score, messageDate, messageId),
+                MatchingAttachments: attachmentMatches));
         }
 
         return results;
+    }
+
+    private static AttachmentSearchMatch ReadAttachmentSearchMatch(SqliteDataReader reader) =>
+        new(
+            Attachment: ReadStoredAttachment(reader),
+            Snippet: GetNullableString(reader, "attachment_snippet"),
+            Score: reader.GetDouble(reader.GetOrdinal("score")));
+
+    private static IReadOnlyList<EmailSearchResult> MergeSearchResults(
+        IReadOnlyList<EmailSearchResult> messageResults,
+        IReadOnlyList<EmailSearchResult> attachmentResults,
+        bool hasTextQuery)
+    {
+        var byMessageId = new Dictionary<int, EmailSearchResult>();
+
+        foreach (var result in messageResults)
+            byMessageId[result.MessageId] = result with
+            {
+                MatchingAttachments = result.MatchingAttachments ?? []
+            };
+
+        foreach (var attachmentResult in attachmentResults)
+        {
+            var matches = attachmentResult.MatchingAttachments ?? [];
+            if (!byMessageId.TryGetValue(attachmentResult.MessageId, out var existing))
+            {
+                byMessageId[attachmentResult.MessageId] = attachmentResult with
+                {
+                    MatchingAttachments = matches
+                };
+                continue;
+            }
+
+            byMessageId[attachmentResult.MessageId] = existing with
+            {
+                Score = Math.Min(existing.Score, attachmentResult.Score),
+                MatchingAttachments = existing.MatchingAttachments
+                    .Concat(matches)
+                    .GroupBy(match => match.Attachment.AttachmentId)
+                    .Select(group => group.First())
+                    .OrderBy(match => match.Score)
+                    .ThenBy(match => match.Attachment.DisplayPath, StringComparer.OrdinalIgnoreCase)
+                    .ToList()
+            };
+        }
+
+        var results = byMessageId.Values.ToList();
+        return hasTextQuery
+            ? results
+                .OrderBy(result => result.Score)
+                .ThenByDescending(result => result.Date ?? "")
+                .ThenBy(result => result.MessageId)
+                .ToList()
+            : results
+                .OrderByDescending(result => result.Date ?? "")
+                .ThenByDescending(result => result.MessageId)
+                .ToList();
     }
 
     public StoredEmailMessage ReadMessage(int messageId)
@@ -568,7 +694,99 @@ internal sealed class EmailDatabase
             HasAttachments: hasAttachments,
             BodyText: bodyText,
             Folders: ReadMessageFolders(connection, messageId),
-            Recipients: ReadMessageRecipients(connection, messageId));
+            Recipients: ReadMessageRecipients(connection, messageId),
+            Attachments: ReadMessageAttachments(connection, messageId));
+    }
+
+    public AttachmentTextContent ReadAttachmentText(int attachmentId)
+    {
+        EnsureInitialized();
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                a.id,
+                a.message_id,
+                a.parent_attachment_id,
+                a.root_attachment_id,
+                a.source_kind,
+                a.part_id,
+                a.filename,
+                a.display_path,
+                a.archive_entry_path,
+                a.mime_type,
+                a.sniffed_mime_type,
+                a.size_bytes,
+                a.compressed_size_bytes,
+                a.uncompressed_size_bytes,
+                a.content_hash,
+                a.storage_key,
+                a.is_container,
+                a.nesting_depth,
+                a.download_status,
+                a.download_error,
+                a.extraction_status,
+                a.extraction_error,
+                a.extracted_text_available,
+                a.ocr_text_available,
+                t.extracted_text,
+                t.ocr_text,
+                t.combined_text,
+                t.extractor,
+                t.extracted_at
+            FROM attachments a
+            LEFT JOIN attachment_text t ON t.attachment_id = a.id
+            WHERE a.id = $attachmentId
+            LIMIT 1;
+            """;
+        AddParameter(command, "$attachmentId", attachmentId);
+
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
+            return null;
+
+        return new(
+            Attachment: ReadStoredAttachment(reader),
+            ExtractedText: GetNullableString(reader, "extracted_text"),
+            OcrText: GetNullableString(reader, "ocr_text"),
+            CombinedText: GetNullableString(reader, "combined_text"),
+            Extractor: GetNullableString(reader, "extractor"),
+            ExtractedAt: GetNullableString(reader, "extracted_at"));
+    }
+
+    public IReadOnlyList<PreparedAttachmentAccess> PrepareAttachmentAccess(IReadOnlyList<int> attachmentIds)
+    {
+        EnsureInitialized();
+
+        if (attachmentIds is null || attachmentIds.Count == 0)
+            return [];
+
+        using var connection = OpenConnection();
+        var attachments = ReadAttachments(connection, attachmentIds);
+        var byId = attachments.ToDictionary(attachment => attachment.AttachmentId);
+        var objectStore = new AttachmentObjectStore(_paths);
+        var results = new List<PreparedAttachmentAccess>();
+
+        foreach (var attachmentId in attachmentIds.Distinct())
+        {
+            if (!byId.TryGetValue(attachmentId, out var attachment))
+            {
+                results.Add(new(
+                    Attachment: null,
+                    Kind: "not_found",
+                    Path: null,
+                    Error: $"Attachment {attachmentId} is not available in local storage."));
+                continue;
+            }
+
+            var exportPath = objectStore.PrepareManagedExport(attachment);
+            results.Add(exportPath is null
+                ? new(attachment, "not_ready", null, "Attachment binary is not stored in the managed object store.")
+                : new(attachment, "managed_export_file", exportPath, null));
+        }
+
+        return results;
     }
 
     public MessageSearchReadiness GetMessageSearchReadiness(MessageSearchReadinessRequest request)
@@ -588,6 +806,7 @@ internal sealed class EmailDatabase
                 MetadataComplete: false,
                 BodiesComplete: false,
                 MessageSearchIndexComplete: false,
+                AttachmentSearchIndexComplete: false,
                 ScopeAccountCount: 0,
                 ScopeFolderCount: 0,
                 MetadataCompleteFolderCount: 0,
@@ -596,6 +815,10 @@ internal sealed class EmailDatabase
                 MessageSearchDocs: 0,
                 FtsRows: 0,
                 PendingMessageBodies: 0,
+                Attachments: 0,
+                AttachmentSearchDocs: 0,
+                AttachmentFtsRows: 0,
+                PendingAttachments: 0,
                 ActiveSyncRun: activeSyncRun,
                 Freshness: BuildSearchFreshness([], request, now));
         }
@@ -614,12 +837,19 @@ internal sealed class EmailDatabase
             && counts.PendingMessageBodies == 0;
         var indexComplete = counts.MetadataMessages == counts.MessageSearchDocs
             && counts.MetadataMessages == counts.FtsRows;
+        var attachmentIndexComplete = counts.Attachments == counts.AttachmentSearchDocs
+            && counts.Attachments == counts.AttachmentFtsRows
+            && counts.PendingAttachments == 0;
 
         return new(
-            SearchReady: metadataComplete && bodiesComplete && indexComplete,
+            SearchReady: metadataComplete
+                && bodiesComplete
+                && indexComplete
+                && (!request.IncludeAttachments || attachmentIndexComplete),
             MetadataComplete: metadataComplete,
             BodiesComplete: bodiesComplete,
             MessageSearchIndexComplete: indexComplete,
+            AttachmentSearchIndexComplete: attachmentIndexComplete,
             ScopeAccountCount: scopedAccountCount,
             ScopeFolderCount: folderStates.Count,
             MetadataCompleteFolderCount: completeFolderCount,
@@ -628,6 +858,10 @@ internal sealed class EmailDatabase
             MessageSearchDocs: counts.MessageSearchDocs,
             FtsRows: counts.FtsRows,
             PendingMessageBodies: counts.PendingMessageBodies,
+            Attachments: counts.Attachments,
+            AttachmentSearchDocs: counts.AttachmentSearchDocs,
+            AttachmentFtsRows: counts.AttachmentFtsRows,
+            PendingAttachments: counts.PendingAttachments,
             ActiveSyncRun: activeSyncRun,
             CoverageNote: coverageNote,
             Freshness: freshness);
@@ -1195,6 +1429,107 @@ internal sealed class EmailDatabase
         return recipients;
     }
 
+    private static IReadOnlyList<StoredAttachment> ReadMessageAttachments(SqliteConnection connection, int messageId)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                id,
+                message_id,
+                parent_attachment_id,
+                root_attachment_id,
+                source_kind,
+                part_id,
+                filename,
+                display_path,
+                archive_entry_path,
+                mime_type,
+                sniffed_mime_type,
+                size_bytes,
+                compressed_size_bytes,
+                uncompressed_size_bytes,
+                content_hash,
+                storage_key,
+                is_container,
+                nesting_depth,
+                download_status,
+                download_error,
+                extraction_status,
+                extraction_error,
+                extracted_text_available,
+                ocr_text_available
+            FROM attachments
+            WHERE message_id = $messageId
+            ORDER BY nesting_depth, display_path COLLATE NOCASE, id;
+            """;
+        AddParameter(command, "$messageId", messageId);
+
+        using var reader = command.ExecuteReader();
+        var attachments = new List<StoredAttachment>();
+
+        while (reader.Read())
+            attachments.Add(ReadStoredAttachment(reader));
+
+        return attachments;
+    }
+
+    private static IReadOnlyList<StoredAttachment> ReadAttachments(
+        SqliteConnection connection,
+        IReadOnlyList<int> attachmentIds)
+    {
+        var distinctIds = attachmentIds
+            .Where(id => id > 0)
+            .Distinct()
+            .ToList();
+
+        if (distinctIds.Count == 0)
+            return [];
+
+        using var command = connection.CreateCommand();
+        var placeholders = distinctIds.Select((_, index) => $"$id{index}").ToList();
+        command.CommandText = $"""
+            SELECT
+                id,
+                message_id,
+                parent_attachment_id,
+                root_attachment_id,
+                source_kind,
+                part_id,
+                filename,
+                display_path,
+                archive_entry_path,
+                mime_type,
+                sniffed_mime_type,
+                size_bytes,
+                compressed_size_bytes,
+                uncompressed_size_bytes,
+                content_hash,
+                storage_key,
+                is_container,
+                nesting_depth,
+                download_status,
+                download_error,
+                extraction_status,
+                extraction_error,
+                extracted_text_available,
+                ocr_text_available
+            FROM attachments
+            WHERE id IN ({string.Join(", ", placeholders)})
+            ORDER BY id;
+            """;
+
+        for (var i = 0; i < distinctIds.Count; i++)
+            AddParameter(command, $"$id{i}", distinctIds[i]);
+
+        using var reader = command.ExecuteReader();
+        var attachments = new List<StoredAttachment>();
+
+        while (reader.Read())
+            attachments.Add(ReadStoredAttachment(reader));
+
+        return attachments;
+    }
+
     private static int UpsertConfiguredAccount(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -1708,8 +2043,14 @@ internal sealed class EmailDatabase
             command.ExecuteNonQuery();
         }
 
-        foreach (var recipient in body.Recipients)
+        foreach (var recipient in body.Recipients ?? [])
             InsertMessageRecipient(connection, transaction, body.MessageId, recipient);
+
+        var attachmentIds = new HashSet<int>();
+        foreach (var attachment in body.Attachments ?? [])
+            UpsertAttachmentTree(connection, transaction, body.MessageId, attachment, parentAttachmentId: null, rootAttachmentId: null, now, attachmentIds);
+
+        DeleteStaleAttachments(connection, transaction, body.MessageId, attachmentIds);
 
         RefreshMessageSearchDocument(connection, transaction, body.MessageId);
 
@@ -1755,6 +2096,348 @@ internal sealed class EmailDatabase
         AddParameter(command, "$type", recipient.Type);
         AddParameter(command, "$name", BlankToNull(recipient.Name));
         AddParameter(command, "$email", BlankToNull(recipient.Email));
+        command.ExecuteNonQuery();
+    }
+
+    private static int UpsertAttachmentTree(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int messageId,
+        AttachmentContent attachment,
+        int? parentAttachmentId,
+        int? rootAttachmentId,
+        string now,
+        HashSet<int> attachmentIds)
+    {
+        var attachmentId = UpsertAttachment(
+            connection,
+            transaction,
+            messageId,
+            attachment,
+            parentAttachmentId,
+            rootAttachmentId,
+            now);
+        var effectiveRootId = rootAttachmentId ?? attachmentId;
+
+        if (rootAttachmentId is null)
+            UpdateAttachmentRoot(connection, transaction, attachmentId, effectiveRootId);
+
+        attachmentIds.Add(attachmentId);
+
+        foreach (var child in attachment.Children ?? [])
+            UpsertAttachmentTree(connection, transaction, messageId, child, attachmentId, effectiveRootId, now, attachmentIds);
+
+        return attachmentId;
+    }
+
+    private static int UpsertAttachment(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int messageId,
+        AttachmentContent attachment,
+        int? parentAttachmentId,
+        int? rootAttachmentId,
+        string now)
+    {
+        using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO attachments (
+                    message_id,
+                    parent_attachment_id,
+                    root_attachment_id,
+                    source_kind,
+                    part_id,
+                    filename,
+                    display_path,
+                    archive_entry_path,
+                    mime_type,
+                    sniffed_mime_type,
+                    size_bytes,
+                    compressed_size_bytes,
+                    uncompressed_size_bytes,
+                    content_hash,
+                    storage_key,
+                    is_container,
+                    nesting_depth,
+                    download_status,
+                    download_attempts,
+                    download_error,
+                    extraction_status,
+                    extraction_attempts,
+                    extraction_started_at,
+                    extraction_lease_until,
+                    extraction_error,
+                    extracted_text_available,
+                    ocr_text_available,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $messageId,
+                    $parentAttachmentId,
+                    $rootAttachmentId,
+                    $sourceKind,
+                    $partId,
+                    $filename,
+                    $displayPath,
+                    $archiveEntryPath,
+                    $mimeType,
+                    $sniffedMimeType,
+                    $sizeBytes,
+                    $compressedSizeBytes,
+                    $uncompressedSizeBytes,
+                    $contentHash,
+                    $storageKey,
+                    $isContainer,
+                    $nestingDepth,
+                    $downloadStatus,
+                    1,
+                    $downloadError,
+                    $extractionStatus,
+                    1,
+                    NULL,
+                    NULL,
+                    $extractionError,
+                    $extractedTextAvailable,
+                    $ocrTextAvailable,
+                    $createdAt,
+                    $updatedAt
+                )
+                ON CONFLICT(message_id, source_kind, display_path) DO UPDATE SET
+                    parent_attachment_id = excluded.parent_attachment_id,
+                    root_attachment_id = COALESCE(excluded.root_attachment_id, attachments.root_attachment_id),
+                    part_id = excluded.part_id,
+                    filename = excluded.filename,
+                    archive_entry_path = excluded.archive_entry_path,
+                    mime_type = excluded.mime_type,
+                    sniffed_mime_type = excluded.sniffed_mime_type,
+                    size_bytes = excluded.size_bytes,
+                    compressed_size_bytes = excluded.compressed_size_bytes,
+                    uncompressed_size_bytes = excluded.uncompressed_size_bytes,
+                    content_hash = excluded.content_hash,
+                    storage_key = excluded.storage_key,
+                    is_container = excluded.is_container,
+                    nesting_depth = excluded.nesting_depth,
+                    download_status = excluded.download_status,
+                    download_attempts = attachments.download_attempts + 1,
+                    download_error = excluded.download_error,
+                    extraction_status = excluded.extraction_status,
+                    extraction_attempts = attachments.extraction_attempts + 1,
+                    extraction_started_at = excluded.extraction_started_at,
+                    extraction_lease_until = excluded.extraction_lease_until,
+                    extraction_error = excluded.extraction_error,
+                    extracted_text_available = excluded.extracted_text_available,
+                    ocr_text_available = excluded.ocr_text_available,
+                    updated_at = excluded.updated_at;
+                """;
+            AddAttachmentParameters(command, messageId, attachment, parentAttachmentId, rootAttachmentId, now);
+            command.ExecuteNonQuery();
+        }
+
+        var attachmentId = ReadAttachmentId(connection, transaction, messageId, attachment.SourceKind, attachment.DisplayPath);
+        UpsertAttachmentText(connection, transaction, attachmentId, attachment, now);
+        RefreshAttachmentSearchDocument(connection, transaction, attachmentId);
+        return attachmentId;
+    }
+
+    private static void AddAttachmentParameters(
+        SqliteCommand command,
+        int messageId,
+        AttachmentContent attachment,
+        int? parentAttachmentId,
+        int? rootAttachmentId,
+        string now)
+    {
+        var extractedTextAvailable = !string.IsNullOrWhiteSpace(attachment.ExtractedText);
+        var ocrTextAvailable = !string.IsNullOrWhiteSpace(attachment.OcrText);
+
+        AddParameter(command, "$messageId", messageId);
+        AddParameter(command, "$parentAttachmentId", parentAttachmentId);
+        AddParameter(command, "$rootAttachmentId", rootAttachmentId);
+        AddParameter(command, "$sourceKind", BlankToNull(attachment.SourceKind) ?? "email_part");
+        AddParameter(command, "$partId", BlankToNull(attachment.PartId));
+        AddParameter(command, "$filename", BlankToNull(attachment.Filename));
+        AddParameter(command, "$displayPath", BlankToNull(attachment.DisplayPath) ?? BlankToNull(attachment.Filename) ?? "attachment");
+        AddParameter(command, "$archiveEntryPath", BlankToNull(attachment.ArchiveEntryPath));
+        AddParameter(command, "$mimeType", BlankToNull(attachment.MimeType));
+        AddParameter(command, "$sniffedMimeType", BlankToNull(attachment.SniffedMimeType));
+        AddParameter(command, "$sizeBytes", attachment.SizeBytes);
+        AddParameter(command, "$compressedSizeBytes", attachment.CompressedSizeBytes);
+        AddParameter(command, "$uncompressedSizeBytes", attachment.UncompressedSizeBytes);
+        AddParameter(command, "$contentHash", BlankToNull(attachment.ContentHash));
+        AddParameter(command, "$storageKey", BlankToNull(attachment.StorageKey));
+        AddParameter(command, "$isContainer", attachment.IsContainer ? 1 : 0);
+        AddParameter(command, "$nestingDepth", attachment.NestingDepth);
+        AddParameter(command, "$downloadStatus", BlankToNull(attachment.DownloadStatus) ?? "not_downloaded");
+        AddParameter(command, "$downloadError", BlankToNull(attachment.DownloadError));
+        AddParameter(command, "$extractionStatus", BlankToNull(attachment.ExtractionStatus) ?? "not_ready");
+        AddParameter(command, "$extractionError", BlankToNull(attachment.ExtractionError));
+        AddParameter(command, "$extractedTextAvailable", extractedTextAvailable ? 1 : 0);
+        AddParameter(command, "$ocrTextAvailable", ocrTextAvailable ? 1 : 0);
+        AddParameter(command, "$createdAt", now);
+        AddParameter(command, "$updatedAt", now);
+    }
+
+    private static int ReadAttachmentId(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int messageId,
+        string sourceKind,
+        string displayPath)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT id
+            FROM attachments
+            WHERE message_id = $messageId
+              AND source_kind = $sourceKind
+              AND display_path = $displayPath
+            LIMIT 1;
+            """;
+        AddParameter(command, "$messageId", messageId);
+        AddParameter(command, "$sourceKind", BlankToNull(sourceKind) ?? "email_part");
+        AddParameter(command, "$displayPath", BlankToNull(displayPath) ?? "attachment");
+        return Convert.ToInt32(command.ExecuteScalar());
+    }
+
+    private static void UpdateAttachmentRoot(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int attachmentId,
+        int rootAttachmentId)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE attachments
+            SET root_attachment_id = $rootAttachmentId
+            WHERE id = $attachmentId;
+            """;
+        AddParameter(command, "$attachmentId", attachmentId);
+        AddParameter(command, "$rootAttachmentId", rootAttachmentId);
+        command.ExecuteNonQuery();
+    }
+
+    private static void UpsertAttachmentText(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int attachmentId,
+        AttachmentContent attachment,
+        string now)
+    {
+        var extractedText = BlankToNull(attachment.ExtractedText);
+        var ocrText = BlankToNull(attachment.OcrText);
+        var combinedText = BlankToNull(string.Join("\n\n", new[] { extractedText, ocrText }.Where(value => !string.IsNullOrWhiteSpace(value))));
+
+        if (combinedText is null)
+        {
+            using var deleteCommand = connection.CreateCommand();
+            deleteCommand.Transaction = transaction;
+            deleteCommand.CommandText = "DELETE FROM attachment_text WHERE attachment_id = $attachmentId;";
+            AddParameter(deleteCommand, "$attachmentId", attachmentId);
+            deleteCommand.ExecuteNonQuery();
+            return;
+        }
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO attachment_text (
+                attachment_id,
+                extracted_text,
+                ocr_text,
+                combined_text,
+                extractor,
+                extracted_at
+            )
+            VALUES (
+                $attachmentId,
+                $extractedText,
+                $ocrText,
+                $combinedText,
+                $extractor,
+                $extractedAt
+            )
+            ON CONFLICT(attachment_id) DO UPDATE SET
+                extracted_text = excluded.extracted_text,
+                ocr_text = excluded.ocr_text,
+                combined_text = excluded.combined_text,
+                extractor = excluded.extractor,
+                extracted_at = excluded.extracted_at;
+            """;
+        AddParameter(command, "$attachmentId", attachmentId);
+        AddParameter(command, "$extractedText", extractedText);
+        AddParameter(command, "$ocrText", ocrText);
+        AddParameter(command, "$combinedText", combinedText);
+        AddParameter(command, "$extractor", BlankToNull(attachment.Extractor));
+        AddParameter(command, "$extractedAt", now);
+        command.ExecuteNonQuery();
+    }
+
+    private static void RefreshAttachmentSearchDocument(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int attachmentId)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO attachment_search_docs (
+                attachment_id,
+                filename,
+                display_path,
+                mime_type,
+                extracted_text
+            )
+            VALUES (
+                $attachmentId,
+                (SELECT filename FROM attachments WHERE id = $attachmentId),
+                (SELECT display_path FROM attachments WHERE id = $attachmentId),
+                (SELECT COALESCE(sniffed_mime_type, mime_type) FROM attachments WHERE id = $attachmentId),
+                (SELECT combined_text FROM attachment_text WHERE attachment_id = $attachmentId)
+            )
+            ON CONFLICT(attachment_id) DO UPDATE SET
+                filename = excluded.filename,
+                display_path = excluded.display_path,
+                mime_type = excluded.mime_type,
+                extracted_text = excluded.extracted_text;
+            """;
+        AddParameter(command, "$attachmentId", attachmentId);
+        command.ExecuteNonQuery();
+    }
+
+    private static void DeleteStaleAttachments(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int messageId,
+        IReadOnlySet<int> attachmentIds)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+
+        if (attachmentIds.Count == 0)
+        {
+            command.CommandText = "DELETE FROM attachments WHERE message_id = $messageId;";
+            AddParameter(command, "$messageId", messageId);
+            command.ExecuteNonQuery();
+            return;
+        }
+
+        var placeholders = attachmentIds.Select((_, index) => $"$id{index}").ToList();
+        command.CommandText = $"""
+            DELETE FROM attachments
+            WHERE message_id = $messageId
+              AND id NOT IN ({string.Join(", ", placeholders)});
+            """;
+        AddParameter(command, "$messageId", messageId);
+
+        var i = 0;
+        foreach (var attachmentId in attachmentIds)
+            AddParameter(command, $"$id{i++}", attachmentId);
+
         command.ExecuteNonQuery();
     }
 
@@ -1977,6 +2660,7 @@ internal sealed class EmailDatabase
             request.HasAttachment,
             request.DateFrom,
             request.DateTo);
+        ApplyAttachmentConditions(query, request.MimeTypes, request.FilenameContains);
 
         using var command = query.CreateCommand();
         query.AddSqlParameter("$dateFrom", request.DateFrom);
@@ -1984,14 +2668,18 @@ internal sealed class EmailDatabase
 
         using var reader = (SqliteDataReader)command.ExecuteReader();
         if (!reader.Read())
-            return new(0, 0, 0, 0, 0);
+            return new(0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         return new(
             MetadataMessages: reader.GetInt32(reader.GetOrdinal("metadata_messages")),
             IndexedMessageBodies: reader.GetInt32(reader.GetOrdinal("indexed_message_bodies")),
             MessageSearchDocs: reader.GetInt32(reader.GetOrdinal("message_search_docs")),
             FtsRows: reader.GetInt32(reader.GetOrdinal("fts_rows")),
-            PendingMessageBodies: reader.GetInt32(reader.GetOrdinal("pending_message_bodies")));
+            PendingMessageBodies: reader.GetInt32(reader.GetOrdinal("pending_message_bodies")),
+            Attachments: reader.GetInt32(reader.GetOrdinal("attachments")),
+            AttachmentSearchDocs: reader.GetInt32(reader.GetOrdinal("attachment_search_docs")),
+            AttachmentFtsRows: reader.GetInt32(reader.GetOrdinal("attachment_fts_rows")),
+            PendingAttachments: reader.GetInt32(reader.GetOrdinal("pending_attachments")));
     }
 
     private static void ApplyScopeConditions(
@@ -2015,6 +2703,17 @@ internal sealed class EmailDatabase
 
         if (hasAttachment is bool hasAttachments)
             query.SetCondition("hasAttachments", hasAttachments ? 1 : 0);
+    }
+
+    private static void ApplyAttachmentConditions(
+        DbQuery query,
+        IReadOnlyList<string> mimeTypes,
+        string filenameContains)
+    {
+        if (HasValues(mimeTypes))
+            query.SetCondition("mimeTypes", mimeTypes.Select(mimeType => mimeType.Trim().ToLowerInvariant()).ToList());
+
+        query.SetCondition("filenameContains", BlankToNull(filenameContains), StringOperator.Contains, ignoreIfNull: true);
     }
 
     private static DbQuery CreateDbQuery(SqliteConnection connection, string sql)
@@ -2855,6 +3554,33 @@ internal sealed class EmailDatabase
         return reader.IsDBNull(ordinal) ? null : reader.GetInt64(ordinal);
     }
 
+    private static StoredAttachment ReadStoredAttachment(SqliteDataReader reader) =>
+        new(
+            AttachmentId: reader.GetInt32(reader.GetOrdinal("id")),
+            MessageId: reader.GetInt32(reader.GetOrdinal("message_id")),
+            ParentAttachmentId: GetNullableInt(reader, "parent_attachment_id"),
+            RootAttachmentId: GetNullableInt(reader, "root_attachment_id"),
+            SourceKind: reader.GetString(reader.GetOrdinal("source_kind")),
+            PartId: GetNullableString(reader, "part_id"),
+            Filename: GetNullableString(reader, "filename"),
+            DisplayPath: reader.GetString(reader.GetOrdinal("display_path")),
+            ArchiveEntryPath: GetNullableString(reader, "archive_entry_path"),
+            MimeType: GetNullableString(reader, "mime_type"),
+            SniffedMimeType: GetNullableString(reader, "sniffed_mime_type"),
+            SizeBytes: GetNullableInt64(reader, "size_bytes"),
+            CompressedSizeBytes: GetNullableInt64(reader, "compressed_size_bytes"),
+            UncompressedSizeBytes: GetNullableInt64(reader, "uncompressed_size_bytes"),
+            ContentHash: GetNullableString(reader, "content_hash"),
+            StorageKey: GetNullableString(reader, "storage_key"),
+            IsContainer: reader.GetInt32(reader.GetOrdinal("is_container")) != 0,
+            NestingDepth: reader.GetInt32(reader.GetOrdinal("nesting_depth")),
+            DownloadStatus: reader.GetString(reader.GetOrdinal("download_status")),
+            DownloadError: GetNullableString(reader, "download_error"),
+            ExtractionStatus: reader.GetString(reader.GetOrdinal("extraction_status")),
+            ExtractionError: GetNullableString(reader, "extraction_error"),
+            ExtractedTextAvailable: reader.GetInt32(reader.GetOrdinal("extracted_text_available")) != 0,
+            OcrTextAvailable: reader.GetInt32(reader.GetOrdinal("ocr_text_available")) != 0);
+
     private sealed record MessageSearchFolderState(
         int FolderId,
         int HistoryDays,
@@ -2867,7 +3593,11 @@ internal sealed class EmailDatabase
         int IndexedMessageBodies,
         int MessageSearchDocs,
         int FtsRows,
-        int PendingMessageBodies);
+        int PendingMessageBodies,
+        int Attachments,
+        int AttachmentSearchDocs,
+        int AttachmentFtsRows,
+        int PendingAttachments);
 
     private sealed record MetadataSyncState(
         int SinceDays,
@@ -3015,6 +3745,164 @@ internal sealed class EmailDatabase
         LIMIT $limit;
         """;
 
+    private const string SearchAttachmentsSql = """
+        SELECT
+            m.id AS message_id,
+            a.name AS account_name,
+            (
+                SELECT group_concat(folder_path, ', ')
+                FROM (
+                    SELECT DISTINCT f.path AS folder_path
+                    FROM message_locations ml
+                    JOIN folders f ON f.id = ml.folder_id
+                    WHERE ml.message_id = m.id
+                      AND ml.deleted_locally = 0
+                      AND ml.expunged = 0
+                    ORDER BY f.path COLLATE NOCASE
+                )
+            ) AS folders,
+            COALESCE(m.date_sent, m.date_received) AS message_date,
+            m.from_name,
+            m.from_email,
+            m.subject,
+            m.has_attachments,
+            NULL AS snippet,
+            snippet(attachments_fts, -1, '[', ']', ' ... ', $snippetTokens) AS attachment_snippet,
+            bm25(attachments_fts) AS score,
+            att.id,
+            att.parent_attachment_id,
+            att.root_attachment_id,
+            att.source_kind,
+            att.part_id,
+            att.filename,
+            att.display_path,
+            att.archive_entry_path,
+            att.mime_type,
+            att.sniffed_mime_type,
+            att.size_bytes,
+            att.compressed_size_bytes,
+            att.uncompressed_size_bytes,
+            att.content_hash,
+            att.storage_key,
+            att.is_container,
+            att.nesting_depth,
+            att.download_status,
+            att.download_error,
+            att.extraction_status,
+            att.extraction_error,
+            att.extracted_text_available,
+            att.ocr_text_available
+        FROM attachments_fts
+        JOIN attachment_search_docs ad ON ad.attachment_id = attachments_fts.rowid
+        JOIN attachments att ON att.id = ad.attachment_id
+        JOIN messages m ON m.id = att.message_id
+        JOIN accounts a ON a.id = m.account_id
+        WHERE attachments_fts MATCH $fts
+          AND ($dateFrom IS NULL OR COALESCE(m.date_sent, m.date_received) >= $dateFrom)
+          AND ($dateTo IS NULL OR COALESCE(m.date_sent, m.date_received) <= $dateTo)
+        {AND
+            {m.account_id [accountIds]}
+            {m.from_email COLLATE NOCASE [fromEmail]}
+            {m.has_attachments [hasAttachments]}
+            {LOWER(COALESCE(att.sniffed_mime_type, att.mime_type, '')) [mimeTypes]}
+            {att.display_path [filenameContains]}
+            {m.id IN (
+                SELECT r_to.message_id
+                FROM message_recipients r_to
+                WHERE r_to.type = 'to'
+                  {AND {r_to.email COLLATE NOCASE [toEmail]}}
+            )}
+            {EXISTS (
+                SELECT 1
+                FROM message_locations ml_filter
+                JOIN folders f_filter ON f_filter.id = ml_filter.folder_id
+                WHERE ml_filter.message_id = m.id
+                  AND ml_filter.deleted_locally = 0
+                  AND ml_filter.expunged = 0
+                  {AND {f_filter.role [folderRoles]}}
+            )}}
+        ORDER BY score, COALESCE(m.date_sent, m.date_received, '') DESC, att.id
+        LIMIT $limit;
+        """;
+
+    private const string BrowseAttachmentsSql = """
+        SELECT
+            m.id AS message_id,
+            a.name AS account_name,
+            (
+                SELECT group_concat(folder_path, ', ')
+                FROM (
+                    SELECT DISTINCT f.path AS folder_path
+                    FROM message_locations ml
+                    JOIN folders f ON f.id = ml.folder_id
+                    WHERE ml.message_id = m.id
+                      AND ml.deleted_locally = 0
+                      AND ml.expunged = 0
+                    ORDER BY f.path COLLATE NOCASE
+                )
+            ) AS folders,
+            COALESCE(m.date_sent, m.date_received) AS message_date,
+            m.from_name,
+            m.from_email,
+            m.subject,
+            m.has_attachments,
+            NULL AS snippet,
+            NULL AS attachment_snippet,
+            0.0 AS score,
+            att.id,
+            att.parent_attachment_id,
+            att.root_attachment_id,
+            att.source_kind,
+            att.part_id,
+            att.filename,
+            att.display_path,
+            att.archive_entry_path,
+            att.mime_type,
+            att.sniffed_mime_type,
+            att.size_bytes,
+            att.compressed_size_bytes,
+            att.uncompressed_size_bytes,
+            att.content_hash,
+            att.storage_key,
+            att.is_container,
+            att.nesting_depth,
+            att.download_status,
+            att.download_error,
+            att.extraction_status,
+            att.extraction_error,
+            att.extracted_text_available,
+            att.ocr_text_available
+        FROM attachments att
+        JOIN attachment_search_docs ad ON ad.attachment_id = att.id
+        JOIN messages m ON m.id = att.message_id
+        JOIN accounts a ON a.id = m.account_id
+        WHERE ($dateFrom IS NULL OR COALESCE(m.date_sent, m.date_received) >= $dateFrom)
+          AND ($dateTo IS NULL OR COALESCE(m.date_sent, m.date_received) <= $dateTo)
+        {AND
+            {m.account_id [accountIds]}
+            {m.from_email COLLATE NOCASE [fromEmail]}
+            {m.has_attachments [hasAttachments]}
+            {LOWER(COALESCE(att.sniffed_mime_type, att.mime_type, '')) [mimeTypes]}
+            {att.display_path [filenameContains]}
+            {m.id IN (
+                SELECT r_to.message_id
+                FROM message_recipients r_to
+                WHERE r_to.type = 'to'
+                  {AND {r_to.email COLLATE NOCASE [toEmail]}}
+            )}
+            {EXISTS (
+                SELECT 1
+                FROM message_locations ml_filter
+                JOIN folders f_filter ON f_filter.id = ml_filter.folder_id
+                WHERE ml_filter.message_id = m.id
+                  AND ml_filter.deleted_locally = 0
+                  AND ml_filter.expunged = 0
+                  {AND {f_filter.role [folderRoles]}}
+            )}}
+        ORDER BY COALESCE(m.date_sent, m.date_received, '') DESC, m.id DESC, att.display_path COLLATE NOCASE
+        LIMIT $limit;
+        """;
+
     private const string SearchReadinessFoldersSql = """
         SELECT
             f.id AS folder_id,
@@ -3045,7 +3933,13 @@ internal sealed class EmailDatabase
             COUNT(DISTINCT fts.rowid) AS fts_rows,
             COUNT(DISTINCT CASE
                 WHEN m.body_downloaded = 0 OR b.message_id IS NULL THEN m.id
-            END) AS pending_message_bodies
+            END) AS pending_message_bodies,
+            COUNT(DISTINCT att.id) AS attachments,
+            COUNT(DISTINCT ads.attachment_id) AS attachment_search_docs,
+            COUNT(DISTINCT afts.rowid) AS attachment_fts_rows,
+            COUNT(DISTINCT CASE
+                WHEN att.extraction_status IN ('not_ready', 'pending', 'running') THEN att.id
+            END) AS pending_attachments
         FROM messages m
         JOIN accounts a ON a.id = m.account_id
         JOIN message_locations ml ON ml.message_id = m.id
@@ -3053,6 +3947,9 @@ internal sealed class EmailDatabase
         LEFT JOIN message_bodies b ON b.message_id = m.id
         LEFT JOIN message_search_docs d ON d.message_id = m.id
         LEFT JOIN messages_fts fts ON fts.rowid = m.id
+        LEFT JOIN attachments att ON att.message_id = m.id
+        LEFT JOIN attachment_search_docs ads ON ads.attachment_id = att.id
+        LEFT JOIN attachments_fts afts ON afts.rowid = att.id
         WHERE a.enabled = 1
           AND f.selectable = 1
           AND f.sync_enabled = 1
@@ -3064,6 +3961,8 @@ internal sealed class EmailDatabase
             {m.account_id [accountIds]}
             {m.from_email COLLATE NOCASE [fromEmail]}
             {m.has_attachments [hasAttachments]}
+            {LOWER(COALESCE(att.sniffed_mime_type, att.mime_type, '')) [mimeTypes]}
+            {att.display_path [filenameContains]}
             {m.id IN (
                 SELECT r_to.message_id
                 FROM message_recipients r_to

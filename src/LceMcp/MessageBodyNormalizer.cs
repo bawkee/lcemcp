@@ -6,19 +6,23 @@ namespace LceMcp;
 
 internal static class MessageBodyNormalizer
 {
-    public static MessageBodyContent FromMimeMessage(int messageId, MimeMessage message)
+    public static MessageBodyContent FromMimeMessage(
+        int messageId,
+        MimeMessage message,
+        IReadOnlyList<AttachmentContent> attachments = null)
     {
         var plainText = BlankToNull(message.TextBody);
         var htmlText = BlankToNull(message.HtmlBody);
 
-        return FromParts(messageId, plainText, htmlText, ReadRecipients(message));
+        return FromParts(messageId, plainText, htmlText, ReadRecipients(message), attachments);
     }
 
     public static MessageBodyContent FromParts(
         int messageId,
         string plainText,
         string htmlText,
-        IReadOnlyList<MessageRecipient> recipients)
+        IReadOnlyList<MessageRecipient> recipients,
+        IReadOnlyList<AttachmentContent> attachments = null)
     {
         plainText = BlankToNull(plainText);
         htmlText = BlankToNull(htmlText);
@@ -29,7 +33,8 @@ internal static class MessageBodyNormalizer
             PlainText: plainText,
             HtmlText: htmlText,
             NormalizedText: normalizedText,
-            Recipients: recipients ?? []);
+            Recipients: recipients ?? [],
+            Attachments: attachments ?? []);
     }
 
     private static IReadOnlyList<MessageRecipient> ReadRecipients(MimeMessage message)
