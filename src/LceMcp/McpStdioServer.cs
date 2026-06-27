@@ -1307,6 +1307,7 @@ internal sealed class McpStdioServer
             ["messages_indexed"] = readiness.MessageSearchDocs,
             ["attachments_indexed"] = readiness.AttachmentSearchDocs,
             ["extraction_pending"] = readiness.PendingAttachments,
+            ["attachment_messages_pending_scan"] = readiness.PendingAttachmentMessages,
             ["folders"] = includeFolders ? ToFoldersJson(folders) : null
         };
     }
@@ -1882,6 +1883,7 @@ internal sealed class McpStdioServer
             ["attachment_search_docs"] = readiness.AttachmentSearchDocs,
             ["attachment_fts_rows"] = readiness.AttachmentFtsRows,
             ["pending_attachments"] = readiness.PendingAttachments,
+            ["pending_attachment_messages"] = readiness.PendingAttachmentMessages,
             ["coverage_note"] = StringOrNull(readiness.CoverageNote),
             ["active_sync_run"] = readiness.ActiveSyncRun is null ? null : ToSyncProgressJson(readiness.ActiveSyncRun)
         };
@@ -1935,6 +1937,7 @@ internal sealed class McpStdioServer
             AttachmentSearchDocs: 0,
             AttachmentFtsRows: 0,
             PendingAttachments: 0,
+            PendingAttachmentMessages: 0,
             ActiveSyncRun: activeSyncRun,
             Freshness: freshness);
     }

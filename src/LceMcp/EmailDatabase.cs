@@ -376,7 +376,10 @@ internal sealed class EmailDatabase
                 JOIN messages m ON m.id = ml.message_id
                 JOIN folders f ON f.id = ml.folder_id
                 WHERE ml.folder_id = $folderId
-                  AND m.body_downloaded = 0
+                  AND (
+                      m.body_downloaded = 0
+                      OR (m.has_attachments = 1 AND m.attachments_scanned = 0)
+                  )
                   AND ml.deleted_locally = 0
                   AND ml.expunged = 0
                 ORDER BY COALESCE(m.date_sent, m.date_received, '') DESC,
@@ -820,6 +823,7 @@ internal sealed class EmailDatabase
                 AttachmentSearchDocs: 0,
                 AttachmentFtsRows: 0,
                 PendingAttachments: 0,
+                PendingAttachmentMessages: 0,
                 ActiveSyncRun: activeSyncRun,
                 Freshness: BuildSearchFreshness([], request, now));
         }
@@ -840,7 +844,8 @@ internal sealed class EmailDatabase
             && counts.MetadataMessages == counts.FtsRows;
         var attachmentIndexComplete = counts.Attachments == counts.AttachmentSearchDocs
             && counts.Attachments == counts.AttachmentFtsRows
-            && counts.PendingAttachments == 0;
+            && counts.PendingAttachments == 0
+            && counts.PendingAttachmentMessages == 0;
 
         return new(
             SearchReady: metadataComplete
@@ -863,6 +868,7 @@ internal sealed class EmailDatabase
             AttachmentSearchDocs: counts.AttachmentSearchDocs,
             AttachmentFtsRows: counts.AttachmentFtsRows,
             PendingAttachments: counts.PendingAttachments,
+            PendingAttachmentMessages: counts.PendingAttachmentMessages,
             ActiveSyncRun: activeSyncRun,
             CoverageNote: coverageNote,
             Freshness: freshness);
@@ -2062,6 +2068,7 @@ internal sealed class EmailDatabase
                 UPDATE messages
                 SET
                     body_downloaded = 1,
+                    attachments_scanned = 1,
                     updated_at = $updatedAt
                 WHERE id = $messageId;
                 """;
@@ -2661,7 +2668,6 @@ internal sealed class EmailDatabase
             request.HasAttachment,
             request.DateFrom,
             request.DateTo);
-        ApplyAttachmentConditions(query, request.MimeTypes, request.FilenameContains);
 
         using var command = query.CreateCommand();
         query.AddSqlParameter("$dateFrom", request.DateFrom);
@@ -2669,7 +2675,7 @@ internal sealed class EmailDatabase
 
         using var reader = (SqliteDataReader)command.ExecuteReader();
         if (!reader.Read())
-            return new(0, 0, 0, 0, 0, 0, 0, 0, 0);
+            return new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         return new(
             MetadataMessages: reader.GetInt32(reader.GetOrdinal("metadata_messages")),
@@ -2680,7 +2686,8 @@ internal sealed class EmailDatabase
             Attachments: reader.GetInt32(reader.GetOrdinal("attachments")),
             AttachmentSearchDocs: reader.GetInt32(reader.GetOrdinal("attachment_search_docs")),
             AttachmentFtsRows: reader.GetInt32(reader.GetOrdinal("attachment_fts_rows")),
-            PendingAttachments: reader.GetInt32(reader.GetOrdinal("pending_attachments")));
+            PendingAttachments: reader.GetInt32(reader.GetOrdinal("pending_attachments")),
+            PendingAttachmentMessages: reader.GetInt32(reader.GetOrdinal("pending_attachment_messages")));
     }
 
     private static void ApplyScopeConditions(
@@ -3598,7 +3605,8 @@ internal sealed class EmailDatabase
         int Attachments,
         int AttachmentSearchDocs,
         int AttachmentFtsRows,
-        int PendingAttachments);
+        int PendingAttachments,
+        int PendingAttachmentMessages);
 
     private sealed record MetadataSyncState(
         int SinceDays,
@@ -3956,7 +3964,10 @@ internal sealed class EmailDatabase
             COUNT(DISTINCT afts.rowid) AS attachment_fts_rows,
             COUNT(DISTINCT CASE
                 WHEN att.extraction_status IN ('not_ready', 'pending', 'running') THEN att.id
-            END) AS pending_attachments
+            END) AS pending_attachments,
+            COUNT(DISTINCT CASE
+                WHEN m.has_attachments = 1 AND m.attachments_scanned = 0 THEN m.id
+            END) AS pending_attachment_messages
         FROM messages m
         JOIN accounts a ON a.id = m.account_id
         JOIN message_locations ml ON ml.message_id = m.id
@@ -3978,8 +3989,6 @@ internal sealed class EmailDatabase
             {m.account_id [accountIds]}
             {m.from_email COLLATE NOCASE [fromEmail]}
             {m.has_attachments [hasAttachments]}
-            {LOWER(COALESCE(att.sniffed_mime_type, att.mime_type, '')) [mimeTypes]}
-            {att.display_path [filenameContains]}
             {m.id IN (
                 SELECT r_to.message_id
                 FROM message_recipients r_to

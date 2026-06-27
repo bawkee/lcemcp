@@ -15,8 +15,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Created, status.InitializationKind);
-        Assert.Equal(6, status.SchemaVersion);
-        Assert.Equal(6, status.TargetSchemaVersion);
+        Assert.Equal(7, status.SchemaVersion);
+        Assert.Equal(7, status.TargetSchemaVersion);
         Assert.Equal(0, status.AccountCount);
         Assert.Equal(0, status.FolderCount);
         Assert.Equal(0, status.MessageCount);
@@ -68,8 +68,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Opened, status.InitializationKind);
-        Assert.Equal(6, status.SchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search"], ReadNames(
+        Assert.Equal(7, status.SchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search", "attachment_scan_tracking"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
     }
@@ -98,9 +98,9 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Migrated, status.InitializationKind);
-        Assert.Equal(6, status.SchemaVersion);
-        Assert.Equal(6, status.TargetSchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search"], ReadNames(
+        Assert.Equal(7, status.SchemaVersion);
+        Assert.Equal(7, status.TargetSchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search", "attachment_scan_tracking"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
         Assert.Contains("message_search_docs", ReadNames(
@@ -109,6 +109,9 @@ public sealed class EmailDatabaseTests
         Assert.Contains("sync_runs", ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;"));
+        Assert.Contains("attachments_scanned", ReadNames(
+            temp.Paths.DatabasePath,
+            "SELECT name FROM pragma_table_info('messages') ORDER BY cid;"));
         Assert.Contains("sync_leases", ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;"));
@@ -431,6 +434,73 @@ public sealed class EmailDatabaseTests
         Assert.Equal(2, status.MessageSearchDocCount);
         Assert.Single(alphaResults);
         Assert.Single(betaResults);
+    }
+
+    [Fact]
+    public void PendingBodyTargetsBackfillLegacyAttachmentMessagesOnce()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:legacy-attachment",
+                messageIdHeader: "legacy-attachment@example.com",
+                hasAttachments: true),
+            TestData.Message(
+                providerUid: "101",
+                providerMessageKey: "emailid:legacy-no-attachment",
+                messageIdHeader: "legacy-no-attachment@example.com",
+                hasAttachments: false)
+        ], SyncStateJson(matchedCount: 2, selectedCount: 2, fetchedCount: 2), 101);
+        var messageIds = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages ORDER BY id;");
+
+        database.UpsertMessageBodies([
+            new(messageIds[0], "Attachment body", null, "Attachment body", []),
+            new(messageIds[1], "Ordinary body", null, "Ordinary body", [])
+        ]);
+        ExecuteNonQuery(temp.Paths.DatabasePath, "UPDATE messages SET attachments_scanned = 0;");
+
+        var messageOnly = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null));
+        var withAttachments = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            IncludeAttachments: true,
+            MimeTypes: ["application/pdf"]));
+        var pending = database.ReadPendingBodySyncTargets("yahoo", "Inbox", maxPerFolder: 0);
+
+        var target = Assert.Single(pending);
+        Assert.Equal(messageIds[0], target.MessageId);
+        Assert.True(messageOnly.SearchReady);
+        Assert.False(withAttachments.SearchReady);
+        Assert.False(withAttachments.AttachmentSearchIndexComplete);
+        Assert.Equal(1, withAttachments.PendingAttachmentMessages);
+
+        database.UpsertMessageBody(new(messageIds[0], "Attachment body", null, "Attachment body", []));
+
+        var completed = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            IncludeAttachments: true));
+
+        Assert.Empty(database.ReadPendingBodySyncTargets("yahoo", "Inbox", maxPerFolder: 0));
+        Assert.True(completed.SearchReady);
+        Assert.True(completed.AttachmentSearchIndexComplete);
+        Assert.Equal(0, completed.PendingAttachmentMessages);
     }
 
     [Fact]

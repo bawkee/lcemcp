@@ -413,9 +413,18 @@ Sanity-check/test hardening on 2026-06-26:
 - Extended MCP stdio coverage for attachment-scoped `email_search` with MIME filters in addition to `email_get_attachment_text` and `email_prepare_attachment_access`.
 - `dotnet build lcemcp.slnx /p:UseSharedCompilation=false` succeeded and `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 53 tests.
 
+Legacy attachment backfill on 2026-06-27:
+
+- Added migration 7, `attachment_scan_tracking`, with a per-message `attachments_scanned` marker. Normal body sync now selects either missing bodies or attachment-bearing messages that predate attachment indexing, and marks attachment scanning complete in the same transaction that persists the refreshed body/attachment tree.
+- Attachment readiness now reports unscanned attachment-bearing messages and remains incomplete until those messages have been processed. MIME/filename-filtered attachment readiness stays conservative while unscanned messages exist because their attachment metadata is not available yet.
+- Added an integration regression proving legacy attachment messages are queued once, ordinary already-indexed messages are not re-downloaded, filtered attachment readiness reports the gap, and a completed scan removes the target.
+- Live Yahoo backfill found 55 attachment-bearing messages among 365 already-indexed messages. `sync-bodies --account yahoo --max-per-folder 0 --batch-size 10` refreshed 46 Inbox and 9 Sent messages, with 55 fetched/persisted and 0 missing.
+- The live cache now has 224 attachment rows, 172 attachment-text rows, and 224 attachment search documents/FTS rows. Attachment readiness reports 0 pending extractions, 0 unscanned messages, and a complete index. A filter-only attachment search returned an indexed result.
+- An immediate uncapped rerun selected 0 targets, confirming the backfill is idempotent.
+- `dotnet test lcemcp.slnx /p:UseSharedCompilation=false` passed with 54 tests before the live run.
+
 Next work:
 
-- Run a bounded live Yahoo body sync against attachment-bearing messages and verify attachment rows, text extraction statuses, and attachment search results without recording private snippets in TODO.
 - Add focused extractor fixture tests for actual PDF, DOCX, XLSX, HTML/CSV, and ZIP inputs, including archive child search and zip-slip/limit cases.
 - Add ZIP safety status rows for skipped individual entries where useful; the first implementation skips unsafe/too-large entries inside an otherwise processed archive.
 - Decide whether to add SharpCompress or another maintained dependency for 7z. For now, 7z attachments are stored when within size limits but marked `unsupported` for expansion.

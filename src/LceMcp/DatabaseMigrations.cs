@@ -9,7 +9,8 @@ internal static class DatabaseMigrations
         new(3, "sync_runs_and_search_readiness", SyncRunsAndReadinessSql),
         new(4, "sync_queue_and_leases", SyncQueueAndLeasesSql),
         new(5, "sync_window_tracking", SyncWindowTrackingSql),
-        new(6, "attachment_metadata_and_search", AttachmentSearchSchemaSql)
+        new(6, "attachment_metadata_and_search", AttachmentSearchSchemaSql),
+        new(7, "attachment_scan_tracking", AttachmentScanTrackingSql)
     ];
 
     public static int TargetVersion => All.Select(migration => migration.Version).DefaultIfEmpty(0).Max();
@@ -340,5 +341,12 @@ internal static class DatabaseMigrations
         CREATE INDEX IF NOT EXISTS idx_attachments_display_path ON attachments(message_id, display_path);
         CREATE INDEX IF NOT EXISTS idx_attachments_extraction_status ON attachments(extraction_status, extraction_lease_until);
         CREATE INDEX IF NOT EXISTS idx_attachments_mime ON attachments(sniffed_mime_type, mime_type);
+        """;
+
+    public const string AttachmentScanTrackingSql = """
+        ALTER TABLE messages ADD COLUMN attachments_scanned INTEGER NOT NULL DEFAULT 0;
+
+        CREATE INDEX IF NOT EXISTS idx_messages_attachment_scan
+        ON messages(account_id, has_attachments, attachments_scanned);
         """;
 }

@@ -1048,7 +1048,7 @@ internal static class CliApp
     {
         if (result.Folders.Count == 0)
         {
-            Console.WriteLine($"Body sync summary for '{result.AccountId}': no pending message bodies.");
+            Console.WriteLine($"Body sync summary for '{result.AccountId}': no pending message bodies or attachment scans.");
             return;
         }
 
@@ -1107,7 +1107,8 @@ internal static class CliApp
         Console.WriteLine(
             $"Attachment search scope: attachments={readiness.Attachments} "
             + $"search_docs={readiness.AttachmentSearchDocs} fts_rows={readiness.AttachmentFtsRows} "
-            + $"pending={readiness.PendingAttachments} index={FormatBool(readiness.AttachmentSearchIndexComplete)}");
+            + $"pending={readiness.PendingAttachments} unscanned_messages={readiness.PendingAttachmentMessages} "
+            + $"index={FormatBool(readiness.AttachmentSearchIndexComplete)}");
 
         if (!string.IsNullOrWhiteSpace(readiness.CoverageNote))
             Console.WriteLine($"Message search coverage: {readiness.CoverageNote}");
@@ -1299,7 +1300,7 @@ internal static class CliApp
           folders           List persisted folders from local SQLite storage.
           set-folder-sync   Enable or disable syncing for one persisted folder.
           sync              Sync bounded message envelope metadata into local SQLite storage.
-          sync-bodies       Download body text for already-synced message metadata and index it locally.
+          sync-bodies       Download pending body text and backfill unscanned attachments.
           search            Search local indexed message metadata and body text.
           serve             Run the MCP stdio server. Writes protocol messages only to stdout.
           mcp-config        Print MCP client configuration for this executable.
@@ -1377,7 +1378,7 @@ internal static class CliApp
         sync-bodies options:
           --account <id-or-email>  Optional. Default: all enabled accounts.
           --folder <path-or-name>  Optional. Default: all cached selectable sync-enabled folders.
-          --max-per-folder <n>     Default: 50 pending bodies per folder. Use 0 for no cap.
+          --max-per-folder <n>     Default: 50 pending bodies/attachment scans per folder. Use 0 for no cap.
           --batch-size <n>         Default: 10. Fetches bodies in bounded loops.
 
         search options:

@@ -30,6 +30,7 @@ internal sealed record MessageSearchReadiness(
     int AttachmentSearchDocs,
     int AttachmentFtsRows,
     int PendingAttachments,
+    int PendingAttachmentMessages,
     SyncRunSnapshot ActiveSyncRun,
     string CoverageNote = null,
     SearchFreshness Freshness = null);
