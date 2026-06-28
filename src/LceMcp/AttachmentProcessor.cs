@@ -1,7 +1,9 @@
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using UglyToad.PdfPig;
@@ -10,19 +12,32 @@ namespace LceMcp;
 
 internal sealed class AttachmentProcessor
 {
-    private const long MaxAttachmentBytes = 25L * 1024 * 1024;
+    internal const long MaxAttachmentBytes = 25L * 1024 * 1024;
     private const int MaxExtractedChars = 1_000_000;
     private const int MaxArchiveDepth = 3;
     private const int MaxArchiveEntries = 200;
     private const long MaxArchiveEntryBytes = 25L * 1024 * 1024;
     private const long MaxArchiveTotalUncompressedBytes = 100L * 1024 * 1024;
     private const double MaxArchiveCompressionRatio = 100d;
+    internal const string ProcessorVersion = "1";
+    // Terminal means a leaf document such as PDF/DOCX/TXT, as opposed to a ZIP
+    // container. The process-wide gate prevents multiple timed-out, non-cancelable
+    // library calls from accumulating; a timed-out task retains the gate until it exits.
+    private static readonly SemaphoreSlim TerminalExtractionGate = new(1, 1);
+    private static readonly TimeSpan DefaultExtractionTimeout = TimeSpan.FromSeconds(30);
 
     private readonly AttachmentObjectStore _objectStore;
+    private readonly Func<AttachmentExtractionInput, AttachmentExtractionOutput> _terminalExtractor;
+    private readonly TimeSpan _extractionTimeout;
 
-    public AttachmentProcessor(AttachmentObjectStore objectStore)
+    public AttachmentProcessor(
+        AttachmentObjectStore objectStore,
+        Func<AttachmentExtractionInput, AttachmentExtractionOutput> terminalExtractor = null,
+        TimeSpan? extractionTimeout = null)
     {
         _objectStore = objectStore;
+        _terminalExtractor = terminalExtractor;
+        _extractionTimeout = extractionTimeout ?? DefaultExtractionTimeout;
     }
 
     public AttachmentContent ProcessEmailAttachment(
@@ -47,27 +62,118 @@ internal sealed class AttachmentProcessor
             NestingDepth: 0);
     }
 
+    public AttachmentContent ProcessStoredAttachment(StoredAttachment attachment, byte[] content) =>
+        ProcessStoredAttachment(
+            SourceKind: attachment.SourceKind,
+            PartId: attachment.PartId,
+            Filename: attachment.Filename,
+            DisplayPath: attachment.DisplayPath,
+            ArchiveEntryPath: attachment.ArchiveEntryPath,
+            MimeType: attachment.MimeType,
+            DeclaredSizeBytes: attachment.SizeBytes,
+            CompressedSizeBytes: attachment.CompressedSizeBytes,
+            UncompressedSizeBytes: attachment.UncompressedSizeBytes,
+            Content: content,
+            NestingDepth: attachment.NestingDepth);
+
+    public AttachmentContent RejectEmailAttachment(
+        string partId,
+        string filename,
+        string mimeType,
+        long? declaredSizeBytes,
+        string displayPath,
+        string errorCode,
+        string error,
+        Exception exception = null)
+    {
+        var safeFilename = BlankToNull(Path.GetFileName((filename ?? "").Replace('\\', '/'))) ?? "attachment";
+        var safeDisplayPath = BlankToNull(displayPath) ?? safeFilename;
+
+        return Node(
+            SourceKind: "email_part",
+            PartId: partId,
+            Filename: safeFilename,
+            DisplayPath: safeDisplayPath,
+            ArchiveEntryPath: null,
+            MimeType: mimeType,
+            SniffedMimeType: GuessMimeType(safeFilename),
+            SizeBytes: declaredSizeBytes,
+            CompressedSizeBytes: null,
+            UncompressedSizeBytes: declaredSizeBytes,
+            ContentHash: null,
+            StorageKey: null,
+            IsContainer: IsZip(mimeType ?? "", safeFilename) || IsSevenZip(mimeType ?? "", safeFilename),
+            NestingDepth: 0,
+            DownloadStatus: errorCode == "attachment_too_large" ? "skipped" : "failed",
+            DownloadError: error,
+            ExtractionStatus: "failed",
+            ExtractionError: error,
+            ExtractedText: null,
+            Extractor: null,
+            Children: [],
+            ExtractionErrorCode: errorCode,
+            Exception: exception,
+            DownloadErrorCode: errorCode);
+    }
+
+    public AttachmentContent CreateEmailAttachmentMetadata(
+        string partId,
+        string filename,
+        string mimeType,
+        long? declaredSizeBytes,
+        string displayPath)
+    {
+        var safeFilename = BlankToNull(Path.GetFileName((filename ?? "").Replace('\\', '/'))) ?? "attachment";
+        var safeDisplayPath = BlankToNull(displayPath) ?? safeFilename;
+        var sniffedMimeType = GuessMimeType(safeFilename);
+        return Node(
+            SourceKind: "email_part",
+            PartId: partId,
+            Filename: safeFilename,
+            DisplayPath: safeDisplayPath,
+            ArchiveEntryPath: null,
+            MimeType: mimeType,
+            SniffedMimeType: sniffedMimeType,
+            SizeBytes: declaredSizeBytes,
+            CompressedSizeBytes: null,
+            UncompressedSizeBytes: declaredSizeBytes,
+            ContentHash: null,
+            StorageKey: null,
+            IsContainer: IsZip(sniffedMimeType, safeFilename) || IsSevenZip(sniffedMimeType, safeFilename),
+            NestingDepth: 0,
+            DownloadStatus: "pending",
+            DownloadError: null,
+            ExtractionStatus: "not_ready",
+            ExtractionError: null,
+            ExtractedText: null,
+            Extractor: null,
+            Children: []);
+    }
+
     private AttachmentContent ProcessArchiveEntry(
         string parentDisplayPath,
         string archiveEntryPath,
+        string displayEntryPath,
         string filename,
         long compressedSizeBytes,
         long uncompressedSizeBytes,
         byte[] content,
-        int nestingDepth)
+        int nestingDepth,
+        ArchiveProcessingBudget archiveBudget)
     {
         return ProcessStoredAttachment(
             SourceKind: "archive_entry",
             PartId: null,
             Filename: filename,
-            DisplayPath: $"{parentDisplayPath}!/{archiveEntryPath}",
+            DisplayPath: $"{parentDisplayPath}!/{displayEntryPath}",
             ArchiveEntryPath: archiveEntryPath,
             MimeType: GuessMimeType(filename),
             DeclaredSizeBytes: uncompressedSizeBytes,
             CompressedSizeBytes: compressedSizeBytes,
             UncompressedSizeBytes: uncompressedSizeBytes,
             Content: content,
-            NestingDepth: nestingDepth);
+            NestingDepth: nestingDepth,
+            ArchiveBudget: archiveBudget);
     }
 
     private AttachmentContent ProcessStoredAttachment(
@@ -81,7 +187,8 @@ internal sealed class AttachmentProcessor
         long? CompressedSizeBytes,
         long? UncompressedSizeBytes,
         byte[] Content,
-        int NestingDepth)
+        int NestingDepth,
+        ArchiveProcessingBudget ArchiveBudget = null)
     {
         var safeFilename = BlankToNull(Path.GetFileName((Filename ?? "").Replace('\\', '/'))) ?? "attachment";
         var displayPath = BlankToNull(DisplayPath) ?? safeFilename;
@@ -107,11 +214,13 @@ internal sealed class AttachmentProcessor
                 NestingDepth,
                 DownloadStatus: "failed",
                 DownloadError: "Attachment content was not available.",
-                ExtractionStatus: "not_ready",
-                ExtractionError: null,
+                ExtractionStatus: "failed",
+                ExtractionError: "Attachment content was not available.",
                 ExtractedText: null,
                 Extractor: null,
-                Children: []);
+                Children: [],
+                ExtractionErrorCode: "temporary_io_failure",
+                DownloadErrorCode: "temporary_io_failure");
         }
 
         if (Content.LongLength > MaxAttachmentBytes)
@@ -133,11 +242,13 @@ internal sealed class AttachmentProcessor
                 NestingDepth,
                 DownloadStatus: "skipped",
                 DownloadError: $"Attachment exceeds {MaxAttachmentBytes} byte storage limit.",
-                ExtractionStatus: "too_large",
-                ExtractionError: null,
+                ExtractionStatus: "failed",
+                ExtractionError: $"Attachment exceeds {MaxAttachmentBytes} byte storage limit.",
                 ExtractedText: null,
                 Extractor: null,
-                Children: []);
+                Children: [],
+                ExtractionErrorCode: "attachment_too_large",
+                DownloadErrorCode: "attachment_too_large");
         }
 
         var stored = _objectStore.Store(Content);
@@ -161,15 +272,21 @@ internal sealed class AttachmentProcessor
                 NestingDepth,
                 DownloadStatus: "stored",
                 DownloadError: null,
-                ExtractionStatus: "unsupported",
+                ExtractionStatus: "failed",
                 ExtractionError: "7z archive expansion is not enabled in this build.",
                 ExtractedText: null,
                 Extractor: null,
-                Children: []);
+                Children: [],
+                ExtractionErrorCode: "unsupported_attachment_type");
         }
 
         if (IsZip(sniffedMimeType, safeFilename))
-            return ProcessZipContainer(SourceKind, PartId, safeFilename, displayPath, ArchiveEntryPath, MimeType, sniffedMimeType, stored, Content, NestingDepth, CompressedSizeBytes, UncompressedSizeBytes);
+        {
+            // Nested archives share one budget rooted at the email attachment. Resetting
+            // limits per child ZIP would allow exponential expansion across the tree.
+            var archiveBudget = ArchiveBudget ?? new();
+            return ProcessZipContainer(SourceKind, PartId, safeFilename, displayPath, ArchiveEntryPath, MimeType, sniffedMimeType, stored, Content, NestingDepth, CompressedSizeBytes, UncompressedSizeBytes, archiveBudget);
+        }
 
         var extraction = ExtractTerminalText(safeFilename, sniffedMimeType, Content);
         var extractedText = BlankToNull(extraction.Text);
@@ -199,7 +316,10 @@ internal sealed class AttachmentProcessor
             ExtractionError: extraction.Error,
             ExtractedText: extractedText,
             Extractor: extraction.Extractor,
-            Children: []);
+            Children: [],
+            ExtractionErrorCode: extraction.ErrorCode,
+            ExtractorVersion: extraction.ExtractorVersion,
+            Exception: extraction.Exception);
     }
 
     private AttachmentContent ProcessZipContainer(
@@ -214,7 +334,8 @@ internal sealed class AttachmentProcessor
         byte[] content,
         int nestingDepth,
         long? compressedSizeBytes,
-        long? uncompressedSizeBytes)
+        long? uncompressedSizeBytes,
+        ArchiveProcessingBudget archiveBudget)
     {
         if (nestingDepth >= MaxArchiveDepth)
         {
@@ -230,8 +351,9 @@ internal sealed class AttachmentProcessor
                 nestingDepth,
                 compressedSizeBytes,
                 uncompressedSizeBytes,
-                "too_large",
+                "failed",
                 "Archive nesting depth limit was reached.",
+                "archive_safety_limit",
                 []);
         }
 
@@ -240,45 +362,109 @@ internal sealed class AttachmentProcessor
             using var stream = new MemoryStream(content, writable: false);
             using var archive = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: false);
             var children = new List<AttachmentContent>();
-            long totalUncompressed = 0;
-            var entryCount = 0;
+            var displayPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var entryOrdinal = 0;
 
             foreach (var entry in archive.Entries)
             {
+                if (archiveBudget.Elapsed > _extractionTimeout)
+                    return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "failed", "Archive extraction timed out.", "extractor_timeout", children);
+
                 if (string.IsNullOrWhiteSpace(entry.Name))
                     continue;
 
-                entryCount++;
-                if (entryCount > MaxArchiveEntries)
-                    return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "too_large", "Archive entry count limit was reached.", children);
+                entryOrdinal++;
+                if (!archiveBudget.TryCountEntry())
+                    return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "failed", "Archive entry count limit was reached.", "archive_safety_limit", children);
 
                 var safeEntryPath = NormalizeArchiveEntryPath(entry.FullName);
                 if (safeEntryPath is null)
+                {
+                    children.Add(RejectedArchiveEntry(
+                        displayPath,
+                        entry.FullName,
+                        displayEntryPath: null,
+                        entry.CompressedLength,
+                        entry.Length,
+                        nestingDepth + 1,
+                        entryOrdinal,
+                        "Archive entry path was rejected."));
                     continue;
+                }
+                var displayEntryPath = UniqueArchiveDisplayPath(safeEntryPath, displayPaths);
 
                 if (entry.Length > MaxArchiveEntryBytes)
+                {
+                    children.Add(RejectedArchiveEntry(
+                        displayPath,
+                        safeEntryPath,
+                        displayEntryPath,
+                        entry.CompressedLength,
+                        entry.Length,
+                        nestingDepth + 1,
+                        entryOrdinal,
+                        "Archive entry exceeds the per-entry size limit."));
                     continue;
+                }
 
-                totalUncompressed += entry.Length;
-                if (totalUncompressed > MaxArchiveTotalUncompressedBytes)
-                    return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "too_large", "Archive total uncompressed size limit was reached.", children);
+                if (!archiveBudget.TryAddUncompressedBytes(entry.Length))
+                    return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "failed", "Archive total uncompressed size limit was reached.", "archive_safety_limit", children);
 
                 if (entry.CompressedLength > 0 && entry.Length / (double)entry.CompressedLength > MaxArchiveCompressionRatio)
+                {
+                    children.Add(RejectedArchiveEntry(
+                        displayPath,
+                        safeEntryPath,
+                        displayEntryPath,
+                        entry.CompressedLength,
+                        entry.Length,
+                        nestingDepth + 1,
+                        entryOrdinal,
+                        "Archive entry exceeds the compression-ratio limit."));
                     continue;
+                }
 
-                using var entryStream = entry.Open();
-                using var entryBuffer = new MemoryStream();
-                entryStream.CopyTo(entryBuffer);
+                byte[] entryBytes;
+                try
+                {
+                    using var entryStream = entry.Open();
+                    using var entryBuffer = new BoundedWriteStream(MaxArchiveEntryBytes);
+                    entryStream.CopyTo(entryBuffer);
+                    entryBytes = entryBuffer.ToArray();
+                }
+                catch (AttachmentSizeLimitException)
+                {
+                    children.Add(RejectedArchiveEntry(
+                        displayPath,
+                        safeEntryPath,
+                        displayEntryPath,
+                        entry.CompressedLength,
+                        entry.Length,
+                        nestingDepth + 1,
+                        entryOrdinal,
+                        "Archive entry exceeded the per-entry size limit while streaming."));
+                    continue;
+                }
+
+                if (!archiveBudget.TryAddUncompressedBytes(entryBytes.LongLength - entry.Length))
+                    return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "failed", "Archive total uncompressed size limit was reached while streaming.", "archive_safety_limit", children);
+
                 children.Add(ProcessArchiveEntry(
                     displayPath,
                     safeEntryPath,
+                    displayEntryPath,
                     Path.GetFileName(safeEntryPath),
                     entry.CompressedLength,
                     entry.Length,
-                    entryBuffer.ToArray(),
-                    nestingDepth + 1));
+                    entryBytes,
+                    nestingDepth + 1,
+                    archiveBudget));
+
+                if (archiveBudget.Elapsed > _extractionTimeout)
+                    return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "failed", "Archive extraction timed out.", "extractor_timeout", children);
             }
 
+            var hasRejectedEntries = children.Any(child => child.ExtractionErrorCode == "archive_safety_limit");
             return ContainerNode(
                 sourceKind,
                 partId,
@@ -291,14 +477,98 @@ internal sealed class AttachmentProcessor
                 nestingDepth,
                 compressedSizeBytes,
                 uncompressedSizeBytes,
-                children.Count == 0 ? "empty" : "done",
-                null,
+                hasRejectedEntries ? "failed" : children.Count == 0 ? "empty" : "done",
+                hasRejectedEntries ? "One or more archive entries were rejected by safety policy." : null,
+                hasRejectedEntries ? "archive_safety_limit" : null,
                 children);
         }
         catch (InvalidDataException ex)
         {
-            return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "failed", ex.Message, []);
+            return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "failed", "The ZIP archive is invalid or corrupt.", "invalid_document", [], ex);
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            var classified = AttachmentFailureClassifier.Classify(ex);
+            return ContainerNode(sourceKind, partId, filename, displayPath, archiveEntryPath, mimeType, sniffedMimeType, stored, nestingDepth, compressedSizeBytes, uncompressedSizeBytes, "failed", classified.Summary, classified.ErrorCode, [], ex);
+        }
+    }
+
+    private static AttachmentContent RejectedArchiveEntry(
+        string parentDisplayPath,
+        string archiveEntryPath,
+        string displayEntryPath,
+        long compressedSizeBytes,
+        long uncompressedSizeBytes,
+        int nestingDepth,
+        int entryOrdinal,
+        string error)
+    {
+        var filename = BlankToNull(Path.GetFileName((archiveEntryPath ?? "").Replace('\\', '/'))) ?? "rejected-entry";
+        var safeDisplayEntryPath = NormalizeArchiveEntryPath(displayEntryPath)
+            ?? NormalizeArchiveEntryPath(archiveEntryPath)
+            ?? RejectedArchiveEntryPath(archiveEntryPath, filename, entryOrdinal);
+        return Node(
+            SourceKind: "archive_entry",
+            PartId: null,
+            Filename: filename,
+            DisplayPath: $"{parentDisplayPath}!/{safeDisplayEntryPath}",
+            ArchiveEntryPath: BlankToNull(archiveEntryPath),
+            MimeType: GuessMimeType(filename),
+            SniffedMimeType: GuessMimeType(filename),
+            SizeBytes: uncompressedSizeBytes,
+            CompressedSizeBytes: compressedSizeBytes,
+            UncompressedSizeBytes: uncompressedSizeBytes,
+            ContentHash: null,
+            StorageKey: null,
+            IsContainer: false,
+            NestingDepth: nestingDepth,
+            DownloadStatus: "skipped",
+            DownloadError: error,
+            ExtractionStatus: "failed",
+            ExtractionError: error,
+            ExtractedText: null,
+            Extractor: "ZipArchive",
+            Children: [],
+            ExtractionErrorCode: "archive_safety_limit",
+            ExtractorVersion: ProcessorVersion,
+            DownloadErrorCode: "archive_safety_limit");
+    }
+
+    private static string UniqueArchiveDisplayPath(
+        string entryPath,
+        HashSet<string> seen)
+    {
+        if (seen.Add(entryPath))
+            return entryPath;
+
+        var slash = entryPath.LastIndexOf('/');
+        var directory = slash >= 0 ? entryPath[..(slash + 1)] : "";
+        var filename = slash >= 0 ? entryPath[(slash + 1)..] : entryPath;
+        var extension = Path.GetExtension(filename);
+        var stem = string.IsNullOrWhiteSpace(extension) ? filename : filename[..^extension.Length];
+        var ordinal = 2;
+        string candidate;
+
+        do
+        {
+            candidate = $"{directory}{stem} ({ordinal}){extension}";
+            ordinal++;
+        }
+        while (!seen.Add(candidate));
+
+        return candidate;
+    }
+
+    private static string RejectedArchiveEntryPath(string entryPath, string filename, int entryOrdinal)
+    {
+        var pathHash = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(entryPath ?? "")))
+            .ToLowerInvariant()[..12];
+        return $"rejected/{entryOrdinal:D4}-{pathHash}-{filename}";
     }
 
     private static AttachmentContent ContainerNode(
@@ -315,7 +585,9 @@ internal sealed class AttachmentProcessor
         long? uncompressedSizeBytes,
         string extractionStatus,
         string extractionError,
-        IReadOnlyList<AttachmentContent> children)
+        string extractionErrorCode,
+        IReadOnlyList<AttachmentContent> children,
+        Exception exception = null)
     {
         return Node(
             sourceKind,
@@ -338,7 +610,10 @@ internal sealed class AttachmentProcessor
             ExtractionError: extractionError,
             ExtractedText: null,
             Extractor: "ZipArchive",
-            Children: children);
+            Children: children,
+            ExtractionErrorCode: extractionErrorCode,
+            ExtractorVersion: ProcessorVersion,
+            Exception: exception);
     }
 
     private static AttachmentContent Node(
@@ -362,7 +637,11 @@ internal sealed class AttachmentProcessor
         string ExtractionError,
         string ExtractedText,
         string Extractor,
-        IReadOnlyList<AttachmentContent> Children)
+        IReadOnlyList<AttachmentContent> Children,
+        string ExtractionErrorCode = null,
+        string ExtractorVersion = null,
+        Exception Exception = null,
+        string DownloadErrorCode = null)
     {
         return new(
             SourceKind,
@@ -386,13 +665,63 @@ internal sealed class AttachmentProcessor
             ExtractedText,
             OcrText: null,
             Extractor,
-            Children ?? []);
+            Children ?? [],
+            ExtractionErrorCode,
+            ExtractorVersion,
+            Exception?.GetType().FullName,
+            Exception?.Message,
+            Exception?.ToString(),
+            DownloadErrorCode);
     }
 
-    private static TerminalExtraction ExtractTerminalText(string filename, string mimeType, byte[] content)
+    private TerminalExtraction ExtractTerminalText(string filename, string mimeType, byte[] content)
+    {
+        // Built-in document libraries expose synchronous extraction and cannot be
+        // forcibly canceled. Run them off-thread to bound the caller's wait while
+        // keeping at most one runaway leaf-document extraction alive.
+        if (!TerminalExtractionGate.Wait(0))
+            return Failure("extractor_unavailable", "The attachment extractor is still busy with timed-out work.");
+
+        var extractionTask = Task.Run(() => ExtractTerminalTextCore(filename, mimeType, content));
+        try
+        {
+            var result = extractionTask
+                .WaitAsync(_extractionTimeout)
+                .GetAwaiter()
+                .GetResult();
+            TerminalExtractionGate.Release();
+            return result;
+        }
+        catch (TimeoutException)
+        {
+            _ = extractionTask.ContinueWith(
+                completed =>
+                {
+                    _ = completed.Exception;
+                    TerminalExtractionGate.Release();
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            return Failure("extractor_timeout", "Attachment extraction timed out.");
+        }
+        catch
+        {
+            TerminalExtractionGate.Release();
+            throw;
+        }
+    }
+
+    private TerminalExtraction ExtractTerminalTextCore(string filename, string mimeType, byte[] content)
     {
         try
         {
+            if (_terminalExtractor is not null)
+            {
+                var output = _terminalExtractor(new(filename, mimeType, content));
+                return Success(output.Text, output.Extractor, output.ExtractorVersion);
+            }
+
             if (IsPdf(mimeType, filename))
                 return ExtractPdf(content);
 
@@ -403,16 +732,23 @@ internal sealed class AttachmentProcessor
                 return ExtractXlsx(content);
 
             if (IsHtml(mimeType, filename))
-                return new("done", NormalizeText(HtmlToText(ReadText(content))), null, "html");
+                return Success(NormalizeText(HtmlToText(ReadText(content))), "html");
 
             if (IsPlainText(mimeType, filename) || IsCsv(mimeType, filename))
-                return new("done", NormalizeText(ReadText(content)), null, IsCsv(mimeType, filename) ? "csv" : "text");
+                return Success(NormalizeText(ReadText(content)), IsCsv(mimeType, filename) ? "csv" : "text");
 
-            return new("unsupported", null, null, null);
+            return Failure(
+                "unsupported_attachment_type",
+                $"No text extractor is available for {BlankToNull(mimeType) ?? "this attachment type"}.");
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            return new("failed", null, ex.Message, null);
+            var classified = AttachmentFailureClassifier.Classify(ex);
+            return Failure(classified.ErrorCode, classified.Summary, ex);
         }
     }
 
@@ -424,14 +760,14 @@ internal sealed class AttachmentProcessor
         foreach (var page in document.GetPages())
             AppendBounded(builder, page.Text);
 
-        return new("done", builder.ToString(), null, "PdfPig");
+        return Success(builder.ToString(), "PdfPig");
     }
 
     private static TerminalExtraction ExtractDocx(byte[] content)
     {
         using var stream = new MemoryStream(content, writable: false);
         using var document = WordprocessingDocument.Open(stream, false);
-        return new("done", NormalizeText(document.MainDocumentPart?.Document?.Body?.InnerText), null, "DocumentFormat.OpenXml");
+        return Success(NormalizeText(document.MainDocumentPart?.Document?.Body?.InnerText), "DocumentFormat.OpenXml");
     }
 
     private static TerminalExtraction ExtractXlsx(byte[] content)
@@ -450,11 +786,13 @@ internal sealed class AttachmentProcessor
                 AppendBounded(builder, ReadCellValue(cell, sharedStrings));
         }
 
-        return new("done", NormalizeText(builder.ToString()), null, "DocumentFormat.OpenXml");
+        return Success(NormalizeText(builder.ToString()), "DocumentFormat.OpenXml");
     }
 
     private static string ReadCellValue(Cell cell, IReadOnlyList<string> sharedStrings)
     {
+        // XLSX stores many cell strings as indexes into a workbook-wide shared-string
+        // table; other cell types keep their displayable value directly in the cell.
         var raw = cell.CellValue?.Text ?? cell.InnerText;
         if (string.IsNullOrWhiteSpace(raw))
             return null;
@@ -474,9 +812,12 @@ internal sealed class AttachmentProcessor
         if (value is null || builder.Length >= MaxExtractedChars)
             return;
 
-        var remaining = MaxExtractedChars - builder.Length;
         if (builder.Length > 0)
             builder.AppendLine();
+
+        var remaining = MaxExtractedChars - builder.Length;
+        if (remaining <= 0)
+            return;
 
         builder.Append(value.Length <= remaining ? value : value[..remaining]);
     }
@@ -580,12 +921,14 @@ internal sealed class AttachmentProcessor
         if (string.IsNullOrWhiteSpace(value))
             return null;
 
-        var normalized = value.Replace('\\', '/').Trim('/');
+        var normalized = value.Replace('\\', '/').Trim();
         if (normalized.Length == 0
             || normalized.StartsWith("/", StringComparison.Ordinal)
             || normalized.StartsWith("~", StringComparison.Ordinal)
             || Regex.IsMatch(normalized, "^[A-Za-z]:"))
             return null;
+
+        normalized = normalized.TrimEnd('/');
 
         var parts = normalized
             .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -633,11 +976,60 @@ internal sealed class AttachmentProcessor
     private static string BlankToNull(string value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
+    private static TerminalExtraction Success(
+        string text,
+        string extractor,
+        string extractorVersion = ProcessorVersion) =>
+        new("done", text, null, null, extractor, extractorVersion, null);
+
+    private static TerminalExtraction Failure(
+        string errorCode,
+        string error,
+        Exception exception = null) =>
+        new("failed", null, error, errorCode, null, ProcessorVersion, exception);
+
+    // Result of extracting one non-container ("terminal") document. Archive trees
+    // use AttachmentContent instead because they can produce child attachment nodes.
     private sealed record TerminalExtraction(
         string Status,
         string Text,
         string Error,
-        string Extractor);
+        string ErrorCode,
+        string Extractor,
+        string ExtractorVersion,
+        Exception Exception);
+
+    // One budget follows the entire recursively expanded archive tree. It bounds
+    // aggregate work rather than allowing each nested ZIP to restart the limits.
+    private sealed class ArchiveProcessingBudget
+    {
+        private readonly Stopwatch _elapsed = Stopwatch.StartNew();
+        private long _uncompressedBytes;
+        private int _entryCount;
+
+        public TimeSpan Elapsed => _elapsed.Elapsed;
+
+        public bool TryCountEntry()
+        {
+            _entryCount++;
+            return _entryCount <= MaxArchiveEntries;
+        }
+
+        public bool TryAddUncompressedBytes(long bytes)
+        {
+            if (bytes <= 0)
+            {
+                _uncompressedBytes = Math.Max(0, _uncompressedBytes + bytes);
+                return true;
+            }
+
+            if (_uncompressedBytes > MaxArchiveTotalUncompressedBytes - bytes)
+                return false;
+
+            _uncompressedBytes += bytes;
+            return true;
+        }
+    }
 
     private static readonly Regex ScriptOrStyleRegex = new(
         @"<(script|style)\b[^>]*>.*?</\1>",

@@ -306,6 +306,33 @@ internal sealed class McpStdioServer
                     readOnly: false,
                     idempotent: false),
                 ToolDefinition(
+                    "email_list_attachment_extraction_failures",
+                    "Email Attachment Failures",
+                    "List bounded durable attachment extraction issues without exposing object-store paths or full exception details.",
+                    ObjectSchema(new()
+                    {
+                        ["attachment_ids"] = IntArraySchema("Optional stable local attachment ids."),
+                        ["accounts"] = StringArraySchema("Optional account ids, display names, or email addresses."),
+                        ["error_codes"] = StringArraySchema("Optional stable error codes such as unsupported_attachment_type or invalid_document."),
+                        ["status"] = NullableStringSchema("Optional issue status: open, resolved, or superseded. Defaults to open."),
+                        ["limit"] = IntSchema("Maximum result count, 1 to 100. Defaults to 20.", 1, 100, 20)
+                    }),
+                    readOnly: true,
+                    idempotent: true),
+                ToolDefinition(
+                    "email_retry_attachment_extraction",
+                    "Retry Email Attachment Extraction",
+                    "Run one additional local extraction attempt for selected open failures. Requires attachment_ids, or accounts plus error_codes. Never accepts paths or re-downloads a stored attachment from IMAP.",
+                    ObjectSchema(new()
+                    {
+                        ["attachment_ids"] = IntArraySchema("Optional stable local attachment ids."),
+                        ["accounts"] = StringArraySchema("Optional account ids, display names, or email addresses."),
+                        ["error_codes"] = StringArraySchema("Optional stable error codes."),
+                        ["limit"] = IntSchema("Maximum retry count, 1 to 50. Defaults to 20.", 1, 50, 20)
+                    }),
+                    readOnly: false,
+                    idempotent: false),
+                ToolDefinition(
                     "email_sync_now",
                     "Email Sync",
                     $"Start or queue local metadata and body indexing for configured accounts. Returns quickly with a sync_run_id; poll email_get_sync_status for progress at about {RecommendedSyncPollIntervalSeconds}s intervals because IMAP body indexing is provider-paced.",
@@ -316,6 +343,7 @@ internal sealed class McpStdioServer
                         ["full"] = BoolSchema("Use no date bound when syncing metadata. Defaults to false, which uses account history_days.", defaultValue: false),
                         ["since_days"] = IntSchema("Optional metadata date bound override. Use 0 for no date bound.", 0, 3650, null),
                         ["max_per_folder"] = IntSchema("Optional per-folder cap. Use 0 for no cap; capped runs usually remain not_synced.", 0, 1000000, 0),
+                        ["retry_failed_downloads"] = BoolSchema("Explicitly grant one new bounded retry cycle to exhausted message or attachment downloads. Defaults to false.", defaultValue: false),
                         // TODO: Codex reported that this is not honored which is true, why do we even have it then? What 'compatibility'? With what?
                         ["wait_for_completion"] = BoolSchema($"Accepted for compatibility, but the MCP server still returns immediately; poll email_get_sync_status at about {RecommendedSyncPollIntervalSeconds}s intervals.", defaultValue: false)
                     }),
@@ -388,6 +416,8 @@ internal sealed class McpStdioServer
             "email_get_message" => ExecuteGetMessage(arguments),
             "email_get_attachment_text" => ExecuteGetAttachmentText(arguments),
             "email_prepare_attachment_access" => ExecutePrepareAttachmentAccess(arguments),
+            "email_list_attachment_extraction_failures" => ExecuteListAttachmentExtractionFailures(arguments),
+            "email_retry_attachment_extraction" => ExecuteRetryAttachmentExtraction(arguments, cancellationToken),
             "email_sync_now" => ExecuteSyncNow(arguments, cancellationToken),
             "email_get_sync_status" => ExecuteGetSyncStatus(arguments),
             _ => throw new JsonRpcError(-32602, $"Unknown tool: {toolName}")
@@ -1126,6 +1156,83 @@ internal sealed class McpStdioServer
             AffectedAttachmentIds: affectedAttachmentIds.Distinct().ToList());
     }
 
+    private ToolExecution ExecuteListAttachmentExtractionFailures(JsonElement arguments)
+    {
+        EnsureArgumentObject(arguments, "email_list_attachment_extraction_failures");
+        ValidateAllowedArguments(arguments, "attachment_ids", "accounts", "error_codes", "status", "limit", "_meta");
+        var request = new AttachmentExtractionFailureQuery(
+            AttachmentIds: ReadOptionalIntArray(arguments, "attachment_ids", 1, int.MaxValue),
+            AccountFilters: ReadOptionalStringArray(arguments, "accounts"),
+            ErrorCodes: ReadOptionalStringArray(arguments, "error_codes"),
+            Status: ReadOptionalString(arguments, "status") ?? "open",
+            Limit: ReadOptionalInt(arguments, "limit", 20, 1, 100));
+        var failures = _database.ListAttachmentExtractionFailures(request);
+        var items = new JsonArray();
+        foreach (var failure in failures)
+            items.Add(ToAttachmentFailureJson(failure));
+
+        var payload = new JsonObject
+        {
+            ["status"] = "ok",
+            ["count"] = failures.Count,
+            ["failures"] = items
+        };
+        var summary = $"status=ok failures={failures.Count}";
+        var affected = failures.Select(failure => failure.AttachmentId).Distinct().ToList();
+        return new(payload, "read", FailureArgumentsSummary(request), summary, AffectedAttachmentIds: affected);
+    }
+
+    private ToolExecution ExecuteRetryAttachmentExtraction(
+        JsonElement arguments,
+        CancellationToken cancellationToken)
+    {
+        EnsureArgumentObject(arguments, "email_retry_attachment_extraction");
+        ValidateAllowedArguments(arguments, "attachment_ids", "accounts", "error_codes", "limit", "_meta");
+        var request = new AttachmentExtractionFailureQuery(
+            AttachmentIds: ReadOptionalIntArray(arguments, "attachment_ids", 1, int.MaxValue),
+            AccountFilters: ReadOptionalStringArray(arguments, "accounts"),
+            ErrorCodes: ReadOptionalStringArray(arguments, "error_codes"),
+            Status: "open",
+            Limit: ReadOptionalInt(arguments, "limit", 20, 1, 50));
+        if (request.AttachmentIds.Count == 0
+            && (request.AccountFilters.Count == 0 || request.ErrorCodes.Count == 0))
+            throw new JsonRpcError(-32602, "email_retry_attachment_extraction requires attachment_ids, or both accounts and error_codes.");
+
+        var result = new AttachmentExtractionRunner(_database).RetryExplicit(
+            request,
+            _clientName,
+            cancellationToken);
+        var items = new JsonArray();
+        foreach (var item in result.Items)
+        {
+            items.Add(new JsonObject
+            {
+                ["attachment_id"] = item.AttachmentId,
+                ["status"] = item.Status,
+                ["error_code"] = StringOrNull(item.ErrorCode),
+                ["error"] = StringOrNull(item.Error)
+            });
+        }
+
+        var payload = new JsonObject
+        {
+            ["status"] = result.FailedCount == 0 && result.SkippedCount == 0 ? "ok" : "completed_with_failures",
+            ["selected"] = result.SelectedCount,
+            ["succeeded"] = result.SucceededCount,
+            ["failed"] = result.FailedCount,
+            ["skipped"] = result.SkippedCount,
+            ["attachments"] = items
+        };
+        var summary = $"selected={result.SelectedCount} succeeded={result.SucceededCount} failed={result.FailedCount} skipped={result.SkippedCount}";
+        return new(
+            payload,
+            "local_retry",
+            FailureArgumentsSummary(request),
+            summary,
+            AffectedAttachmentIds: result.Items.Select(item => item.AttachmentId).Distinct().ToList(),
+            IsError: result.FailedCount > 0 || result.SkippedCount > 0);
+    }
+
     private ToolExecution ExecuteSyncNow(JsonElement arguments, CancellationToken cancellationToken)
     {
         EnsureArgumentObject(arguments, "email_sync_now");
@@ -1136,6 +1243,7 @@ internal sealed class McpStdioServer
             "full",
             "since_days",
             "max_per_folder",
+            "retry_failed_downloads",
             "wait_for_completion",
             "_meta");
 
@@ -1145,10 +1253,11 @@ internal sealed class McpStdioServer
             Full: ReadOptionalBool(arguments, "full", defaultValue: false),
             SinceDays: ReadOptionalNullableInt(arguments, "since_days", min: 0, max: 3650),
             MaxPerFolder: ReadOptionalInt(arguments, "max_per_folder", defaultValue: 0, min: 0, max: 1000000),
+            RetryFailedDownloads: ReadOptionalBool(arguments, "retry_failed_downloads", defaultValue: false),
             WaitForCompletion: ReadOptionalBool(arguments, "wait_for_completion", defaultValue: false));
         var config = _configStore.Load();
         var accounts = SelectAccounts(config, request.Accounts, enabledOnly: true);
-        var argumentsSummary = $"accounts={FormatAccountFilters(request.Accounts)}, folder={FormatOptional(request.Folder)}, full={request.Full.ToString().ToLowerInvariant()}, max_per_folder={request.MaxPerFolder}";
+        var argumentsSummary = $"accounts={FormatAccountFilters(request.Accounts)}, folder={FormatOptional(request.Folder)}, full={request.Full.ToString().ToLowerInvariant()}, max_per_folder={request.MaxPerFolder}, retry_failed_downloads={request.RetryFailedDownloads.ToString().ToLowerInvariant()}";
 
         if (accounts.Count == 0)
         {
@@ -1307,6 +1416,8 @@ internal sealed class McpStdioServer
             ["messages_indexed"] = readiness.MessageSearchDocs,
             ["attachments_indexed"] = readiness.AttachmentSearchDocs,
             ["extraction_pending"] = readiness.PendingAttachments,
+            ["extraction_failures_open"] = readiness.OpenAttachmentExtractionFailures,
+            ["extraction_failures_by_code"] = ToCountJson(readiness.AttachmentExtractionFailuresByCode),
             ["attachment_messages_pending_scan"] = readiness.PendingAttachmentMessages,
             ["folders"] = includeFolders ? ToFoldersJson(folders) : null
         };
@@ -1482,7 +1593,21 @@ internal sealed class McpStdioServer
         SyncRunStartResult syncRun,
         CancellationToken cancellationToken)
     {
-        var totalTargets = works.Sum(work => _database.ReadPendingBodySyncTargets(work.Account.Id, request.Folder, request.MaxPerFolder).Count);
+        if (request.RetryFailedDownloads)
+        {
+            foreach (var work in works)
+                _database.RequeueExhaustedBodyRetries(work.Account.Id, request.Folder);
+        }
+
+        var bodyTargetsByAccount = works.ToDictionary(
+            work => work.Account.Id,
+            work => _database.ReadPendingBodySyncTargets(work.Account.Id, request.Folder, request.MaxPerFolder).Count,
+            StringComparer.OrdinalIgnoreCase);
+        var dueAttachmentsByAccount = works.ToDictionary(
+            work => work.Account.Id,
+            work => _database.ReadDueAttachmentExtractionIds(work.Account.Id, 50).Count,
+            StringComparer.OrdinalIgnoreCase);
+        var totalTargets = bodyTargetsByAccount.Values.Sum() + dueAttachmentsByAccount.Values.Sum();
         UpdateSyncRunPhaseOrThrow(syncRun, "syncing_bodies", 0, totalTargets);
 
         var failures = new List<string>();
@@ -1490,6 +1615,16 @@ internal sealed class McpStdioServer
 
         foreach (var work in works)
         {
+            var retries = new AttachmentExtractionRunner(_database).ProcessDue(
+                work.Account.Id,
+                limit: 50,
+                cancellationToken);
+            doneOffset += retries.SelectedCount;
+            UpdateSyncRunProgressOrThrow(syncRun, doneOffset, totalTargets);
+            failures.AddRange(retries.Items
+                .Where(item => item.Status == "failed")
+                .Select(item => $"{work.Account.Id}/attachment {item.AttachmentId}: {item.ErrorCode}"));
+
             var result = await new ImapBodySync(_database).SyncAccountAsync(
                 work.Account,
                 work.Password,
@@ -1503,7 +1638,7 @@ internal sealed class McpStdioServer
             var selected = result.Folders.Sum(folder => folder.SelectedCount);
             failures.AddRange(result.Folders
                 .Where(folder => !folder.Succeeded)
-                .Select(folder => $"{work.Account.Id}/{folder.FolderPath}: {folder.Error}"));
+                .Select(folder => $"{work.Account.Id}/{folder.FolderPath}: {folder.Error ?? $"{folder.FailedCount} message target(s) failed"}"));
             doneOffset += selected;
         }
 
@@ -1857,11 +1992,41 @@ internal sealed class McpStdioServer
             ["download_status"] = attachment.DownloadStatus,
             ["download_error"] = StringOrNull(attachment.DownloadError),
             ["extraction_status"] = attachment.ExtractionStatus,
+            ["extraction_error_code"] = StringOrNull(attachment.ExtractionErrorCode),
             ["extraction_error"] = StringOrNull(attachment.ExtractionError),
+            ["extraction_next_attempt_at"] = StringOrNull(attachment.ExtractionNextAttemptAt),
+            ["extraction_completed_at"] = StringOrNull(attachment.ExtractionCompletedAt),
+            ["extractor"] = StringOrNull(attachment.Extractor),
+            ["extractor_version"] = StringOrNull(attachment.ExtractorVersion),
             ["extracted_text_available"] = attachment.ExtractedTextAvailable,
             ["ocr_text_available"] = attachment.OcrTextAvailable,
             ["access_preparable"] = !string.IsNullOrWhiteSpace(attachment.StorageKey)
         };
+
+    private static JsonObject ToAttachmentFailureJson(AttachmentExtractionFailure failure) =>
+        new()
+        {
+            ["failure_id"] = failure.FailureId,
+            ["attachment_id"] = failure.AttachmentId,
+            ["message_id"] = failure.MessageId,
+            ["account"] = failure.AccountName,
+            ["display_path"] = failure.DisplayPath,
+            ["mime_type"] = StringOrNull(failure.MimeType),
+            ["stage"] = failure.Stage,
+            ["error_code"] = failure.ErrorCode,
+            ["error_summary"] = StringOrNull(failure.ErrorSummary),
+            ["exception_type"] = StringOrNull(failure.ExceptionType),
+            ["extractor"] = StringOrNull(failure.Extractor),
+            ["extractor_version"] = StringOrNull(failure.ExtractorVersion),
+            ["occurrence_count"] = failure.OccurrenceCount,
+            ["first_seen_at"] = failure.FirstSeenAt,
+            ["last_checked_at"] = failure.LastCheckedAt,
+            ["resolved_at"] = StringOrNull(failure.ResolvedAt),
+            ["status"] = failure.Status
+        };
+
+    private static string FailureArgumentsSummary(AttachmentExtractionFailureQuery request) =>
+        $"attachment_ids={request.AttachmentIds.Count}, accounts={request.AccountFilters.Count}, error_codes={request.ErrorCodes.Count}, status={request.Status}, limit={request.Limit}";
 
     private static JsonObject ToReadinessJson(MessageSearchReadiness readiness) =>
         new()
@@ -1880,10 +2045,13 @@ internal sealed class McpStdioServer
             ["fts_rows"] = readiness.FtsRows,
             ["pending_message_bodies"] = readiness.PendingMessageBodies,
             ["attachments"] = readiness.Attachments,
+            ["attachment_texts"] = readiness.AttachmentTexts,
             ["attachment_search_docs"] = readiness.AttachmentSearchDocs,
             ["attachment_fts_rows"] = readiness.AttachmentFtsRows,
             ["pending_attachments"] = readiness.PendingAttachments,
             ["pending_attachment_messages"] = readiness.PendingAttachmentMessages,
+            ["open_attachment_extraction_failures"] = readiness.OpenAttachmentExtractionFailures,
+            ["attachment_extraction_failures_by_code"] = ToCountJson(readiness.AttachmentExtractionFailuresByCode),
             ["coverage_note"] = StringOrNull(readiness.CoverageNote),
             ["active_sync_run"] = readiness.ActiveSyncRun is null ? null : ToSyncProgressJson(readiness.ActiveSyncRun)
         };
@@ -2177,6 +2345,22 @@ internal sealed class McpStdioServer
         return values;
     }
 
+    private static IReadOnlyList<int> ReadOptionalIntArray(JsonElement element, string name, int min, int max)
+    {
+        if (element.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
+            || !element.TryGetProperty(name, out var value)
+            || value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            return [];
+
+        if (value.ValueKind != JsonValueKind.Array)
+            throw new JsonRpcError(-32602, $"{name} must be an array of integers or null.");
+
+        var values = new List<int>();
+        foreach (var item in value.EnumerateArray())
+            values.Add(ReadIntValue(item, name, min, max));
+        return values;
+    }
+
     private static int ReadIntValue(JsonElement value, string name, int min, int max)
     {
         if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var parsed))
@@ -2448,6 +2632,14 @@ internal sealed class McpStdioServer
         return array;
     }
 
+    private static JsonObject ToCountJson(IReadOnlyDictionary<string, int> values)
+    {
+        var result = new JsonObject();
+        foreach (var item in values ?? new Dictionary<string, int>())
+            result[item.Key] = item.Value;
+        return result;
+    }
+
     private static JsonNode StringOrNull(string value) =>
         value is null ? null : JsonValue.Create(value);
 
@@ -2479,6 +2671,7 @@ internal sealed class McpStdioServer
         bool Full,
         int? SinceDays,
         int MaxPerFolder,
+        bool RetryFailedDownloads,
         bool WaitForCompletion);
 
     private sealed record SyncAccountWork(

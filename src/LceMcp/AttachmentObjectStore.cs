@@ -12,6 +12,8 @@ internal sealed class AttachmentObjectStore
         _paths = paths;
     }
 
+    public AppPaths Paths => _paths;
+
     public StoredAttachmentObject Store(byte[] content)
     {
         _paths.EnsureDataDirectories();
@@ -54,6 +56,18 @@ internal sealed class AttachmentObjectStore
         var targetPath = Path.Combine(exportDirectory, filename);
         File.Copy(sourcePath, targetPath, overwrite: false);
         return targetPath;
+    }
+
+    public byte[] Read(string storageKey, long maxBytes = AttachmentProcessor.MaxAttachmentBytes)
+    {
+        var sourcePath = ResolveStoragePath(storageKey);
+        using var stream = File.OpenRead(sourcePath);
+        if (stream.Length > maxBytes)
+            throw new AttachmentSizeLimitException(maxBytes);
+
+        using var buffer = new MemoryStream((int)stream.Length);
+        stream.CopyTo(buffer);
+        return buffer.ToArray();
     }
 
     private string ResolveStoragePath(string storageKey)

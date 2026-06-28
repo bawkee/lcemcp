@@ -34,6 +34,8 @@ internal static class CliApp
             "set-folder-sync" => SetFolderSync(database, options),
             "sync" => await SyncAsync(configStore, credentialStore, database, options, cancellationToken),
             "sync-bodies" => await SyncBodiesAsync(configStore, credentialStore, database, options, cancellationToken),
+            "attachment-failures" => ListAttachmentFailures(database, options),
+            "retry-attachments" => RetryAttachments(database, options, cancellationToken),
             "search" => Search(database, options),
             "serve" => await McpStdioServer.RunAsync(configStore, database, cancellationToken),
             "mcp-config" => PrintMcpConfig(options),
@@ -147,6 +149,8 @@ internal static class CliApp
         Console.WriteLine($"Database attachments: {databaseStatus.AttachmentCount}");
         Console.WriteLine($"Database attachment texts: {databaseStatus.AttachmentTextCount}");
         Console.WriteLine($"Database attachment search docs: {databaseStatus.AttachmentSearchDocCount}");
+        Console.WriteLine($"Open attachment extraction failures: {databaseStatus.OpenAttachmentExtractionFailureCount}");
+        Console.WriteLine($"Attachment extraction failures by code: {FormatFailureBreakdown(databaseStatus.OpenAttachmentExtractionFailuresByCode)}");
         Console.WriteLine($"Last sync state: {FormatSyncState(databaseStatus.LastSyncState)}");
         PrintMessageSearchReadiness(database.GetMessageSearchReadiness(new(
             AccountFilters: [],
@@ -551,6 +555,7 @@ internal static class CliApp
         var folderFilter = options.Get("--folder");
         var maxPerFolder = options.GetInt("--max-per-folder", 50);
         var batchSize = options.GetInt("--batch-size", 10);
+        var retryFailedDownloads = options.Has("--retry-failed-downloads");
 
         if (maxPerFolder < 0)
             throw new CliException("--max-per-folder must be 0 or greater. Use 0 for no per-folder cap.", 2);
@@ -572,18 +577,40 @@ internal static class CliApp
             var databaseAccountId = database.UpsertConfiguredAccount(account);
 
             Console.WriteLine($"Syncing bodies for '{account.Id}', max_per_folder={FormatMaxPerFolder(maxPerFolder)}, batch_size={batchSize}...");
-
             var pendingTargetCount = database.ReadPendingBodySyncTargets(account.Id, folderFilter, maxPerFolder).Count;
-            var syncRun = database.StartOrQueueSyncRun(databaseAccountId, account.Id, folderFilter, "syncing_bodies", pendingTargetCount);
+            var dueAttachmentCount = database.ReadDueAttachmentExtractionIds(account.Id, 50).Count;
+            var totalTargetCount = pendingTargetCount + dueAttachmentCount;
+            var syncRun = database.StartOrQueueSyncRun(databaseAccountId, account.Id, folderFilter, "syncing_bodies", totalTargetCount);
             Console.WriteLine($"Sync run: {syncRun.Id} status={syncRun.Status}");
+            AttachmentRetryResult automaticRetries = new([]);
 
             try
             {
                 syncRun = await WaitForSyncRunLeaseAsync(database, syncRun, cancellationToken);
+                if (retryFailedDownloads)
+                {
+                    var requeued = database.RequeueExhaustedBodyRetries(account.Id, folderFilter);
+                    Console.WriteLine($"Requeued exhausted attachment/message downloads: {requeued}");
+                    pendingTargetCount = database.ReadPendingBodySyncTargets(account.Id, folderFilter, maxPerFolder).Count;
+                    dueAttachmentCount = database.ReadDueAttachmentExtractionIds(account.Id, 50).Count;
+                    totalTargetCount = pendingTargetCount + dueAttachmentCount;
+                    if (!database.UpdateSyncRunPhase(syncRun.Id, syncRun.OwnerId, "syncing_bodies", 0, totalTargetCount))
+                        throw new OperationCanceledException("Sync lease was lost.");
+                }
                 PrintSyncProgress(syncRun.ActiveRun);
 
                 var result = await RunWithSyncLeaseHeartbeatAsync(database, syncRun, cancellationToken, async () =>
                 {
+                    automaticRetries = new AttachmentExtractionRunner(database).ProcessDue(
+                        account.Id,
+                        limit: 50,
+                        cancellationToken);
+                    UpdateSyncRunProgressOrThrow(
+                        database,
+                        syncRun,
+                        automaticRetries.SelectedCount,
+                        totalTargetCount);
+
                     var syncResult = await new ImapBodySync(database).SyncAccountAsync(
                         account,
                         password,
@@ -591,17 +618,29 @@ internal static class CliApp
                         maxPerFolder,
                         batchSize,
                         cancellationToken,
-                        (done, total) => UpdateSyncRunProgressOrThrow(database, syncRun, done, total),
+                        (done, _) => UpdateSyncRunProgressOrThrow(
+                            database,
+                            syncRun,
+                            automaticRetries.SelectedCount + done,
+                            totalTargetCount),
                         () => ThrowIfSyncLeaseLost(database, syncRun));
 
                     var failed = syncResult.Folders.Where(folder => !folder.Succeeded).ToList();
+                    var retryErrors = automaticRetries.Items
+                        .Where(item => item.Status == "failed")
+                        .Select(item => $"attachment {item.AttachmentId}: {item.ErrorCode}")
+                        .ToList();
+                    var errors = failed
+                        .Select(folder => $"{folder.FolderPath}: {folder.Error ?? $"{folder.FailedCount} message target(s) failed"}")
+                        .Concat(retryErrors)
+                        .ToList();
                     var completed = database.CompleteSyncRun(
                         syncRun.Id,
                         syncRun.OwnerId,
-                        succeeded: failed.Count == 0,
-                        done: syncResult.Folders.Sum(folder => folder.PersistedCount),
-                        total: syncResult.Folders.Sum(folder => folder.SelectedCount),
-                        lastError: failed.Count == 0 ? null : string.Join("; ", failed.Select(folder => $"{folder.FolderPath}: {folder.Error}")));
+                        succeeded: errors.Count == 0,
+                        done: automaticRetries.SelectedCount + syncResult.Folders.Sum(folder => folder.PersistedCount),
+                        total: totalTargetCount,
+                        lastError: errors.Count == 0 ? null : string.Join("; ", errors));
                     if (!completed)
                         throw new OperationCanceledException("Sync lease was lost.");
 
@@ -609,15 +648,22 @@ internal static class CliApp
                 }, PrintSyncProgress);
 
                 PrintBodySyncResult(result);
+                if (automaticRetries.SelectedCount > 0)
+                {
+                    Console.WriteLine(
+                        $"Automatic attachment retries: selected={automaticRetries.SelectedCount} "
+                        + $"succeeded={automaticRetries.SucceededCount} failed={automaticRetries.FailedCount} "
+                        + $"skipped={automaticRetries.SkippedCount}");
+                }
             }
             catch (OperationCanceledException)
             {
-                database.CancelSyncRun(syncRun.Id, syncRun.OwnerId, done: 0, total: pendingTargetCount);
+                database.CancelSyncRun(syncRun.Id, syncRun.OwnerId, done: 0, total: totalTargetCount);
                 throw;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                database.CompleteSyncRun(syncRun.Id, syncRun.OwnerId, succeeded: false, done: 0, total: pendingTargetCount, lastError: ex.Message);
+                database.CompleteSyncRun(syncRun.Id, syncRun.OwnerId, succeeded: false, done: 0, total: totalTargetCount, lastError: ex.Message);
                 throw;
             }
         }
@@ -725,6 +771,55 @@ internal static class CliApp
 
         return 0;
     }
+
+    private static int ListAttachmentFailures(EmailDatabase database, CommandOptions options)
+    {
+        var request = AttachmentFailureRequest(options, defaultStatus: "open");
+        var failures = database.ListAttachmentExtractionFailures(request);
+        Console.WriteLine($"Attachment extraction failures: {failures.Count}");
+        foreach (var failure in failures)
+        {
+            Console.WriteLine(
+                $"failure_id={failure.FailureId} attachment_id={failure.AttachmentId} message_id={failure.MessageId} "
+                + $"account={failure.AccountName} path={failure.DisplayPath} stage={failure.Stage} "
+                + $"code={failure.ErrorCode} status={failure.Status} occurrences={failure.OccurrenceCount} "
+                + $"last_checked_at={failure.LastCheckedAt}");
+        }
+
+        return 0;
+    }
+
+    private static int RetryAttachments(
+        EmailDatabase database,
+        CommandOptions options,
+        CancellationToken cancellationToken)
+    {
+        var request = AttachmentFailureRequest(options, defaultStatus: "open");
+        if (request.AttachmentIds.Count == 0
+            && (request.AccountFilters.Count == 0 || request.ErrorCodes.Count == 0))
+            throw new CliException("retry-attachments requires --attachment-id, or both --account and --error-code.", 2);
+
+        var result = new AttachmentExtractionRunner(database).RetryExplicit(
+            request,
+            clientName: "cli",
+            cancellationToken);
+        Console.WriteLine(
+            $"Attachment retries: selected={result.SelectedCount} succeeded={result.SucceededCount} "
+            + $"failed={result.FailedCount} skipped={result.SkippedCount}");
+        foreach (var item in result.Items)
+            Console.WriteLine($"attachment_id={item.AttachmentId} status={item.Status} error_code={FormatOptional(item.ErrorCode)} error={FormatOptional(item.Error)}");
+        return result.FailedCount == 0 && result.SkippedCount == 0 ? 0 : 1;
+    }
+
+    private static AttachmentExtractionFailureQuery AttachmentFailureRequest(
+        CommandOptions options,
+        string defaultStatus) =>
+        new(
+            AttachmentIds: ParseIntList(options.Get("--attachment-id"), "--attachment-id"),
+            AccountFilters: SplitOption(options.Get("--account")),
+            ErrorCodes: SplitOption(options.Get("--error-code")),
+            Status: options.Get("--failure-status") ?? defaultStatus,
+            Limit: options.GetInt("--limit", 20));
 
     private static int ListAccounts(ConfigStore configStore, WindowsCredentialStore credentialStore)
     {
@@ -1055,9 +1150,9 @@ internal static class CliApp
         foreach (var folder in result.Folders)
         {
             if (folder.Succeeded)
-                Console.WriteLine($"{folder.FolderPath}: selected={folder.SelectedCount} fetched={folder.FetchedCount} persisted={folder.PersistedCount} missing={folder.MissingCount}");
+                Console.WriteLine($"{folder.FolderPath}: selected={folder.SelectedCount} fetched={folder.FetchedCount} persisted={folder.PersistedCount} missing={folder.MissingCount} failed={folder.FailedCount}");
             else
-                Console.WriteLine($"{folder.FolderPath}: selected={folder.SelectedCount} fetched={folder.FetchedCount} persisted={folder.PersistedCount} missing={folder.MissingCount} error={folder.Error}");
+                Console.WriteLine($"{folder.FolderPath}: selected={folder.SelectedCount} fetched={folder.FetchedCount} persisted={folder.PersistedCount} missing={folder.MissingCount} failed={folder.FailedCount} error={FormatOptional(folder.Error)}");
         }
 
         var succeeded = result.Folders.Count(folder => folder.Succeeded);
@@ -1106,8 +1201,10 @@ internal static class CliApp
             + $"search_docs={readiness.MessageSearchDocs} fts_rows={readiness.FtsRows} pending_bodies={readiness.PendingMessageBodies}");
         Console.WriteLine(
             $"Attachment search scope: attachments={readiness.Attachments} "
-            + $"search_docs={readiness.AttachmentSearchDocs} fts_rows={readiness.AttachmentFtsRows} "
+            + $"texts={readiness.AttachmentTexts} search_docs={readiness.AttachmentSearchDocs} fts_rows={readiness.AttachmentFtsRows} "
             + $"pending={readiness.PendingAttachments} unscanned_messages={readiness.PendingAttachmentMessages} "
+            + $"failures={readiness.OpenAttachmentExtractionFailures} "
+            + $"failure_codes={FormatFailureBreakdown(readiness.AttachmentExtractionFailuresByCode)} "
             + $"index={FormatBool(readiness.AttachmentSearchIndexComplete)}");
 
         if (!string.IsNullOrWhiteSpace(readiness.CoverageNote))
@@ -1254,6 +1351,11 @@ internal static class CliApp
     private static string FormatBool(bool value) =>
         value.ToString().ToLowerInvariant();
 
+    private static string FormatFailureBreakdown(IReadOnlyDictionary<string, int> values) =>
+        values is null || values.Count == 0
+            ? "none"
+            : string.Join(",", values.OrderBy(item => item.Key).Select(item => $"{item.Key}:{item.Value}"));
+
     private static string FormatMaxPerFolder(int maxPerFolder) =>
         maxPerFolder == 0 ? "unbounded" : maxPerFolder.ToString();
 
@@ -1266,6 +1368,19 @@ internal static class CliApp
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(item => !string.IsNullOrWhiteSpace(item))
             .ToList();
+    }
+
+    private static IReadOnlyList<int> ParseIntList(string value, string optionName)
+    {
+        var values = new List<int>();
+        foreach (var item in SplitOption(value))
+        {
+            if (!int.TryParse(item, out var parsed) || parsed < 1)
+                throw new CliException($"{optionName} values must be positive integers.", 2);
+            values.Add(parsed);
+        }
+
+        return values;
     }
 
     private static bool? ParseNullableBool(string value, string optionName)
@@ -1301,6 +1416,8 @@ internal static class CliApp
           set-folder-sync   Enable or disable syncing for one persisted folder.
           sync              Sync bounded message envelope metadata into local SQLite storage.
           sync-bodies       Download pending body text and backfill unscanned attachments.
+          attachment-failures List durable attachment extraction failures.
+          retry-attachments Retry failed extraction from the managed local object store.
           search            Search local indexed message metadata and body text.
           serve             Run the MCP stdio server. Writes protocol messages only to stdout.
           mcp-config        Print MCP client configuration for this executable.
@@ -1318,6 +1435,8 @@ internal static class CliApp
           dotnet run --project src/LceMcp -- set-folder-sync --account yahoo --folder Inbox --enabled true
           dotnet run --project src/LceMcp -- sync --account yahoo --folder Inbox --max-per-folder 50
           dotnet run --project src/LceMcp -- sync-bodies --account yahoo --folder Inbox --max-per-folder 10
+          dotnet run --project src/LceMcp -- attachment-failures --error-code unsupported_attachment_type
+          dotnet run --project src/LceMcp -- retry-attachments --attachment-id 42
           dotnet run --project src/LceMcp -- search --query "refund processed" --account yahoo
           dotnet run --project src/LceMcp -- serve
           dotnet run --project src/LceMcp -- mcp-config --client codex
@@ -1380,6 +1499,14 @@ internal static class CliApp
           --folder <path-or-name>  Optional. Default: all cached selectable sync-enabled folders.
           --max-per-folder <n>     Default: 50 pending bodies/attachment scans per folder. Use 0 for no cap.
           --batch-size <n>         Default: 10. Fetches bodies in bounded loops.
+          --retry-failed-downloads Explicitly requeue exhausted message/attachment downloads before syncing.
+
+        attachment-failures/retry-attachments options:
+          --attachment-id <ids>    Optional comma-separated stable attachment IDs.
+          --account <ids>          Optional comma-separated account ids/emails.
+          --error-code <codes>     Optional comma-separated stable failure codes.
+          --failure-status <s>     List filter: open, resolved, or superseded. Default: open.
+          --limit <n>              Default: 20. Maximum 100 (retry maximum 50).
 
         search options:
           --query <text>           Optional when another filter is supplied. Local FTS query text; quoted phrases and OR are supported.

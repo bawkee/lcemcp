@@ -11,6 +11,7 @@
 - Prefer composition over inheritance.
 - Avoid Clean Architecture ceremony and interface-per-class bloat.
 - Prefer readable code over clever code.
+- Comment domain terms, safety invariants, and lifecycle transitions whose intent is not obvious from the code. Do not narrate straightforward implementation details.
 - Avoid braces around single-line `if`/`else` bodies when each branch is one clear statement.
 - Add abstractions only when they make sync, search, storage, or MCP behavior easier to understand.
 - Use modern C# features where they improve clarity.

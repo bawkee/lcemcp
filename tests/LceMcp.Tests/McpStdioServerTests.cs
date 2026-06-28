@@ -4,6 +4,7 @@ using System.Text.Json.Nodes;
 
 namespace LceMcp.Tests;
 
+[Collection("Process-wide attachment extraction gate")]
 public sealed class McpStdioServerTests
 {
     [Fact]
@@ -44,6 +45,8 @@ public sealed class McpStdioServerTests
         Assert.Contains("email_get_message", toolNames);
         Assert.Contains("email_get_attachment_text", toolNames);
         Assert.Contains("email_prepare_attachment_access", toolNames);
+        Assert.Contains("email_list_attachment_extraction_failures", toolNames);
+        Assert.Contains("email_retry_attachment_extraction", toolNames);
         Assert.Contains("email_sync_now", toolNames);
         Assert.Contains("email_get_sync_status", toolNames);
         Assert.Contains("does not delete cached messages", setFolderSyncTool["description"].GetValue<string>());
@@ -255,6 +258,68 @@ public sealed class McpStdioServerTests
         Assert.True(File.Exists(access["path"].GetValue<string>()));
         Assert.Contains($"email_get_attachment_text|status=ok attachment=1|{messageId}|{attachmentId}", auditRows);
         Assert.Contains($"email_prepare_attachment_access|prepared=1 failed=0|{messageId}|{attachmentId}", auditRows);
+    }
+
+    [Fact]
+    public async Task EmailAttachmentFailureToolsListRetryAndAuditWithoutLeakingDiagnostics()
+    {
+        using var temp = TempWorkspace.Create();
+        var account = TestData.Account();
+        var configStore = new ConfigStore(temp.Paths);
+        var config = new AppConfig();
+        config.UpsertAccount(account);
+        configStore.Save(config);
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(account);
+        database.UpsertFolders(accountId, [TestData.Folder("Inbox", role: "inbox")]);
+        var inbox = database.ReadFolders("yahoo").Single();
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                "100",
+                "emailid:mcp-failed-attachment",
+                "mcp-failed-attachment@example.com",
+                hasAttachments: true)
+        ], SyncStateJson(1, 1, 1), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+        var processor = new AttachmentProcessor(new AttachmentObjectStore(temp.Paths));
+        database.UpsertMessageBody(new(
+            messageId,
+            "Attachment body",
+            null,
+            "Attachment body",
+            [],
+            [processor.ProcessEmailAttachment(
+                "2", "payload.bin", "application/octet-stream", 3, [1, 2, 3], "payload.bin")]));
+        var attachmentId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM attachments;").Single();
+
+        var output = new StringWriter();
+        var error = new StringWriter();
+        var inputText = """
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_list_attachment_extraction_failures","arguments":{"attachment_ids":[__ATTACHMENT_ID__],"status":"open","limit":10}}}
+            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"email_retry_attachment_extraction","arguments":{"attachment_ids":[__ATTACHMENT_ID__],"limit":10}}}
+            """.Replace("__ATTACHMENT_ID__", attachmentId.ToString());
+        var input = new StringReader(inputText);
+        var server = new McpStdioServer(configStore, database, input, output, error);
+
+        await server.RunAsync(CancellationToken.None);
+
+        var lines = OutputLines(output);
+        var listed = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
+        var retried = JsonNode.Parse(lines[2]).AsObject()["result"]["structuredContent"].AsObject();
+        var listedFailure = listed["failures"].AsArray().Single().AsObject();
+        var auditRows = ReadStrings(
+            temp.Paths.DatabasePath,
+            "SELECT tool_name || '|' || result_summary || '|' || COALESCE(affected_attachment_ids, '') FROM audit_log ORDER BY id;");
+
+        Assert.Equal("unsupported_attachment_type", listedFailure["error_code"].GetValue<string>());
+        Assert.Null(listedFailure["storage_key"]);
+        Assert.Null(listedFailure["exception_details"]);
+        Assert.Equal("completed_with_failures", retried["status"].GetValue<string>());
+        Assert.Equal(1, retried["failed"].GetValue<int>());
+        Assert.Contains($"email_list_attachment_extraction_failures|status=ok failures=1|{attachmentId}", auditRows);
+        Assert.Contains($"email_retry_attachment_extraction|selected=1 succeeded=0 failed=1 skipped=0|{attachmentId}", auditRows);
     }
 
     [Fact]

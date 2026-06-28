@@ -81,6 +81,7 @@ internal sealed class ImapBodySync
         var fetchedCount = 0;
         var persistedCount = 0;
         var missingCount = 0;
+        var failedCount = 0;
 
         try
         {
@@ -126,11 +127,13 @@ internal sealed class ImapBodySync
                 bodies.AddRange(fullMessageResult.Bodies);
                 fetchedCount += fullMessageResult.FetchedCount;
                 missingCount += fullMessageResult.MissingCount;
+                failedCount += fullMessageResult.FailedCount;
 
                 var textPartResult = await FetchTextPartBatchAsync(folder, textPartItems, cancellationToken);
                 bodies.AddRange(textPartResult.Bodies);
                 fetchedCount += textPartResult.FetchedCount;
                 missingCount += textPartResult.MissingCount;
+                failedCount += textPartResult.FailedCount;
 
                 beforePersist?.Invoke();
                 _database.UpsertMessageBodies(bodies);
@@ -140,7 +143,7 @@ internal sealed class ImapBodySync
                     progress?.Invoke();
             }
 
-            return new(folderPath, targets.Count, fetchedCount, persistedCount, missingCount, Error: null);
+            return new(folderPath, targets.Count, fetchedCount, persistedCount, missingCount, Error: null, FailedCount: failedCount);
         }
         catch (OperationCanceledException)
         {
@@ -148,7 +151,7 @@ internal sealed class ImapBodySync
         }
         catch (Exception ex)
         {
-            return new(folderPath, targets.Count, fetchedCount, persistedCount, missingCount, ex.Message);
+            return new(folderPath, targets.Count, fetchedCount, persistedCount, missingCount, ex.Message, failedCount);
         }
     }
 
@@ -167,6 +170,8 @@ internal sealed class ImapBodySync
 
         var bodies = new List<MessageBodyContent>();
         var fetchedUids = new HashSet<uint>();
+        var failedCount = 0;
+        var fetchFailureCount = 0;
         var targetsByUid = items.ToDictionary(item => item.Uid.Id, item => item.Target);
 
         if (folder is not IImapFolder imapFolder)
@@ -181,12 +186,29 @@ internal sealed class ImapBodySync
                     if (!targetsByUid.TryGetValue(uid.Id, out var target))
                         return;
 
-                    var message = await MimeMessage.LoadAsync(stream, token);
-                    bodies.Add(MessageBodyNormalizer.FromMimeMessage(
-                        target.MessageId,
-                        message,
-                        await ExtractAttachmentsFromMessageAsync(message, token)));
-                    fetchedUids.Add(uid.Id);
+                    try
+                    {
+                        var message = await MimeMessage.LoadAsync(stream, token);
+                        var body = MessageBodyNormalizer.FromMimeMessage(
+                            target.MessageId,
+                            message,
+                            await ExtractAttachmentsFromMessageAsync(message, token));
+                        bodies.Add(body);
+                        RecordAttachmentDownloadFailure(target.MessageId, body.Attachments);
+                        if (HasAttachmentFailures(body.Attachments))
+                            failedCount++;
+                        fetchedUids.Add(uid.Id);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex) when (ex is not OutOfMemoryException)
+                    {
+                        failedCount++;
+                        fetchFailureCount++;
+                        RecordMessageFailure(target.MessageId, ex);
+                    }
                 },
                 cancellationToken);
         }
@@ -198,7 +220,8 @@ internal sealed class ImapBodySync
         return new(
             Bodies: bodies,
             FetchedCount: bodies.Count,
-            MissingCount: items.Count - fetchedUids.Count);
+            MissingCount: Math.Max(0, items.Count - fetchedUids.Count - fetchFailureCount),
+            FailedCount: failedCount);
     }
 
     private async Task<BodyBatchFetchResult> FetchFullMessagesIndividuallyAsync(
@@ -208,27 +231,42 @@ internal sealed class ImapBodySync
     {
         var bodies = new List<MessageBodyContent>();
         var missingCount = 0;
+        var failedCount = 0;
 
         foreach (var item in items)
         {
             try
             {
                 var message = await folder.GetMessageAsync(item.Uid, cancellationToken);
-                bodies.Add(MessageBodyNormalizer.FromMimeMessage(
+                var body = MessageBodyNormalizer.FromMimeMessage(
                     item.Target.MessageId,
                     message,
-                    await ExtractAttachmentsFromMessageAsync(message, cancellationToken)));
+                    await ExtractAttachmentsFromMessageAsync(message, cancellationToken));
+                bodies.Add(body);
+                RecordAttachmentDownloadFailure(item.Target.MessageId, body.Attachments);
+                if (HasAttachmentFailures(body.Attachments))
+                    failedCount++;
             }
             catch (MessageNotFoundException)
             {
                 missingCount++;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                failedCount++;
+                RecordMessageFailure(item.Target.MessageId, ex);
             }
         }
 
         return new(
             Bodies: bodies,
             FetchedCount: bodies.Count,
-            MissingCount: missingCount);
+            MissingCount: missingCount,
+            FailedCount: failedCount);
     }
 
     private async Task<BodyBatchFetchResult> FetchTextPartBatchAsync(
@@ -248,6 +286,7 @@ internal sealed class ImapBodySync
             .ToDictionary(summary => summary.UniqueId.Id);
         var bodies = new List<MessageBodyContent>();
         var missingCount = 0;
+        var failedCount = 0;
 
         foreach (var item in items)
         {
@@ -259,18 +298,32 @@ internal sealed class ImapBodySync
                     continue;
                 }
 
-                bodies.Add(await FetchBodyContentAsync(folder, item.Uid, item.Target.MessageId, summary, cancellationToken));
+                var body = await FetchBodyContentAsync(folder, item.Uid, item.Target.MessageId, summary, cancellationToken);
+                bodies.Add(body);
+                RecordAttachmentDownloadFailure(item.Target.MessageId, body.Attachments);
+                if (HasAttachmentFailures(body.Attachments))
+                    failedCount++;
             }
             catch (MessageNotFoundException)
             {
                 missingCount++;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                failedCount++;
+                RecordMessageFailure(item.Target.MessageId, ex);
             }
         }
 
         return new(
             Bodies: bodies,
             FetchedCount: bodies.Count,
-            MissingCount: missingCount);
+            MissingCount: missingCount,
+            FailedCount: failedCount);
     }
 
     private async Task<MessageBodyContent> FetchBodyContentAsync(
@@ -281,7 +334,7 @@ internal sealed class ImapBodySync
         CancellationToken cancellationToken)
     {
         var recipients = ReadRecipients(summary.Envelope);
-        var attachments = await FetchAttachmentContentsAsync(folder, uid, summary.Attachments, cancellationToken);
+        var attachments = await FetchAttachmentContentsAsync(folder, uid, messageId, summary.Attachments, cancellationToken);
         var plainText = await FetchTextPartAsync(folder, uid, summary.TextBody, cancellationToken);
 
         if (!string.IsNullOrWhiteSpace(plainText))
@@ -292,11 +345,7 @@ internal sealed class ImapBodySync
         if (!string.IsNullOrWhiteSpace(htmlText))
             return MessageBodyNormalizer.FromParts(messageId, null, htmlText, recipients, attachments);
 
-        var message = await folder.GetMessageAsync(uid, cancellationToken);
-        return MessageBodyNormalizer.FromMimeMessage(
-            messageId,
-            message,
-            await ExtractAttachmentsFromMessageAsync(message, cancellationToken));
+        return MessageBodyNormalizer.FromParts(messageId, null, null, recipients, attachments);
     }
 
     private static async Task<string> FetchTextPartAsync(
@@ -348,6 +397,7 @@ internal sealed class ImapBodySync
     private async Task<IReadOnlyList<AttachmentContent>> FetchAttachmentContentsAsync(
         IMailFolder folder,
         UniqueId uid,
+        int messageId,
         IEnumerable<BodyPartBasic> parts,
         CancellationToken cancellationToken)
     {
@@ -355,7 +405,7 @@ internal sealed class ImapBodySync
             return [];
 
         var attachments = new List<AttachmentContent>();
-        var displayPaths = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var displayPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var part in parts)
         {
@@ -363,16 +413,59 @@ internal sealed class ImapBodySync
 
             var filename = AttachmentFilename(part.FileName, part.ContentType?.MimeType);
             var displayPath = UniqueDisplayPath(filename, displayPaths);
-            var entity = await folder.GetBodyPartAsync(uid, part, cancellationToken);
-            var bytes = await ReadEntityContentAsync(entity, cancellationToken);
-
-            attachments.Add(_attachmentProcessor.ProcessEmailAttachment(
+            // Record body-structure metadata before any network read so preflight
+            // rejection and mid-stream failure both leave a durable attachment row.
+            var metadata = _attachmentProcessor.CreateEmailAttachmentMetadata(
                 part.PartSpecifier,
                 filename,
                 part.ContentType?.MimeType,
                 part.Octets,
-                bytes,
-                displayPath));
+                displayPath);
+            _database.UpsertAttachmentMetadata(messageId, metadata);
+
+            var declaredSize = (long)part.Octets;
+            if (declaredSize > AttachmentProcessor.MaxAttachmentBytes)
+            {
+                attachments.Add(_attachmentProcessor.RejectEmailAttachment(
+                    part.PartSpecifier,
+                    filename,
+                    part.ContentType?.MimeType,
+                    declaredSize,
+                    displayPath,
+                    "attachment_too_large",
+                    $"Attachment declares {declaredSize} bytes, above the {AttachmentProcessor.MaxAttachmentBytes} byte download limit."));
+                continue;
+            }
+
+            try
+            {
+                var entity = await folder.GetBodyPartAsync(uid, part, cancellationToken);
+                var bytes = await ReadEntityContentAsync(entity, cancellationToken);
+                attachments.Add(_attachmentProcessor.ProcessEmailAttachment(
+                    part.PartSpecifier,
+                    filename,
+                    part.ContentType?.MimeType,
+                    part.Octets,
+                    bytes,
+                    displayPath));
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                var classified = AttachmentFailureClassifier.Classify(ex);
+                attachments.Add(_attachmentProcessor.RejectEmailAttachment(
+                    part.PartSpecifier,
+                    filename,
+                    part.ContentType?.MimeType,
+                    part.Octets,
+                    displayPath,
+                    classified.ErrorCode,
+                    classified.Summary,
+                    ex));
+            }
         }
 
         return attachments;
@@ -383,7 +476,7 @@ internal sealed class ImapBodySync
         CancellationToken cancellationToken)
     {
         var attachments = new List<AttachmentContent>();
-        var displayPaths = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var displayPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var entity in message.Attachments)
         {
@@ -391,15 +484,34 @@ internal sealed class ImapBodySync
 
             var filename = AttachmentFilename(EntityFileName(entity), entity.ContentType?.MimeType);
             var displayPath = UniqueDisplayPath(filename, displayPaths);
-            var bytes = await ReadEntityContentAsync(entity, cancellationToken);
-
-            attachments.Add(_attachmentProcessor.ProcessEmailAttachment(
-                null,
-                filename,
-                entity.ContentType?.MimeType,
-                bytes.LongLength,
-                bytes,
-                displayPath));
+            try
+            {
+                var bytes = await ReadEntityContentAsync(entity, cancellationToken);
+                attachments.Add(_attachmentProcessor.ProcessEmailAttachment(
+                    null,
+                    filename,
+                    entity.ContentType?.MimeType,
+                    bytes.LongLength,
+                    bytes,
+                    displayPath));
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                var classified = AttachmentFailureClassifier.Classify(ex);
+                attachments.Add(_attachmentProcessor.RejectEmailAttachment(
+                    null,
+                    filename,
+                    entity.ContentType?.MimeType,
+                    null,
+                    displayPath,
+                    classified.ErrorCode,
+                    classified.Summary,
+                    ex));
+            }
         }
 
         return attachments;
@@ -409,7 +521,9 @@ internal sealed class ImapBodySync
         MimeEntity entity,
         CancellationToken cancellationToken)
     {
-        using var stream = new MemoryStream();
+        // Provider Octets values are advisory. Decoded MIME bytes still pass through
+        // the hard cap, including full-message fallback entities.
+        using var stream = new BoundedWriteStream(AttachmentProcessor.MaxAttachmentBytes);
 
         if (entity is MimePart mimePart && mimePart.Content is not null)
             await mimePart.Content.DecodeToAsync(stream, cancellationToken);
@@ -444,20 +558,26 @@ internal sealed class ImapBodySync
         };
     }
 
-    private static string UniqueDisplayPath(string filename, Dictionary<string, int> seen)
+    private static string UniqueDisplayPath(string filename, HashSet<string> seen)
     {
         var safe = string.IsNullOrWhiteSpace(filename) ? "attachment" : filename.Trim();
 
-        if (!seen.TryGetValue(safe, out var count))
-        {
-            seen[safe] = 1;
+        if (seen.Add(safe))
             return safe;
-        }
 
-        seen[safe] = count + 1;
         var extension = Path.GetExtension(safe);
         var stem = string.IsNullOrWhiteSpace(extension) ? safe : safe[..^extension.Length];
-        return $"{stem} ({count + 1}){extension}";
+        var ordinal = 2;
+        string candidate;
+
+        do
+        {
+            candidate = $"{stem} ({ordinal}){extension}";
+            ordinal++;
+        }
+        while (!seen.Add(candidate));
+
+        return candidate;
     }
 
     private static readonly FetchRequest BodyFetchRequest = new(
@@ -465,10 +585,54 @@ internal sealed class ImapBodySync
         | MessageSummaryItems.Envelope
         | MessageSummaryItems.BodyStructure);
 
-    private static readonly BodyBatchFetchResult EmptyBatchFetchResult = new([], 0, 0);
+    private void RecordMessageFailure(int messageId, Exception exception)
+    {
+        var classified = AttachmentFailureClassifier.Classify(exception);
+        _database.RecordBodySyncFailure(messageId, classified.ErrorCode, classified.Summary, exception);
+    }
+
+    private void RecordAttachmentDownloadFailure(
+        int messageId,
+        IReadOnlyList<AttachmentContent> attachments)
+    {
+        // One failed top-level download keeps the message eligible for bounded body
+        // retry. Extraction-only failures remain attached to local extraction work.
+        var failure = (attachments ?? [])
+            .SelectMany(FlattenAttachments)
+            .FirstOrDefault(attachment => attachment.DownloadStatus == "failed");
+        if (failure is null)
+            return;
+
+        _database.RecordBodySyncFailure(
+            messageId,
+            failure.DownloadErrorCode ?? "temporary_io_failure",
+            failure.DownloadError ?? "Attachment download failed.",
+            exception: null);
+    }
+
+    internal static bool HasAttachmentFailures(IReadOnlyList<AttachmentContent> attachments) =>
+        (attachments ?? []).Any(HasAttachmentFailure);
+
+    private static bool HasAttachmentFailure(AttachmentContent attachment) =>
+        attachment.ExtractionStatus == "failed"
+        || attachment.DownloadStatus == "failed"
+        || (attachment.Children ?? []).Any(HasAttachmentFailure);
+
+    private static IEnumerable<AttachmentContent> FlattenAttachments(AttachmentContent attachment)
+    {
+        yield return attachment;
+        foreach (var child in attachment.Children ?? [])
+        {
+            foreach (var descendant in FlattenAttachments(child))
+                yield return descendant;
+        }
+    }
+
+    private static readonly BodyBatchFetchResult EmptyBatchFetchResult = new([], 0, 0, 0);
 
     private sealed record BodyBatchFetchResult(
         IReadOnlyList<MessageBodyContent> Bodies,
         int FetchedCount,
-        int MissingCount);
+        int MissingCount,
+        int FailedCount);
 }

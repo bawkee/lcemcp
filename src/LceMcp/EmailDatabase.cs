@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace LceMcp;
 
-internal sealed class EmailDatabase
+internal sealed partial class EmailDatabase
 {
     private readonly AppPaths _paths;
     private const string GlobalSyncScopeKey = "global";
@@ -21,7 +21,9 @@ internal sealed class EmailDatabase
     public DatabaseInitializationKind EnsureInitialized()
     {
         _paths.EnsureDataDirectories();
-        return ApplyMigrations();
+        var initialization = ApplyMigrations();
+        RecoverExpiredAttachmentExtractionsCore(DateTimeOffset.UtcNow);
+        return initialization;
     }
 
     public DatabaseStatus GetStatus()
@@ -30,6 +32,7 @@ internal sealed class EmailDatabase
 
         using var connection = OpenConnection();
 
+        var failuresByCode = ReadGlobalOpenAttachmentFailureCounts(connection);
         return new DatabaseStatus(
             SchemaVersion: ExecuteScalarInt(connection, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations;"),
             TargetSchemaVersion: DatabaseMigrations.TargetVersion,
@@ -43,7 +46,9 @@ internal sealed class EmailDatabase
             AttachmentTextCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM attachment_text;"),
             AttachmentSearchDocCount: ExecuteScalarInt(connection, "SELECT COUNT(*) FROM attachment_search_docs;"),
             LastSyncState: ReadLastSyncState(connection),
-            InitializationKind: initializationKind);
+            InitializationKind: initializationKind,
+            OpenAttachmentExtractionFailureCount: failuresByCode.Values.Sum(),
+            OpenAttachmentExtractionFailuresByCode: failuresByCode);
     }
 
     public int UpsertConfiguredAccount(AccountConfig account)
@@ -382,11 +387,16 @@ internal sealed class EmailDatabase
                   )
                   AND ml.deleted_locally = 0
                   AND ml.expunged = 0
-                ORDER BY COALESCE(m.date_sent, m.date_received, '') DESC,
+                  AND m.body_retry_exhausted = 0
+                  AND (m.body_next_attempt_at IS NULL OR m.body_next_attempt_at <= $now)
+                ORDER BY CASE WHEN m.body_attempts = 0 THEN 0 ELSE 1 END,
+                         COALESCE(m.body_next_attempt_at, ''),
+                         COALESCE(m.date_sent, m.date_received, '') DESC,
                          CAST(ml.provider_uid AS INTEGER) DESC
                 LIMIT $limit;
                 """;
             AddParameter(command, "$folderId", folder.Id);
+            AddParameter(command, "$now", DateTimeOffset.UtcNow.ToString("O"));
             AddParameter(command, "$limit", limit);
 
             using var reader = command.ExecuteReader();
@@ -732,6 +742,11 @@ internal sealed class EmailDatabase
                 a.download_error,
                 a.extraction_status,
                 a.extraction_error,
+                a.extraction_error_code,
+                a.extraction_next_attempt_at,
+                a.extraction_completed_at,
+                a.extractor,
+                a.extractor_version,
                 a.extracted_text_available,
                 a.ocr_text_available,
                 t.extracted_text,
@@ -831,6 +846,7 @@ internal sealed class EmailDatabase
         var scopedAccountCount = ReadScopedAccountCount(connection, accountIds, request.AccountFilters);
         var folderStates = ReadMessageSearchFolderStates(connection, accountIds, request.FolderRoles);
         var counts = ReadMessageSearchCounts(connection, accountIds, request);
+        var attachmentFailuresByCode = ReadOpenAttachmentFailureCounts(connection, accountIds, request);
         var completeFolderCount = folderStates.Count(folder => IsFolderMetadataComplete(folder, request));
         var coverageNote = BuildCoverageNote(folderStates, request, completeFolderCount);
         var freshness = BuildSearchFreshness(folderStates, request, now);
@@ -871,7 +887,10 @@ internal sealed class EmailDatabase
             PendingAttachmentMessages: counts.PendingAttachmentMessages,
             ActiveSyncRun: activeSyncRun,
             CoverageNote: coverageNote,
-            Freshness: freshness);
+            Freshness: freshness,
+            AttachmentTexts: counts.AttachmentTexts,
+            OpenAttachmentExtractionFailures: attachmentFailuresByCode.Values.Sum(),
+            AttachmentExtractionFailuresByCode: attachmentFailuresByCode);
     }
 
     public SyncRunStartResult StartOrQueueSyncRun(
@@ -1463,6 +1482,11 @@ internal sealed class EmailDatabase
                 download_error,
                 extraction_status,
                 extraction_error,
+                extraction_error_code,
+                extraction_next_attempt_at,
+                extraction_completed_at,
+                extractor,
+                extractor_version,
                 extracted_text_available,
                 ocr_text_available
             FROM attachments
@@ -1518,6 +1542,11 @@ internal sealed class EmailDatabase
                 download_error,
                 extraction_status,
                 extraction_error,
+                extraction_error_code,
+                extraction_next_attempt_at,
+                extraction_completed_at,
+                extractor,
+                extractor_version,
                 extracted_text_available,
                 ocr_text_available
             FROM attachments
@@ -2001,12 +2030,16 @@ internal sealed class EmailDatabase
         command.ExecuteNonQuery();
     }
 
-    private static void UpsertMessageBody(
+    private void UpsertMessageBody(
         SqliteConnection connection,
         SqliteTransaction transaction,
         MessageBodyContent body,
         string now)
     {
+        // "Scanned" means every top-level MIME attachment was enumerated and reached
+        // a terminal download result. It does not mean every text extraction succeeded.
+        var attachmentsScanned = (body.Attachments ?? [])
+            .All(attachment => attachment.DownloadStatus is "stored" or "skipped");
         using (var command = connection.CreateCommand())
         {
             command.Transaction = transaction;
@@ -2055,7 +2088,7 @@ internal sealed class EmailDatabase
 
         var attachmentIds = new HashSet<int>();
         foreach (var attachment in body.Attachments ?? [])
-            UpsertAttachmentTree(connection, transaction, body.MessageId, attachment, parentAttachmentId: null, rootAttachmentId: null, now, attachmentIds);
+            UpsertAttachmentTree(connection, transaction, body.MessageId, attachment, parentAttachmentId: null, rootAttachmentId: null, now, "initial", attachmentIds);
 
         DeleteStaleAttachments(connection, transaction, body.MessageId, attachmentIds);
 
@@ -2068,11 +2101,17 @@ internal sealed class EmailDatabase
                 UPDATE messages
                 SET
                     body_downloaded = 1,
-                    attachments_scanned = 1,
+                    attachments_scanned = $attachmentsScanned,
+                    body_attempts = CASE WHEN $attachmentsScanned = 1 THEN 0 ELSE body_attempts END,
+                    body_retry_exhausted = CASE WHEN $attachmentsScanned = 1 THEN 0 ELSE body_retry_exhausted END,
+                    body_next_attempt_at = CASE WHEN $attachmentsScanned = 1 THEN NULL ELSE body_next_attempt_at END,
+                    body_last_error_code = CASE WHEN $attachmentsScanned = 1 THEN NULL ELSE body_last_error_code END,
+                    body_last_error = CASE WHEN $attachmentsScanned = 1 THEN NULL ELSE body_last_error END,
                     updated_at = $updatedAt
                 WHERE id = $messageId;
                 """;
             AddParameter(command, "$messageId", body.MessageId);
+            AddParameter(command, "$attachmentsScanned", attachmentsScanned ? 1 : 0);
             AddParameter(command, "$updatedAt", now);
             command.ExecuteNonQuery();
         }
@@ -2107,7 +2146,7 @@ internal sealed class EmailDatabase
         command.ExecuteNonQuery();
     }
 
-    private static int UpsertAttachmentTree(
+    private int UpsertAttachmentTree(
         SqliteConnection connection,
         SqliteTransaction transaction,
         int messageId,
@@ -2115,6 +2154,7 @@ internal sealed class EmailDatabase
         int? parentAttachmentId,
         int? rootAttachmentId,
         string now,
+        string triggerKind,
         HashSet<int> attachmentIds)
     {
         var attachmentId = UpsertAttachment(
@@ -2124,7 +2164,8 @@ internal sealed class EmailDatabase
             attachment,
             parentAttachmentId,
             rootAttachmentId,
-            now);
+            now,
+            triggerKind);
         var effectiveRootId = rootAttachmentId ?? attachmentId;
 
         if (rootAttachmentId is null)
@@ -2132,21 +2173,63 @@ internal sealed class EmailDatabase
 
         attachmentIds.Add(attachmentId);
 
+        if (!string.IsNullOrWhiteSpace(attachment.DownloadErrorCode)
+            && string.IsNullOrWhiteSpace(attachment.StorageKey))
+        {
+            RetainAttachmentDescendants(connection, transaction, attachmentId, attachmentIds);
+            return attachmentId;
+        }
+
         foreach (var child in attachment.Children ?? [])
-            UpsertAttachmentTree(connection, transaction, messageId, child, attachmentId, effectiveRootId, now, attachmentIds);
+            UpsertAttachmentTree(connection, transaction, messageId, child, attachmentId, effectiveRootId, now, triggerKind, attachmentIds);
 
         return attachmentId;
     }
 
-    private static int UpsertAttachment(
+    private static void RetainAttachmentDescendants(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int attachmentId,
+        ISet<int> attachmentIds)
+    {
+        // A failed re-download has no new archive tree to compare. Mark the existing
+        // descendants as retained so the message-level stale-row cleanup preserves them.
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            WITH RECURSIVE descendants(id) AS (
+                SELECT id
+                FROM attachments
+                WHERE parent_attachment_id = $attachmentId
+
+                UNION ALL
+
+                SELECT child.id
+                FROM attachments child
+                JOIN descendants parent ON child.parent_attachment_id = parent.id
+            )
+            SELECT id
+            FROM descendants;
+            """;
+        AddParameter(command, "$attachmentId", attachmentId);
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+            attachmentIds.Add(reader.GetInt32(0));
+    }
+
+    private int UpsertAttachment(
         SqliteConnection connection,
         SqliteTransaction transaction,
         int messageId,
         AttachmentContent attachment,
         int? parentAttachmentId,
         int? rootAttachmentId,
-        string now)
+        string now,
+        string triggerKind)
     {
+        var isDownloadFailure = !string.IsNullOrWhiteSpace(attachment.DownloadErrorCode)
+            && string.IsNullOrWhiteSpace(attachment.StorageKey);
+
         using (var command = connection.CreateCommand())
         {
             command.Transaction = transaction;
@@ -2220,34 +2303,111 @@ internal sealed class EmailDatabase
                     filename = excluded.filename,
                     archive_entry_path = excluded.archive_entry_path,
                     mime_type = excluded.mime_type,
-                    sniffed_mime_type = excluded.sniffed_mime_type,
-                    size_bytes = excluded.size_bytes,
-                    compressed_size_bytes = excluded.compressed_size_bytes,
-                    uncompressed_size_bytes = excluded.uncompressed_size_bytes,
-                    content_hash = excluded.content_hash,
-                    storage_key = excluded.storage_key,
-                    is_container = excluded.is_container,
+                    sniffed_mime_type = CASE
+                        WHEN $isDownloadFailure = 1 AND attachments.storage_key IS NOT NULL
+                        THEN attachments.sniffed_mime_type
+                        ELSE excluded.sniffed_mime_type
+                    END,
+                    size_bytes = CASE
+                        WHEN $isDownloadFailure = 1 AND attachments.storage_key IS NOT NULL
+                        THEN attachments.size_bytes
+                        ELSE excluded.size_bytes
+                    END,
+                    compressed_size_bytes = CASE
+                        WHEN $isDownloadFailure = 1 AND attachments.storage_key IS NOT NULL
+                        THEN attachments.compressed_size_bytes
+                        ELSE excluded.compressed_size_bytes
+                    END,
+                    uncompressed_size_bytes = CASE
+                        WHEN $isDownloadFailure = 1 AND attachments.storage_key IS NOT NULL
+                        THEN attachments.uncompressed_size_bytes
+                        ELSE excluded.uncompressed_size_bytes
+                    END,
+                    content_hash = COALESCE(excluded.content_hash, attachments.content_hash),
+                    storage_key = COALESCE(excluded.storage_key, attachments.storage_key),
+                    is_container = CASE
+                        WHEN $isDownloadFailure = 1 AND attachments.storage_key IS NOT NULL
+                        THEN attachments.is_container
+                        ELSE excluded.is_container
+                    END,
                     nesting_depth = excluded.nesting_depth,
                     download_status = excluded.download_status,
                     download_attempts = attachments.download_attempts + 1,
                     download_error = excluded.download_error,
-                    extraction_status = excluded.extraction_status,
+                    extraction_status = CASE
+                        WHEN $isDownloadFailure = 1 AND attachments.storage_key IS NOT NULL
+                        THEN CASE
+                            WHEN attachments.extraction_status = 'running' THEN 'failed'
+                            ELSE attachments.extraction_status
+                        END
+                        ELSE excluded.extraction_status
+                    END,
                     extraction_attempts = attachments.extraction_attempts + 1,
                     extraction_started_at = excluded.extraction_started_at,
                     extraction_lease_until = excluded.extraction_lease_until,
-                    extraction_error = excluded.extraction_error,
-                    extracted_text_available = excluded.extracted_text_available,
-                    ocr_text_available = excluded.ocr_text_available,
+                    extraction_lease_token = NULL,
+                    extraction_error = CASE
+                        WHEN $isDownloadFailure = 1 AND attachments.storage_key IS NOT NULL
+                        THEN attachments.extraction_error
+                        ELSE excluded.extraction_error
+                    END,
+                    extracted_text_available = CASE
+                        WHEN $isDownloadFailure = 1 AND attachments.storage_key IS NOT NULL
+                        THEN attachments.extracted_text_available
+                        ELSE excluded.extracted_text_available
+                    END,
+                    ocr_text_available = CASE
+                        WHEN $isDownloadFailure = 1 AND attachments.storage_key IS NOT NULL
+                        THEN attachments.ocr_text_available
+                        ELSE excluded.ocr_text_available
+                    END,
                     updated_at = excluded.updated_at;
                 """;
             AddAttachmentParameters(command, messageId, attachment, parentAttachmentId, rootAttachmentId, now);
+            AddParameter(command, "$isDownloadFailure", isDownloadFailure ? 1 : 0);
             command.ExecuteNonQuery();
         }
 
         var attachmentId = ReadAttachmentId(connection, transaction, messageId, attachment.SourceKind, attachment.DisplayPath);
-        UpsertAttachmentText(connection, transaction, attachmentId, attachment, now);
+        SupersedeRunningAttachmentAttempt(connection, transaction, attachmentId, now);
+        if (!isDownloadFailure)
+            UpsertAttachmentText(connection, transaction, attachmentId, attachment, now);
+        RecordAttachmentProcessingOutcome(
+            connection,
+            transaction,
+            attachmentId,
+            attachment,
+            triggerKind,
+            clientName: null,
+            now,
+            attemptId: null);
         RefreshAttachmentSearchDocument(connection, transaction, attachmentId);
         return attachmentId;
+    }
+
+    private static void SupersedeRunningAttachmentAttempt(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int attachmentId,
+        string now)
+    {
+        // A fresh message scan is authoritative over an overlapping local retry.
+        // Completing that retry later will fail its lease-token ownership check.
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE attachment_extraction_attempts
+            SET
+                completed_at = $completedAt,
+                outcome = 'superseded',
+                error_code = 'worker_canceled',
+                exception_message = 'Superseded by a newer message attachment scan.'
+            WHERE attachment_id = $attachmentId
+              AND outcome = 'running';
+            """;
+        AddParameter(command, "$attachmentId", attachmentId);
+        AddParameter(command, "$completedAt", now);
+        command.ExecuteNonQuery();
     }
 
     private static void AddAttachmentParameters(
@@ -2675,7 +2835,7 @@ internal sealed class EmailDatabase
 
         using var reader = (SqliteDataReader)command.ExecuteReader();
         if (!reader.Read())
-            return new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            return new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         return new(
             MetadataMessages: reader.GetInt32(reader.GetOrdinal("metadata_messages")),
@@ -2684,6 +2844,7 @@ internal sealed class EmailDatabase
             FtsRows: reader.GetInt32(reader.GetOrdinal("fts_rows")),
             PendingMessageBodies: reader.GetInt32(reader.GetOrdinal("pending_message_bodies")),
             Attachments: reader.GetInt32(reader.GetOrdinal("attachments")),
+            AttachmentTexts: reader.GetInt32(reader.GetOrdinal("attachment_texts")),
             AttachmentSearchDocs: reader.GetInt32(reader.GetOrdinal("attachment_search_docs")),
             AttachmentFtsRows: reader.GetInt32(reader.GetOrdinal("attachment_fts_rows")),
             PendingAttachments: reader.GetInt32(reader.GetOrdinal("pending_attachments")),
@@ -3587,7 +3748,25 @@ internal sealed class EmailDatabase
             ExtractionStatus: reader.GetString(reader.GetOrdinal("extraction_status")),
             ExtractionError: GetNullableString(reader, "extraction_error"),
             ExtractedTextAvailable: reader.GetInt32(reader.GetOrdinal("extracted_text_available")) != 0,
-            OcrTextAvailable: reader.GetInt32(reader.GetOrdinal("ocr_text_available")) != 0);
+            OcrTextAvailable: reader.GetInt32(reader.GetOrdinal("ocr_text_available")) != 0,
+            ExtractionErrorCode: GetNullableStringIfPresent(reader, "extraction_error_code"),
+            ExtractionNextAttemptAt: GetNullableStringIfPresent(reader, "extraction_next_attempt_at"),
+            ExtractionCompletedAt: GetNullableStringIfPresent(reader, "extraction_completed_at"),
+            Extractor: GetNullableStringIfPresent(reader, "extractor"),
+            ExtractorVersion: GetNullableStringIfPresent(reader, "extractor_version"));
+
+    private static string GetNullableStringIfPresent(SqliteDataReader reader, string name)
+    {
+        for (var ordinal = 0; ordinal < reader.FieldCount; ordinal++)
+        {
+            if (!reader.GetName(ordinal).Equals(name, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+        }
+
+        return null;
+    }
 
     private sealed record MessageSearchFolderState(
         int FolderId,
@@ -3603,6 +3782,7 @@ internal sealed class EmailDatabase
         int FtsRows,
         int PendingMessageBodies,
         int Attachments,
+        int AttachmentTexts,
         int AttachmentSearchDocs,
         int AttachmentFtsRows,
         int PendingAttachments,
@@ -3815,6 +3995,11 @@ internal sealed class EmailDatabase
             att.download_error,
             att.extraction_status,
             att.extraction_error,
+            att.extraction_error_code,
+            att.extraction_next_attempt_at,
+            att.extraction_completed_at,
+            att.extractor,
+            att.extractor_version,
             att.extracted_text_available,
             att.ocr_text_available
         FROM attachments_fts
@@ -3895,6 +4080,11 @@ internal sealed class EmailDatabase
             att.download_error,
             att.extraction_status,
             att.extraction_error,
+            att.extraction_error_code,
+            att.extraction_next_attempt_at,
+            att.extraction_completed_at,
+            att.extractor,
+            att.extractor_version,
             att.extracted_text_available,
             att.ocr_text_available
         FROM attachments att
@@ -3960,10 +4150,11 @@ internal sealed class EmailDatabase
                 WHEN m.body_downloaded = 0 OR b.message_id IS NULL THEN m.id
             END) AS pending_message_bodies,
             COUNT(DISTINCT att.id) AS attachments,
+            COUNT(DISTINCT atx.attachment_id) AS attachment_texts,
             COUNT(DISTINCT ads.attachment_id) AS attachment_search_docs,
             COUNT(DISTINCT afts.rowid) AS attachment_fts_rows,
             COUNT(DISTINCT CASE
-                WHEN att.extraction_status IN ('not_ready', 'pending', 'running') THEN att.id
+                WHEN att.extraction_status IN ('not_ready', 'pending', 'running', 'retry_wait') THEN att.id
             END) AS pending_attachments,
             COUNT(DISTINCT CASE
                 WHEN m.has_attachments = 1 AND m.attachments_scanned = 0 THEN m.id
@@ -3976,6 +4167,7 @@ internal sealed class EmailDatabase
         LEFT JOIN message_search_docs d ON d.message_id = m.id
         LEFT JOIN messages_fts fts ON fts.rowid = m.id
         LEFT JOIN attachments att ON att.message_id = m.id
+        LEFT JOIN attachment_text atx ON atx.attachment_id = att.id
         LEFT JOIN attachment_search_docs ads ON ads.attachment_id = att.id
         LEFT JOIN attachments_fts afts ON afts.rowid = att.id
         WHERE a.enabled = 1

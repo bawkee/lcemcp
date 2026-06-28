@@ -432,7 +432,60 @@ Next work:
 - Consider scoped localhost access links later. The current `email_prepare_attachment_access` implementation uses managed export files only.
 - Expand attachment readiness/search polish: separate attachment hit counts where practical, richer filter-only previews, and MCP status language that distinguishes message-ready from attachment-ready more clearly.
 
-## 9. Scanned PDF OCR Extraction
+## 9. Attachment Processing Reliability And Explicit Retry
+
+Status: completed on 2026-06-27; OCR remains the next attachment milestone.
+
+The remaining P1 review findings are included here and specified explicitly in `SPEC.md`: per-message failure isolation with fair retry selection, and preflight plus streaming enforcement of the attachment byte limit.
+
+Agreed design:
+
+- Treat every non-successful extraction outcome, including unsupported attachment types, through one failure system: `extraction_status = failed` plus a stable domain error code such as `unsupported_attachment_type`, `invalid_document`, `encrypted_document`, `extractor_timeout`, or `temporary_io_failure`. Runtime exception class names are diagnostic details, not durable public error codes.
+- Separate execution attempts from failure issues. Every automatic, explicit, or upgrade-triggered execution records one attempt, but repeated identical `(attachment, stage, error_code)` outcomes reuse one open issue instead of creating duplicate failures.
+- Persist extractor/version, trigger kind, timestamps, stable error code, exception type, exception message, and bounded full exception details for each failed attempt. Also write full exception details including stack traces and inner exceptions to rotating local diagnostic logs. Never log raw attachment bytes or extracted document text as exception context.
+- A successful retry marks open issues for that attachment/stage resolved/fixed and records the resolving attempt. An error-code change without successful extraction supersedes the old issue and opens the new classification.
+- Automatic retries are bounded and classified: deterministic unsupported/corrupt/encrypted/safety failures get no automatic retry; transient timeout/unavailable/I/O/worker failures get a small backoff budget; unknown extractor failures get one delayed retry before becoming terminal.
+- Explicit user/LLM retry grants one additional attempt beyond the automatic budget. There is no `force` mode. Unsupported types are retried the same way as any other failure and remain one open issue if still unsupported.
+- Attachment search may be ready with terminal failures, but status/readiness must report open failure counts, error-code breakdown, and text coverage so “index complete” is not presented as “all extraction succeeded.”
+
+Completed:
+
+- Added migration 8 with attachment download/extraction lifecycle fields, extractor/version provenance, leased extraction claims, `attachment_extraction_attempts`, deduplicated `attachment_extraction_failures`, message body retry scheduling, and migration of legacy `unsupported`, `encrypted`, `too_large`, and `failed` rows without changing attachment IDs or storage keys.
+- Unified processor outcomes under stable domain error codes. Unsupported, corrupt, encrypted, too-large, archive-safety, timeout, temporary-I/O, worker-crash, and unknown failures now use the same attempt/issue lifecycle; repeated identical failures increment one open issue, changed classifications supersede the old issue, and success resolves the issue.
+- Added rotating `logs/attachment-extraction.log` diagnostics with bounded durable exception details in SQLite. Ordinary CLI/MCP failure output exposes safe summaries and exception type, not object-store paths, raw content, or full stack traces.
+- Added atomic local-object extraction claims, bounded classified automatic retry/backoff, expired-lease recovery, and explicit one-attempt retries. Successful retries update attachment text/search/FTS while preserving the stable attachment ID.
+- Added `attachment-failures` and `retry-attachments` CLI commands plus audited `email_list_attachment_extraction_failures` and `email_retry_attachment_extraction` MCP tools. Retry requests are capped and require attachment IDs or account-plus-error-code filters.
+- Body sync now persists attachment metadata before part download, rejects trustworthy over-limit sizes before requesting the part, enforces the same hard limit while MIME content streams, isolates non-cancellation failures per message/attachment, records poison-message backoff, and prioritizes never-attempted body targets ahead of retries.
+- ZIP entry reads now use hard streaming limits. Traversal, oversized, and suspicious-compression entries are persisted as explicit skipped/failed child rows, and a partial container is no longer reported as unqualified `done`.
+- Readiness/status now separates terminal failures from pending work and reports attachment text coverage, open failure count, and error-code breakdown. Terminal failures no longer block an otherwise complete attachment index.
+
+Test result:
+
+- `dotnet test lcemcp.slnx --no-restore` passed with 67 tests on 2026-06-27.
+- New adversarial coverage intentionally throws transient I/O, timeout, corrupt-document, and unexpected extractor exceptions; verifies deterministic terminal handling, transient/unknown retry exhaustion, explicit retry by error code, duplicate issue suppression, classification supersession, successful repair/reindexing, full exception logging including inner exceptions, expired lease recovery, fair poison-message selection, legacy-row migration, CLI/MCP listing and retry audit, and preflight/streaming byte limits.
+- `dotnet format lcemcp.slnx --verify-no-changes --no-restore` passed.
+- Isolated CLI smoke tests created schema version `8 / target 8`; `status` reported the new extraction failure/coverage fields and `attachment-failures --limit 5` returned an empty result on a fresh database.
+
+Post-interruption review and hardening on 2026-06-28:
+
+- Added migration 9, `bounded_body_retries`, so poison message/attachment downloads stop after the classified retry budget and require the explicit bounded `sync-bodies --retry-failed-downloads` or MCP `retry_failed_downloads` requeue path. Retry requeue now runs only after the global sync lease is acquired.
+- Corrected stage-aware attempt accounting: deterministic download failures become terminal, extraction retries do not claim download-only issues, successful re-downloads resolve stale download issues, and local extraction success cannot falsely resolve a provider download failure.
+- Failed rescans now preserve the existing content hash, object key, extracted text, content-derived metadata, and archive descendants. New scans explicitly supersede an overlapping leased retry, and the stale worker cannot overwrite the newer scan or remain stuck as `running`.
+- Expired leases are recovered during normal database initialization, expired owners cannot complete, cancellation durably exits `running`, and diagnostic logger failures cannot roll back attachment state.
+- Attachment failure accounting now includes stored/skipped extraction failures without corrupting batch missing counts. Terminal extractor work has a bounded soft timeout, and timed-out task exceptions are observed while at most one runaway terminal extraction remains active.
+- ZIP handling rejects Unix/Windows/UNC absolute and traversal paths, persists rejected child rows, and assigns collision-safe display paths for duplicate archive and top-level attachment names. Failed archive downloads retain previously indexed descendants.
+- Legacy failure summaries are backfilled from safe domain-code text rather than legacy runtime messages. Full exception details remain bounded in internal attempt history and rotating local diagnostic logs.
+- `dotnet test lcemcp.slnx --no-restore` passed with 78 tests; the attachment-focused negative-branch suite passed 25 tests. `dotnet format lcemcp.slnx --verify-no-changes --no-restore` and `git diff --check` passed. An isolated CLI smoke test created schema version `9 / target 9`, reported the failure/coverage fields, and listed zero failures on a fresh database.
+
+Follow-up P1 and readability review on 2026-06-28:
+
+- Fixed recursive ZIP limits so nested containers share one root entry-count, total-uncompressed-size, and timeout budget. Previously each child ZIP reset all three limits, allowing deeply nested archives to multiply bounded work beyond the advertised root limits.
+- Added a nested-ZIP regression that crosses the aggregate 200-entry budget while every individual container remains below it.
+- Documented attachment-tree projections, terminal/leaf extraction, the process-wide timeout gate, bounded decoding, failure scopes, retry claims, stale-tree preservation, and other non-obvious lifecycle invariants. Added a repository guideline to comment domain terms and safety invariants without narrating straightforward code.
+- Serialized test classes that exercise the process-wide terminal-extraction gate. The prior timeout test could overlap another attachment test and transiently produce `extractor_unavailable`, making the full suite order-dependent even though each test passed alone.
+- `dotnet test lcemcp.slnx --no-restore /p:UseSharedCompilation=false` passed with 79 tests in four consecutive full-suite runs; the focused attachment processor/reliability run passed 26 tests. `dotnet format lcemcp.slnx --verify-no-changes --no-restore` and `git diff --check` passed.
+
+## 10. Scanned PDF OCR Extraction
 
 Separate ticket for OCRing PDFs that have no useful embedded text. This is split out because it is a bigger implementation/dependency task, not because OCR should be architecturally separate from embedded text extraction. OCR should feed the same attachment text, readiness, search, snippet, and `email_get_attachment_text` paths as every other extractor.
 
@@ -442,10 +495,10 @@ Next work:
 - Detect OCR candidates during PDF extraction when embedded text is empty, tiny, suspicious, encrypted, or image-only.
 - Render PDF pages safely with bounded page count, resolution, file size, timeout, and temp-file cleanup limits.
 - Feed recognized text into the same attachment extraction result and FTS indexing flow used by embedded PDF/DOCX/XLSX/TXT/HTML/CSV extraction. Store extractor provenance if useful, but avoid a separate MCP-facing OCR model unless the implementation proves it is needed.
-- Represent disabled, skipped, timeout, and failure cases through the same attachment extraction status/error fields used by the rest of the milestone.
+- Route disabled, skipped, timeout, and failure cases through the attachment attempt/failure lifecycle from item 9.
 - Add focused fixture tests for image-only PDFs, mixed embedded-text plus scanned PDFs, OCR-disabled behavior, timeouts/failures, and stale index cleanup.
 
-## 10. Testing Posture
+## 11. Testing Posture
 
 Status: the standalone "add focused tests" milestone is complete enough to retire as an active backlog item. The project now has a mature regression suite, so new tests should be attached to each feature or bug fix instead of tracked as a separate phase.
 
@@ -466,7 +519,7 @@ Historical checkpoints:
 - Completed on 2026-06-20: Added MCP stdio tests for initialize/tools-list, stdout/stderr separation, `email_get_sync_status` structured readiness output, and audit logging. `dotnet test lcemcp.slnx` passed with 25 tests.
 - Completed on 2026-06-20: Expanded MCP tests to cover the full exposed tool catalog plus ready-index `email_search` and `email_get_message`, including affected-message audit ids. `dotnet test lcemcp.slnx` passed with 26 tests.
 
-## 11. Later Milestones
+## 12. Later Milestones
 
 These are intentionally after read-only local search works.
 

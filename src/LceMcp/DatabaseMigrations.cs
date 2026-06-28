@@ -10,7 +10,9 @@ internal static class DatabaseMigrations
         new(4, "sync_queue_and_leases", SyncQueueAndLeasesSql),
         new(5, "sync_window_tracking", SyncWindowTrackingSql),
         new(6, "attachment_metadata_and_search", AttachmentSearchSchemaSql),
-        new(7, "attachment_scan_tracking", AttachmentScanTrackingSql)
+        new(7, "attachment_scan_tracking", AttachmentScanTrackingSql),
+        new(8, "attachment_processing_reliability", AttachmentProcessingReliabilitySql),
+        new(9, "bounded_body_retries", BoundedBodyRetriesSql)
     ];
 
     public static int TargetVersion => All.Select(migration => migration.Version).DefaultIfEmpty(0).Max();
@@ -348,5 +350,182 @@ internal static class DatabaseMigrations
 
         CREATE INDEX IF NOT EXISTS idx_messages_attachment_scan
         ON messages(account_id, has_attachments, attachments_scanned);
+        """;
+
+    public const string AttachmentProcessingReliabilitySql = """
+        ALTER TABLE attachments ADD COLUMN download_started_at TEXT;
+        ALTER TABLE attachments ADD COLUMN download_lease_until TEXT;
+        ALTER TABLE attachments ADD COLUMN download_next_attempt_at TEXT;
+        ALTER TABLE attachments ADD COLUMN download_completed_at TEXT;
+        ALTER TABLE attachments ADD COLUMN download_error_code TEXT;
+        ALTER TABLE attachments ADD COLUMN extraction_next_attempt_at TEXT;
+        ALTER TABLE attachments ADD COLUMN extraction_completed_at TEXT;
+        ALTER TABLE attachments ADD COLUMN extraction_error_code TEXT;
+        ALTER TABLE attachments ADD COLUMN extractor TEXT;
+        ALTER TABLE attachments ADD COLUMN extractor_version TEXT;
+        ALTER TABLE attachments ADD COLUMN extraction_lease_token TEXT;
+
+        ALTER TABLE messages ADD COLUMN body_attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE messages ADD COLUMN body_next_attempt_at TEXT;
+        ALTER TABLE messages ADD COLUMN body_last_error_code TEXT;
+        ALTER TABLE messages ADD COLUMN body_last_error TEXT;
+
+        CREATE TABLE attachment_extraction_attempts (
+            id INTEGER PRIMARY KEY,
+            attachment_id INTEGER NOT NULL,
+            stage TEXT NOT NULL DEFAULT 'extraction',
+            trigger_kind TEXT NOT NULL,
+            client_name TEXT,
+            extractor TEXT,
+            extractor_version TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            outcome TEXT NOT NULL,
+            error_code TEXT,
+            exception_type TEXT,
+            exception_message TEXT,
+            exception_details TEXT,
+            FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE attachment_extraction_failures (
+            id INTEGER PRIMARY KEY,
+            attachment_id INTEGER NOT NULL,
+            stage TEXT NOT NULL,
+            error_code TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            first_attempt_id INTEGER NOT NULL,
+            latest_attempt_id INTEGER NOT NULL,
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
+            first_seen_at TEXT NOT NULL,
+            last_checked_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolved_by_attempt_id INTEGER,
+            FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+            FOREIGN KEY(first_attempt_id) REFERENCES attachment_extraction_attempts(id),
+            FOREIGN KEY(latest_attempt_id) REFERENCES attachment_extraction_attempts(id),
+            FOREIGN KEY(resolved_by_attempt_id) REFERENCES attachment_extraction_attempts(id)
+        );
+
+        CREATE UNIQUE INDEX idx_attachment_extraction_failures_open
+        ON attachment_extraction_failures(attachment_id, stage, error_code)
+        WHERE status = 'open';
+
+        CREATE INDEX idx_attachment_extraction_failures_status
+        ON attachment_extraction_failures(status, error_code, last_checked_at);
+
+        CREATE INDEX idx_attachment_extraction_attempts_attachment
+        ON attachment_extraction_attempts(attachment_id, started_at);
+
+        UPDATE attachments
+        SET
+            extraction_error_code = CASE extraction_status
+                WHEN 'unsupported' THEN 'unsupported_attachment_type'
+                WHEN 'encrypted' THEN 'encrypted_document'
+                WHEN 'too_large' THEN 'attachment_too_large'
+                WHEN 'failed' THEN CASE
+                    WHEN storage_key IS NULL THEN 'temporary_io_failure'
+                    ELSE 'unknown_extractor_failure'
+                END
+            END,
+            extractor = (
+                SELECT attachment_text.extractor
+                FROM attachment_text
+                WHERE attachment_text.attachment_id = attachments.id
+            ),
+            extraction_completed_at = CASE
+                WHEN extraction_status IN ('done', 'empty', 'unsupported', 'encrypted', 'too_large', 'failed')
+                THEN updated_at
+            END
+        WHERE extraction_status IN ('done', 'empty', 'unsupported', 'encrypted', 'too_large', 'failed');
+
+        INSERT INTO attachment_extraction_attempts (
+            attachment_id,
+            stage,
+            trigger_kind,
+            extractor,
+            started_at,
+            completed_at,
+            outcome,
+            error_code,
+            exception_message
+        )
+        SELECT
+            id,
+            'extraction',
+            'legacy_migration',
+            extractor,
+            COALESCE(extraction_started_at, updated_at, created_at),
+            COALESCE(extraction_completed_at, updated_at, created_at),
+            CASE WHEN extraction_error_code IS NULL THEN extraction_status ELSE 'failed' END,
+            extraction_error_code,
+            extraction_error
+        FROM attachments
+        WHERE extraction_status IN ('done', 'empty', 'unsupported', 'encrypted', 'too_large', 'failed');
+
+        INSERT INTO attachment_extraction_failures (
+            attachment_id,
+            stage,
+            error_code,
+            status,
+            first_attempt_id,
+            latest_attempt_id,
+            occurrence_count,
+            first_seen_at,
+            last_checked_at
+        )
+        SELECT
+            a.id,
+            'extraction',
+            a.extraction_error_code,
+            'open',
+            (
+                SELECT MAX(attempt.id)
+                FROM attachment_extraction_attempts attempt
+                WHERE attempt.attachment_id = a.id
+            ),
+            (
+                SELECT MAX(attempt.id)
+                FROM attachment_extraction_attempts attempt
+                WHERE attempt.attachment_id = a.id
+            ),
+            1,
+            COALESCE(a.extraction_completed_at, a.updated_at, a.created_at),
+            COALESCE(a.extraction_completed_at, a.updated_at, a.created_at)
+        FROM attachments a
+        WHERE a.extraction_error_code IS NOT NULL;
+
+        UPDATE attachments
+        SET extraction_status = 'failed'
+        WHERE extraction_status IN ('unsupported', 'encrypted', 'too_large');
+
+        CREATE INDEX idx_attachments_extraction_schedule
+        ON attachments(extraction_status, extraction_next_attempt_at, extraction_lease_until);
+
+        CREATE INDEX idx_messages_body_retry
+        ON messages(account_id, body_downloaded, attachments_scanned, body_next_attempt_at, body_attempts);
+        """;
+
+    public const string BoundedBodyRetriesSql = """
+        ALTER TABLE messages ADD COLUMN body_retry_exhausted INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE attachment_extraction_failures ADD COLUMN error_summary TEXT;
+
+        UPDATE attachment_extraction_failures
+        SET error_summary = CASE error_code
+            WHEN 'unsupported_attachment_type' THEN 'No text extractor is available for this attachment type.'
+            WHEN 'invalid_document' THEN 'The attachment is invalid or corrupt.'
+            WHEN 'encrypted_document' THEN 'The attachment is encrypted and cannot be extracted.'
+            WHEN 'extractor_timeout' THEN 'Attachment extraction timed out.'
+            WHEN 'extractor_unavailable' THEN 'The attachment extractor was temporarily unavailable.'
+            WHEN 'temporary_io_failure' THEN 'A temporary I/O error interrupted attachment processing.'
+            WHEN 'worker_canceled' THEN 'Attachment extraction was canceled.'
+            WHEN 'worker_crashed' THEN 'The attachment extraction worker stopped before completion.'
+            WHEN 'attachment_too_large' THEN 'The attachment exceeded the configured size limit.'
+            WHEN 'archive_safety_limit' THEN 'The archive was rejected by a safety limit.'
+            ELSE 'Attachment processing failed unexpectedly.'
+        END;
+
+        CREATE INDEX idx_messages_body_retry_exhausted
+        ON messages(account_id, body_retry_exhausted, body_next_attempt_at, body_attempts);
         """;
 }

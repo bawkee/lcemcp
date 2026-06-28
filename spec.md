@@ -620,6 +620,7 @@ CREATE TABLE messages (
     size_bytes INTEGER,
     raw_headers TEXT,
     body_downloaded INTEGER NOT NULL DEFAULT 0,
+    attachments_scanned INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(account_id) REFERENCES accounts(id)
@@ -726,12 +727,22 @@ CREATE TABLE attachments (
     nesting_depth INTEGER NOT NULL DEFAULT 0,
     download_status TEXT NOT NULL DEFAULT 'not_downloaded',
     download_attempts INTEGER NOT NULL DEFAULT 0,
+    download_started_at TEXT,
+    download_lease_until TEXT,
+    download_next_attempt_at TEXT,
+    download_completed_at TEXT,
+    download_error_code TEXT,
     download_error TEXT,
     extraction_status TEXT NOT NULL DEFAULT 'not_ready',
     extraction_attempts INTEGER NOT NULL DEFAULT 0,
     extraction_started_at TEXT,
     extraction_lease_until TEXT,
+    extraction_next_attempt_at TEXT,
+    extraction_completed_at TEXT,
+    extraction_error_code TEXT,
     extraction_error TEXT,
+    extractor TEXT,
+    extractor_version TEXT,
     extracted_text_available INTEGER NOT NULL DEFAULT 0,
     ocr_text_available INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
@@ -767,9 +778,84 @@ Use one row for every searchable or user-accessible binary. A ZIP attachment get
 Recommended status values:
 
 ```text
-download_status: not_downloaded | stored | skipped | failed
-extraction_status: not_ready | pending | running | done | empty | unsupported | encrypted | too_large | failed | skipped
+download_status: not_downloaded | pending | running | retry_wait | stored | skipped | failed
+extraction_status: not_ready | pending | running | retry_wait | done | empty | failed
 ```
+
+`messages.attachments_scanned = 1` means the message's MIME/body structure was successfully enumerated and expected top-level attachment rows were recorded. It does not mean every attachment binary downloaded or extracted successfully. Download and extraction failures remain visible and retryable through attachment rows without repeatedly downloading the message body.
+
+Unsupported types, encrypted documents, corrupt documents, safety-limit rejections, timeouts, unavailable workers, and unexpected extractor exceptions all use `extraction_status = failed` plus a stable domain `extraction_error_code`. Do not persist CLR exception class names as the public error code. Example codes:
+
+```text
+unsupported_attachment_type
+invalid_document
+encrypted_document
+attachment_too_large
+archive_safety_limit
+extractor_timeout
+extractor_unavailable
+temporary_io_failure
+worker_crashed
+unknown_extractor_failure
+```
+
+The current attachment row is the latest-state projection. Keep attempt history and deduplicated failure issues separately:
+
+```sql
+CREATE TABLE attachment_extraction_attempts (
+    id INTEGER PRIMARY KEY,
+    attachment_id INTEGER NOT NULL,
+    trigger_kind TEXT NOT NULL,
+    client_name TEXT,
+    extractor TEXT,
+    extractor_version TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    outcome TEXT NOT NULL,
+    error_code TEXT,
+    exception_type TEXT,
+    exception_message TEXT,
+    exception_details TEXT,
+    FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE
+);
+
+CREATE TABLE attachment_extraction_failures (
+    id INTEGER PRIMARY KEY,
+    attachment_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    error_code TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    first_attempt_id INTEGER NOT NULL,
+    latest_attempt_id INTEGER NOT NULL,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    first_seen_at TEXT NOT NULL,
+    last_checked_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_by_attempt_id INTEGER,
+    FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+    FOREIGN KEY(first_attempt_id) REFERENCES attachment_extraction_attempts(id),
+    FOREIGN KEY(latest_attempt_id) REFERENCES attachment_extraction_attempts(id),
+    FOREIGN KEY(resolved_by_attempt_id) REFERENCES attachment_extraction_attempts(id)
+);
+
+CREATE UNIQUE INDEX idx_attachment_extraction_failures_open
+ON attachment_extraction_failures(attachment_id, stage, error_code)
+WHERE status = 'open';
+```
+
+`trigger_kind` should distinguish at least `initial`, `automatic_retry`, `explicit_retry`, and `extractor_upgrade`. Each execution creates an attempt row. Repeating the same failure updates the existing open failure issue's `latest_attempt_id`, `last_checked_at`, and `occurrence_count`; it must not create another open issue. A successful extraction marks all open issues for that attachment/stage `resolved` and records `resolved_by_attempt_id`. If the error classification changes without successful extraction, mark the old issue `superseded` and open the new issue rather than calling the old one fixed.
+
+Record actual exception diagnostics for failed attempts:
+
+- Stable domain error code.
+- Runtime exception type.
+- Exception message.
+- Full exception details, including stack trace and inner exceptions.
+- Extractor name/version, attachment ID, stage, trigger kind, and timestamps.
+
+Write full `Exception.ToString()`-style diagnostics to rotating local logs on stderr-compatible logging paths. Keep a reasonably bounded copy in SQLite for durable troubleshooting. Do not log raw attachment bytes or extracted document text as exception context. Normal MCP responses should expose stable error codes, safe summaries, and bounded metadata, not full stack traces or internal filesystem paths.
+
+Expected capability outcomes such as `unsupported_attachment_type` do not need a synthetic runtime exception. Their exception fields may be null while the stable error code and safe explanation remain populated. When an extractor actually throws, preserve the real exception details rather than replacing them with only the domain code.
 
 ### 11.8 attachment_text
 
@@ -1375,11 +1461,12 @@ For attachment extraction:
 
 ```text
 use attachment rows as the work source
-mark extraction_status = pending/running/done/failed/skipped
+mark extraction_status = pending/running/retry_wait/done/empty/failed
 use extraction_lease_until for running work
-write extracted output to a temp path first
+record every execution attempt and deduplicate open failure issues
+write extracted output through bounded temporary storage
 commit DB state and atomic file moves carefully
-on startup, reset expired running rows back to pending
+on startup, classify expired running leases and return retryable work to retry_wait
 ```
 
 For archive/container extraction:
@@ -1427,6 +1514,51 @@ Proton Mail:
 
 - Treat Proton Bridge as the local IMAP/SMTP endpoint.
 - Do not try to implement Proton's proprietary service directly in v1.
+
+### 14.6 Per-Message Failure Isolation
+
+Failures at account or folder boundaries may fail the applicable sync scope:
+
+```text
+authentication failure
+connection failure
+folder open failure
+folder-level summary/list command failure
+sync lease loss or cancellation
+```
+
+Once individual message targets are known, failures attributable to one message or attachment must be isolated from independent targets. IMAP part download errors, MIME decode errors, malformed message content, object-store write errors, and attachment processor failures for one target must not abort the rest of the folder.
+
+Required behavior:
+
+```text
+1. Process and persist successful messages independently of failed siblings in the same batch.
+2. Record the failed message/attachment, stable error code, safe summary, and full local exception diagnostics.
+3. Increment attempted/progress counts and continue with later targets.
+4. Leave retryable work pending or in retry_wait with bounded backoff.
+5. Surface aggregate failures in the folder/run result rather than reporting an unqualified success.
+6. Re-throw cancellation and lease-loss exceptions immediately.
+```
+
+A repeatedly failing newest message must not starve older targets, including when `max_per_folder` is bounded. Target selection should prioritize never-attempted work and due retries, and exclude backoff-delayed rows until `next_attempt_at`. Exhausted terminal failures remain visible but do not monopolize every subsequent sync.
+
+### 14.7 Attachment Download Size Enforcement
+
+The attachment size policy is a download boundary, not merely a post-download storage check.
+
+Required behavior:
+
+```text
+1. Persist the top-level attachment metadata row from body structure before requesting its binary.
+2. Inspect provider/body-structure size metadata before requesting a part.
+3. If a trustworthy declared size exceeds the configured limit, record attachment_too_large and do not request the binary.
+4. Treat provider sizes as advisory; enforce the same limit while decoding/streaming.
+5. Stop after at most limit + 1 decoded bytes, clean partial temporary files, and do not retain a partial object.
+6. Stream decoded content through incremental hashing into the managed object store instead of materializing arbitrarily large byte arrays in memory.
+7. Apply cancellation and a bounded timeout during download/decode.
+```
+
+The hard cap applies to decoded attachment bytes. Transfer encoding, incorrect provider metadata, missing `Octets`, and full-message fallback paths must not bypass it. Archive expansion has separate compressed/uncompressed limits in addition to the top-level binary download limit.
 
 ---
 
@@ -1527,9 +1659,38 @@ max_archive_compression_ratio
 archive_extraction_timeout_seconds
 ```
 
+Entry-count, total-uncompressed-size, and timeout budgets apply to the complete
+recursively expanded tree rooted at one email attachment. Nested containers must
+share the root budget rather than resetting these limits at each ZIP level.
+
 Archive entries must never write directly to caller-controlled paths. Normalize separators, reject absolute paths and `..` traversal, preserve the original entry name for display, and expose a safe `display_path` such as `statements.zip!/2026-06/statement.pdf`.
 
 DOCX and XLSX are Open XML documents and should be handled by document extractors before generic archive expansion. Their internal ZIP entries are implementation detail, not user-facing child attachments.
+
+### 15.5 Failure Classification and Retry
+
+Attachment download/enumeration and local text extraction are separate lifecycle stages. Once a binary is stored in the managed object store, extraction retries must use that local object and must not re-download it from IMAP.
+
+Automatic retry policy is bounded and error-code-specific:
+
+```text
+invalid/unsupported/encrypted/safety-limit failures -> no automatic retry
+timeout/unavailable/temporary I/O/worker crash       -> at most 3 total attempts with backoff
+unknown extractor failure                            -> one delayed automatic retry, then terminal
+```
+
+`retry_wait` rows become claimable only after `extraction_next_attempt_at`. Claim work transactionally by moving one row to `running`, incrementing its attempt count, and setting a lease. Expired `running` leases become retryable failures without allowing two workers to process the same attachment concurrently.
+
+Explicit user or LLM retries are allowed for any open extraction failure, including `unsupported_attachment_type`. An explicit retry grants one additional attempt beyond the automatic retry budget; it does not reset an unlimited automatic loop. If the same failure recurs, record the attempt and diagnostics but reuse the existing open failure issue. If extraction succeeds, update attachment text/search documents and mark the issue resolved/fixed.
+
+When extractor support or versions change, the app may offer or schedule retries filtered by error code, MIME type, and prior extractor version. This uses the same explicit/upgrade attempt path rather than a special `force` mode.
+
+Readiness semantics:
+
+- `pending`, `running`, and `retry_wait` mean attachment extraction is not complete for the requested scope.
+- Terminal open failures do not block the rest of the searchable corpus forever.
+- Status/readiness must report open failure counts and an error-code breakdown so `attachment_search_index_complete = true` cannot be mistaken for “every attachment produced text.”
+- Successful retry resolves the issue and updates text coverage without changing the stable attachment ID.
 
 ---
 
@@ -1557,6 +1718,8 @@ email_get_message
 email_get_thread
 email_get_attachment_text
 email_prepare_attachment_access
+email_list_attachment_extraction_failures
+email_retry_attachment_extraction
 email_sync_now
 email_get_sync_status
 email_get_audit_events
@@ -2226,6 +2389,51 @@ Rules:
 
 Raw attachment export remains a separate dangerous capability. It would mean returning raw bytes/base64 through MCP, bulk exporting without specific attachment IDs, or writing to arbitrary caller-supplied paths. Keep that disabled by default.
 
+### 16.11.1 email_list_attachment_extraction_failures
+
+List bounded, unresolved or historical attachment extraction issues without exposing raw attachment content, object-store paths, or full exception stack traces.
+
+Input:
+
+```json
+{
+  "attachment_ids": null,
+  "accounts": ["yahoo"],
+  "error_codes": ["unsupported_attachment_type"],
+  "status": "open",
+  "limit": 20
+}
+```
+
+Output should include stable attachment/message IDs, display path, MIME type, error code, safe error summary, runtime exception type when available, extractor/version, occurrence count, first/last timestamps, and issue status. Full exception details remain available in local diagnostic logs and durable internal attempt history, not ordinary MCP output.
+
+### 16.11.2 email_retry_attachment_extraction
+
+Explicitly queue one additional local extraction attempt for known failures. This tool never accepts filesystem paths and does not contact IMAP when the managed object is present.
+
+Input:
+
+```json
+{
+  "attachment_ids": null,
+  "accounts": ["yahoo"],
+  "error_codes": ["unsupported_attachment_type"],
+  "limit": 20
+}
+```
+
+Rules:
+
+- Require explicit attachment IDs or at least one bounded failure filter such as account plus error code.
+- Cap each request, for example at 50 attachments.
+- Select only existing attachment rows with open failures and stored binaries.
+- Refuse or report attachments already pending/running rather than queueing duplicates.
+- Each selected attachment receives one explicit attempt beyond its automatic budget; there is no `force` flag.
+- Repeating the same failure reuses the existing issue while recording the new attempt and exception diagnostics.
+- Success updates attachment text/FTS and resolves the issue as fixed.
+- Audit the tool call, selected attachment IDs, filter summary, and aggregate result.
+- Return a run/status ID for potentially long work such as OCR and expose progress through the normal sync/status surface.
+
 ### 16.12 email_sync_now
 
 Manually trigger sync.
@@ -2356,6 +2564,11 @@ Output:
       "messages_indexed": 12043,
       "attachments_indexed": 884,
       "extraction_pending": 12,
+      "extraction_failures_open": 4,
+      "extraction_failures_by_code": {
+        "unsupported_attachment_type": 3,
+        "invalid_document": 1
+      },
       "folders": [
         {
           "folder": "All Mail",
@@ -2747,14 +2960,17 @@ Deliver:
 - PDF embedded text extraction.
 - TXT/HTML/CSV/DOCX/XLSX text extraction where practical.
 - ZIP/7z archive expansion with bounded safety limits.
+- Durable extraction attempts, deduplicated failure issues, bounded automatic retries, and explicit ID/error-code-filtered retry.
 - attachment_search_docs and attachments_fts index.
 - `email_search` supports `search_in = ["attachments"]`.
 - `email_search` supports `search_in = ["messages", "attachments"]`.
 - `email_search` returns nested matching attachment hits.
 - `email_search` returns message/attachment hit counts when practical.
-- MCP tool:
+- MCP tools:
   - email_get_attachment_text
   - email_prepare_attachment_access
+  - email_list_attachment_extraction_failures
+  - email_retry_attachment_extraction
 ```
 
 Do not require OCR yet.

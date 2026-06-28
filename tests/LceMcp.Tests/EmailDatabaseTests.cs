@@ -15,8 +15,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Created, status.InitializationKind);
-        Assert.Equal(7, status.SchemaVersion);
-        Assert.Equal(7, status.TargetSchemaVersion);
+        Assert.Equal(9, status.SchemaVersion);
+        Assert.Equal(9, status.TargetSchemaVersion);
         Assert.Equal(0, status.AccountCount);
         Assert.Equal(0, status.FolderCount);
         Assert.Equal(0, status.MessageCount);
@@ -40,6 +40,8 @@ public sealed class EmailDatabaseTests
             "accounts",
             "audit_log",
             "attachment_search_docs",
+            "attachment_extraction_attempts",
+            "attachment_extraction_failures",
             "attachment_text",
             "attachments",
             "attachments_fts",
@@ -68,8 +70,8 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Opened, status.InitializationKind);
-        Assert.Equal(7, status.SchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search", "attachment_scan_tracking"], ReadNames(
+        Assert.Equal(9, status.SchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search", "attachment_scan_tracking", "attachment_processing_reliability", "bounded_body_retries"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
     }
@@ -98,9 +100,9 @@ public sealed class EmailDatabaseTests
         var status = database.GetStatus();
 
         Assert.Equal(DatabaseInitializationKind.Migrated, status.InitializationKind);
-        Assert.Equal(7, status.SchemaVersion);
-        Assert.Equal(7, status.TargetSchemaVersion);
-        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search", "attachment_scan_tracking"], ReadNames(
+        Assert.Equal(9, status.SchemaVersion);
+        Assert.Equal(9, status.TargetSchemaVersion);
+        Assert.Equal(["initial_metadata_cache", "message_bodies_and_search", "sync_runs_and_search_readiness", "sync_queue_and_leases", "sync_window_tracking", "attachment_metadata_and_search", "attachment_scan_tracking", "attachment_processing_reliability", "bounded_body_retries"], ReadNames(
             temp.Paths.DatabasePath,
             "SELECT name FROM schema_migrations ORDER BY version;"));
         Assert.Contains("message_search_docs", ReadNames(

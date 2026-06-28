@@ -2,6 +2,7 @@ using System.Text.Json.Nodes;
 
 namespace LceMcp.Tests;
 
+[Collection("Process-wide attachment extraction gate")]
 public sealed class CliAppTests
 {
     private static readonly SemaphoreSlim ConsoleGate = new(1, 1);
@@ -96,6 +97,75 @@ public sealed class CliAppTests
         var json = ExtractJson(output);
 
         Assert.NotNull(json["servers"]["lcemcp"]);
+    }
+
+    [Fact]
+    public async Task AttachmentFailureCommandsListAndRetryKnownFailure()
+    {
+        await ConsoleGate.WaitAsync();
+        var previousOut = Console.Out;
+        var previousError = Console.Error;
+        var previousConfigDir = Environment.GetEnvironmentVariable("LCEMCP_CONFIG_DIR");
+
+        try
+        {
+            using var temp = TempWorkspace.Create();
+            var database = new EmailDatabase(temp.Paths);
+            var accountId = database.UpsertConfiguredAccount(TestData.Account());
+            database.UpsertFolders(accountId, [TestData.Folder("Inbox", role: "inbox")]);
+            var inbox = database.ReadFolders("yahoo").Single();
+            database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+                TestData.Message(
+                    "100",
+                    "emailid:cli-attachment-failure",
+                    "cli-attachment-failure@example.com",
+                    hasAttachments: true)
+            ], """{"since_days":30,"max_per_folder":0,"matched_count":1,"selected_count":1,"fetched_count":1,"missing_count":0}""", 100);
+            var messageId = database.ReadPendingBodySyncTargets("yahoo", "Inbox", 0).Single().MessageId;
+            var processor = new AttachmentProcessor(new AttachmentObjectStore(temp.Paths));
+            database.UpsertMessageBody(new(
+                messageId,
+                "Body",
+                null,
+                "Body",
+                [],
+                [processor.ProcessEmailAttachment(
+                    "2", "payload.bin", "application/octet-stream", 3, [1, 2, 3], "payload.bin")]));
+            var attachmentId = database.ListAttachmentExtractionFailures(new([], [], [], "open", 20)).Single().AttachmentId;
+            using var output = new StringWriter();
+            using var error = new StringWriter();
+            Environment.SetEnvironmentVariable("LCEMCP_CONFIG_DIR", temp.Directory);
+            Console.SetOut(output);
+            Console.SetError(error);
+
+            var listExit = await CliApp.RunAsync([
+                "attachment-failures",
+                "--attachment-id",
+                attachmentId.ToString()
+            ], CancellationToken.None);
+            var listOutput = output.ToString();
+            output.GetStringBuilder().Clear();
+            var retryExit = await CliApp.RunAsync([
+                "retry-attachments",
+                "--attachment-id",
+                attachmentId.ToString()
+            ], CancellationToken.None);
+            var retryOutput = output.ToString();
+
+            Assert.Equal(0, listExit);
+            Assert.Contains($"attachment_id={attachmentId}", listOutput);
+            Assert.Contains("code=unsupported_attachment_type", listOutput);
+            Assert.Equal(1, retryExit);
+            Assert.Contains("selected=1", retryOutput);
+            Assert.Contains("failed=1", retryOutput);
+        }
+        finally
+        {
+            Console.SetOut(previousOut);
+            Console.SetError(previousError);
+            Environment.SetEnvironmentVariable("LCEMCP_CONFIG_DIR", previousConfigDir);
+            ConsoleGate.Release();
+        }
     }
 
     private static async Task<string> RunCliAsync(params string[] args)

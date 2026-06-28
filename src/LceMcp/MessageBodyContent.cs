@@ -28,9 +28,10 @@ internal sealed record BodyFolderSyncResult(
     int FetchedCount,
     int PersistedCount,
     int MissingCount,
-    string Error)
+    string Error,
+    int FailedCount = 0)
 {
-    public bool Succeeded => string.IsNullOrWhiteSpace(Error);
+    public bool Succeeded => string.IsNullOrWhiteSpace(Error) && FailedCount == 0;
 }
 
 internal sealed record BodyAccountSyncResult(

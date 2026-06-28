@@ -7,6 +7,7 @@ using System.Text;
 
 namespace LceMcp.Tests;
 
+[Collection("Process-wide attachment extraction gate")]
 public sealed class AttachmentProcessorTests
 {
     [Fact]
@@ -17,8 +18,10 @@ public sealed class AttachmentProcessorTests
         var zipBytes = CreateZip(new Dictionary<string, string>
         {
             ["docs/invoice.HTML"] = "<html><body><p>Invoice VAT and DDV total.</p></body></html>",
+            ["evil.txt"] = "safe sibling",
             ["../evil.txt"] = "should not appear",
-            ["C:/absolute.txt"] = "should not appear either"
+            ["C:/absolute.txt"] = "should not appear either",
+            ["/absolute-unix.txt"] = "should not appear either"
         });
 
         var attachment = processor.ProcessEmailAttachment(
@@ -29,9 +32,17 @@ public sealed class AttachmentProcessorTests
             content: zipBytes,
             displayPath: "bundle.zip");
 
-        var child = Assert.Single(attachment.Children);
+        var child = Assert.Single(attachment.Children, item => item.DisplayPath.EndsWith("docs/invoice.HTML"));
+        var rejected = attachment.Children.Where(item => item.DownloadStatus == "skipped").ToList();
         Assert.True(attachment.IsContainer);
-        Assert.Equal("done", attachment.ExtractionStatus);
+        Assert.Equal("failed", attachment.ExtractionStatus);
+        Assert.Equal("archive_safety_limit", attachment.ExtractionErrorCode);
+        Assert.Equal(3, rejected.Count);
+        Assert.All(rejected, item => Assert.Equal("archive_safety_limit", item.ExtractionErrorCode));
+        Assert.All(rejected, item => Assert.Contains("!/rejected/", item.DisplayPath));
+        Assert.Equal(
+            attachment.Children.Count,
+            attachment.Children.Select(item => item.DisplayPath).Distinct(StringComparer.OrdinalIgnoreCase).Count());
         Assert.Equal("bundle.zip!/docs/invoice.HTML", child.DisplayPath);
         Assert.Equal("done", child.ExtractionStatus);
         Assert.Contains("DDV", child.ExtractedText, StringComparison.OrdinalIgnoreCase);
@@ -85,11 +96,73 @@ public sealed class AttachmentProcessorTests
         Assert.False(attachment.IsContainer);
         Assert.Equal("stored", attachment.DownloadStatus);
         Assert.Equal("failed", attachment.ExtractionStatus);
+        Assert.Equal("invalid_document", attachment.ExtractionErrorCode);
         Assert.NotNull(attachment.StorageKey);
         Assert.Null(attachment.ExtractedText);
     }
 
-    private static byte[] CreateZip(IReadOnlyDictionary<string, string> entries)
+    [Fact]
+    public void DuplicateArchiveEntryNamesReceiveUniqueDisplayPaths()
+    {
+        using var temp = TempWorkspace.Create();
+        var processor = new AttachmentProcessor(new AttachmentObjectStore(temp.Paths));
+        var zipBytes = CreateZip(
+        [
+            new("report.txt", "first"),
+            new("report.txt", "second"),
+            new("report (2).txt", "third")
+        ]);
+
+        var attachment = processor.ProcessEmailAttachment(
+            partId: "2",
+            filename: "duplicates.zip",
+            mimeType: "application/zip",
+            declaredSizeBytes: zipBytes.Length,
+            content: zipBytes,
+            displayPath: "duplicates.zip");
+
+        Assert.Equal(3, attachment.Children.Count);
+        Assert.Equal(
+            attachment.Children.Count,
+            attachment.Children.Select(item => item.DisplayPath).Distinct(StringComparer.OrdinalIgnoreCase).Count());
+        Assert.Contains(attachment.Children, item => item.DisplayPath == "duplicates.zip!/report.txt");
+        Assert.Contains(attachment.Children, item => item.DisplayPath == "duplicates.zip!/report (2).txt");
+        Assert.Contains(attachment.Children, item => item.DisplayPath == "duplicates.zip!/report (2) (2).txt");
+    }
+
+    [Fact]
+    public void NestedZipExpansionSharesOneRootEntryBudget()
+    {
+        using var temp = TempWorkspace.Create();
+        var processor = new AttachmentProcessor(new AttachmentObjectStore(temp.Paths));
+        var first = CreateZip(Enumerable.Range(1, 100).ToDictionary(
+            index => $"first/{index}.txt",
+            index => $"first {index}"));
+        var second = CreateZip(Enumerable.Range(1, 100).ToDictionary(
+            index => $"second/{index}.txt",
+            index => $"second {index}"));
+        var outer = CreateBinaryZip(new Dictionary<string, byte[]>
+        {
+            ["first.zip"] = first,
+            ["second.zip"] = second
+        });
+
+        var attachment = processor.ProcessEmailAttachment(
+            partId: "2",
+            filename: "nested.zip",
+            mimeType: "application/zip",
+            declaredSizeBytes: outer.Length,
+            content: outer,
+            displayPath: "nested.zip");
+
+        Assert.Equal("failed", attachment.ExtractionStatus);
+        Assert.Equal("archive_safety_limit", attachment.ExtractionErrorCode);
+        Assert.Contains(
+            attachment.Children,
+            child => child.ExtractionErrorCode == "archive_safety_limit");
+    }
+
+    private static byte[] CreateZip(IEnumerable<KeyValuePair<string, string>> entries)
     {
         using var stream = new MemoryStream();
         using (var archive = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: true))
@@ -99,6 +172,22 @@ public sealed class AttachmentProcessorTests
                 var zipEntry = archive.CreateEntry(entry.Key);
                 using var writer = new StreamWriter(zipEntry.Open(), Encoding.UTF8);
                 writer.Write(entry.Value);
+            }
+        }
+
+        return stream.ToArray();
+    }
+
+    private static byte[] CreateBinaryZip(IEnumerable<KeyValuePair<string, byte[]>> entries)
+    {
+        using var stream = new MemoryStream();
+        using (var archive = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            foreach (var entry in entries)
+            {
+                var zipEntry = archive.CreateEntry(entry.Key);
+                using var entryStream = zipEntry.Open();
+                entryStream.Write(entry.Value);
             }
         }
 

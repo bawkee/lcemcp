@@ -13,7 +13,9 @@ internal sealed record DatabaseStatus(
     int AttachmentTextCount,
     int AttachmentSearchDocCount,
     SyncStateStatus LastSyncState,
-    DatabaseInitializationKind InitializationKind);
+    DatabaseInitializationKind InitializationKind,
+    int OpenAttachmentExtractionFailureCount = 0,
+    IReadOnlyDictionary<string, int> OpenAttachmentExtractionFailuresByCode = null);
 
 internal enum DatabaseInitializationKind
 {

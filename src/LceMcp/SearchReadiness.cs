@@ -33,7 +33,10 @@ internal sealed record MessageSearchReadiness(
     int PendingAttachmentMessages,
     SyncRunSnapshot ActiveSyncRun,
     string CoverageNote = null,
-    SearchFreshness Freshness = null);
+    SearchFreshness Freshness = null,
+    int AttachmentTexts = 0,
+    int OpenAttachmentExtractionFailures = 0,
+    IReadOnlyDictionary<string, int> AttachmentExtractionFailuresByCode = null);
 
 internal sealed record SearchFreshness(
     string ResponseGeneratedAt,
