@@ -35,7 +35,7 @@ internal static class CliApp
             "sync" => await SyncAsync(configStore, credentialStore, database, options, cancellationToken),
             "sync-bodies" => await SyncBodiesAsync(configStore, credentialStore, database, options, cancellationToken),
             "attachment-failures" => ListAttachmentFailures(database, options),
-            "retry-attachments" => RetryAttachments(database, options, cancellationToken),
+            "retry-attachments" => RetryAttachments(configStore, database, options, cancellationToken),
             "search" => Search(database, options),
             "serve" => await McpStdioServer.RunAsync(configStore, database, cancellationToken),
             "mcp-config" => PrintMcpConfig(options),
@@ -122,10 +122,18 @@ internal static class CliApp
         Console.WriteLine($"Config: {configStore.ConfigPath} ({(configExists ? "present" : "missing")})");
         Console.WriteLine($"Database: {database.DatabasePath} ({FormatInitializationKind(databaseStatus.InitializationKind)})");
         Console.WriteLine($"Configured accounts: {config.Accounts.Count}");
+        var cachedOcrModels = new TesseractLanguagePackStore(
+            database.Paths,
+            config.Ocr.AutoDownloadLanguagePacks).ListCachedModels();
+        Console.WriteLine($"PDF OCR: {(config.Ocr.Enabled ? "enabled" : "disabled")}");
+        Console.WriteLine($"OCR language mode: {(config.Ocr.Languages.Count == 0 ? $"auto script (fallback {config.Ocr.FallbackScript})" : string.Join("+", config.Ocr.Languages))}");
+        Console.WriteLine($"OCR model downloads: {(config.Ocr.AutoDownloadLanguagePacks ? "enabled" : "disabled")}");
+        Console.WriteLine($"Cached OCR models: {(cachedOcrModels.Count == 0 ? "none" : string.Join(", ", cachedOcrModels))}");
 
         var configErrors = config.Accounts
             .SelectMany(account => AccountConfigValidator.ValidateForImap(account)
                 .Select(error => $"{AccountLabel(account)}: {error}"))
+            .Concat(OcrConfigValidator.Validate(config.Ocr))
             .ToList();
 
         if (configErrors.Count == 0)
@@ -556,6 +564,7 @@ internal static class CliApp
         var maxPerFolder = options.GetInt("--max-per-folder", 50);
         var batchSize = options.GetInt("--batch-size", 10);
         var retryFailedDownloads = options.Has("--retry-failed-downloads");
+        OcrConfigValidator.ThrowIfInvalid(config.Ocr);
 
         if (maxPerFolder < 0)
             throw new CliException("--max-per-folder must be 0 or greater. Use 0 for no per-folder cap.", 2);
@@ -575,6 +584,12 @@ internal static class CliApp
                 throw new CliException($"Credential not found: {account.CredentialRef}", 3);
 
             var databaseAccountId = database.UpsertConfiguredAccount(account);
+            if (config.Ocr.Enabled)
+            {
+                var queuedOcrCandidates = database.QueuePdfOcrUpgradeCandidates(account.Id);
+                if (queuedOcrCandidates > 0)
+                    Console.WriteLine($"Queued PDF attachments for OCR-capable re-extraction: {queuedOcrCandidates}");
+            }
 
             Console.WriteLine($"Syncing bodies for '{account.Id}', max_per_folder={FormatMaxPerFolder(maxPerFolder)}, batch_size={batchSize}...");
             var pendingTargetCount = database.ReadPendingBodySyncTargets(account.Id, folderFilter, maxPerFolder).Count;
@@ -601,7 +616,9 @@ internal static class CliApp
 
                 var result = await RunWithSyncLeaseHeartbeatAsync(database, syncRun, cancellationToken, async () =>
                 {
-                    automaticRetries = new AttachmentExtractionRunner(database).ProcessDue(
+                    automaticRetries = new AttachmentExtractionRunner(
+                        database,
+                        ocrConfig: config.Ocr).ProcessDue(
                         account.Id,
                         limit: 50,
                         cancellationToken);
@@ -611,7 +628,7 @@ internal static class CliApp
                         automaticRetries.SelectedCount,
                         totalTargetCount);
 
-                    var syncResult = await new ImapBodySync(database).SyncAccountAsync(
+                    var syncResult = await new ImapBodySync(database, config.Ocr).SyncAccountAsync(
                         account,
                         password,
                         folderFilter,
@@ -790,6 +807,7 @@ internal static class CliApp
     }
 
     private static int RetryAttachments(
+        ConfigStore configStore,
         EmailDatabase database,
         CommandOptions options,
         CancellationToken cancellationToken)
@@ -799,7 +817,9 @@ internal static class CliApp
             && (request.AccountFilters.Count == 0 || request.ErrorCodes.Count == 0))
             throw new CliException("retry-attachments requires --attachment-id, or both --account and --error-code.", 2);
 
-        var result = new AttachmentExtractionRunner(database).RetryExplicit(
+        var result = new AttachmentExtractionRunner(
+            database,
+            ocrConfig: configStore.Load().Ocr).RetryExplicit(
             request,
             clientName: "cli",
             cancellationToken);

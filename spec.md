@@ -221,13 +221,21 @@ Preferred extraction path:
 ```text
 PDF text: PdfPig first
 PDF fallback: optional external pdftotext/poppler
-OCR: optional external Tesseract worker
+OCR: bundled Tesseract worker and PDFium rasterizer, opt-in
 Images: ImageSharp or platform image APIs if needed
 DOCX: Open XML SDK or DocumentFormat.OpenXml
 CSV/TXT/HTML: built-in/simple parsers
 ```
 
 Keep OCR optional. Tesseract and language packs are useful, but they are not lightweight.
+Do not bundle every language model. Cache models under the app data directory
+and fetch them lazily from a pinned commit of Tesseract's official
+`tessdata_fast` repository. Prefer configured language codes when the corpus is
+known. Otherwise use Tesseract OSD to detect the script and download one broad
+script model; exact language detection cannot reliably precede OCR because an
+image-only page has no text to classify. Treat disabled automatic language-pack
+downloads as an explicit offline/preseeded-model policy, not as the normal user
+path.
 
 ---
 
@@ -493,6 +501,10 @@ Default Windows data directory:
   logs\
     audit.log
     sync.log
+  ocr\
+    tessdata\
+      eng.traineddata
+      osd.traineddata
 ```
 
 Default Unix-like data directory:
@@ -1617,6 +1629,27 @@ PdfPig first
 optional external pdftotext/poppler fallback
 optional Tesseract OCR
 ```
+
+Implemented scanned-PDF OCR behavior:
+
+```text
+OCR is disabled by default
+configured language codes bypass script detection and download only those models
+empty languages use osd.traineddata followed by one detected/fallback script model
+official tessdata_fast content is pinned to an immutable repository commit
+MCP exposes email_list_ocr_languages and email_set_ocr_config for safe config changes
+OCR config changes require no restart and apply to the next sync/retry/extraction
+rendering uses PDFium at 200 DPI
+at most 20 candidate pages, 6000 pixels per dimension, and 20 million pixels per page
+rendered page encodings are capped at 25 MiB
+OCR-enabled terminal extraction has a two-minute caller timeout
+```
+
+`ocr_disabled`, missing-model, renderer/worker unavailable, timeout, corrupt or
+encrypted PDF, and OCR safety-limit results use the normal attachment
+attempt/failure lifecycle. Enabling OCR queues successfully processed PDFs from
+older extractor versions and prior `ocr_disabled` failures for one
+`extractor_upgrade` pass.
 
 ### 15.3 Image OCR
 

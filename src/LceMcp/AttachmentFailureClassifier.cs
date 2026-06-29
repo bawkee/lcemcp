@@ -6,6 +6,9 @@ internal static class AttachmentFailureClassifier
 {
     public static AttachmentFailureClassification Classify(Exception exception)
     {
+        if (exception is AttachmentExtractionException attachmentException)
+            return new(attachmentException.ErrorCode, attachmentException.SafeSummary);
+
         if (exception.GetType().Name.Contains("Encrypted", StringComparison.OrdinalIgnoreCase)
             || exception is System.Security.Cryptography.CryptographicException)
             return new("encrypted_document", "The attachment is encrypted and cannot be extracted.");
@@ -19,6 +22,9 @@ internal static class AttachmentFailureClassifier
         {
             AttachmentSizeLimitException => new("attachment_too_large", "The attachment exceeded the configured download limit."),
             TimeoutException => new("extractor_timeout", "Attachment extraction timed out."),
+            DllNotFoundException => new("extractor_unavailable", "The local attachment extractor is unavailable."),
+            BadImageFormatException => new("extractor_unavailable", "The local attachment extractor is unavailable."),
+            HttpRequestException => new("temporary_io_failure", "A temporary network error interrupted attachment processing."),
             IOException => new("temporary_io_failure", "A temporary I/O error interrupted attachment processing."),
             UnauthorizedAccessException => new("temporary_io_failure", "Attachment storage was temporarily unavailable."),
             InvalidDataException => new("invalid_document", "The attachment is invalid or corrupt."),

@@ -2,6 +2,7 @@ using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
 using DocumentFormat.OpenXml.Wordprocessing;
+using SkiaSharp;
 using System.IO.Compression;
 using System.Text;
 
@@ -10,6 +11,129 @@ namespace LceMcp.Tests;
 [Collection("Process-wide attachment extraction gate")]
 public sealed class AttachmentProcessorTests
 {
+    [Fact]
+    public void ImageOnlyPdfFeedsOcrTextIntoNormalAttachmentResult()
+    {
+        using var temp = TempWorkspace.Create();
+        var ocr = new StubPdfOcrExtractor(
+            new("Scanned invoice total 123.45", "Latin", "test-ocr"));
+        var processor = new AttachmentProcessor(
+            new AttachmentObjectStore(temp.Paths),
+            ocrConfig: new() { Enabled = true },
+            pdfOcrExtractor: ocr);
+        var pdf = CreateImageOnlyPdf("SCANNED INVOICE TOTAL 123.45");
+
+        var attachment = processor.ProcessEmailAttachment(
+            "2",
+            "scan.pdf",
+            "application/pdf",
+            pdf.Length,
+            pdf,
+            "scan.pdf");
+
+        Assert.Equal("done", attachment.ExtractionStatus);
+        Assert.Null(attachment.ExtractedText);
+        Assert.Contains("invoice total", attachment.OcrText, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([0], ocr.LastPageIndexes);
+        Assert.Contains("Tesseract", attachment.Extractor);
+        Assert.Contains("test-ocr", attachment.Extractor);
+        Assert.Equal(AttachmentProcessor.ProcessorVersion, attachment.ExtractorVersion);
+    }
+
+    [Fact]
+    public void PdfOcrCandidateIsExplicitFailureWhenOcrIsDisabled()
+    {
+        using var temp = TempWorkspace.Create();
+        var processor = new AttachmentProcessor(new AttachmentObjectStore(temp.Paths));
+        var pdf = CreateImageOnlyPdf("OCR IS DISABLED");
+
+        var attachment = processor.ProcessEmailAttachment(
+            "2",
+            "scan.pdf",
+            "application/pdf",
+            pdf.Length,
+            pdf,
+            "scan.pdf");
+
+        Assert.Equal("failed", attachment.ExtractionStatus);
+        Assert.Equal("ocr_disabled", attachment.ExtractionErrorCode);
+        Assert.Null(attachment.OcrText);
+        Assert.Equal("PdfPig", attachment.Extractor);
+    }
+
+    [Fact]
+    public void PdfOcrWorkerTimeoutUsesExistingFailureClassification()
+    {
+        using var temp = TempWorkspace.Create();
+        var processor = new AttachmentProcessor(
+            new AttachmentObjectStore(temp.Paths),
+            ocrConfig: new() { Enabled = true },
+            pdfOcrExtractor: new ThrowingPdfOcrExtractor(new TimeoutException("test timeout")));
+        var pdf = CreateImageOnlyPdf("OCR TIMEOUT");
+
+        var attachment = processor.ProcessEmailAttachment(
+            "2",
+            "scan.pdf",
+            "application/pdf",
+            pdf.Length,
+            pdf,
+            "scan.pdf");
+
+        Assert.Equal("failed", attachment.ExtractionStatus);
+        Assert.Equal("extractor_timeout", attachment.ExtractionErrorCode);
+        Assert.NotNull(attachment.ExceptionDetails);
+    }
+
+    [Fact]
+    public void PdfOcrRejectsMoreThanBoundedCandidatePageCount()
+    {
+        using var temp = TempWorkspace.Create();
+        var config = new OcrConfig { Enabled = true };
+        config.Languages.Add("eng");
+        var processor = new AttachmentProcessor(
+            new AttachmentObjectStore(temp.Paths),
+            ocrConfig: config);
+        var pdf = CreateImageOnlyPdf("TOO MANY OCR PAGES", PdfOcrExtractor.MaxOcrPages + 1);
+
+        var attachment = processor.ProcessEmailAttachment(
+            "2",
+            "large-scan.pdf",
+            "application/pdf",
+            pdf.Length,
+            pdf,
+            "large-scan.pdf");
+
+        Assert.Equal("failed", attachment.ExtractionStatus);
+        Assert.Equal("ocr_safety_limit", attachment.ExtractionErrorCode);
+        Assert.Empty(Directory.EnumerateFiles(temp.Paths.TessdataDirectory, "*.traineddata"));
+    }
+
+    [Fact]
+    public void MixedPdfOnlySendsPagesWithoutUsefulEmbeddedTextToOcr()
+    {
+        using var temp = TempWorkspace.Create();
+        var ocr = new StubPdfOcrExtractor(
+            new("OCR text from the scanned second page", "Latin", "test-ocr"));
+        var processor = new AttachmentProcessor(
+            new AttachmentObjectStore(temp.Paths),
+            ocrConfig: new() { Enabled = true },
+            pdfOcrExtractor: ocr);
+        var pdf = CreateMixedPdf();
+
+        var attachment = processor.ProcessEmailAttachment(
+            "2",
+            "mixed.pdf",
+            "application/pdf",
+            pdf.Length,
+            pdf,
+            "mixed.pdf");
+
+        Assert.Equal("done", attachment.ExtractionStatus);
+        Assert.Contains("selectable", attachment.ExtractedText, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("scanned second", attachment.OcrText, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([1], ocr.LastPageIndexes);
+    }
+
     [Fact]
     public void ZipExpansionRejectsTraversalAndExtractsSafeHtmlChild()
     {
@@ -231,5 +355,79 @@ public sealed class AttachmentProcessorTests
         }
 
         return stream.ToArray();
+    }
+
+    private static byte[] CreateImageOnlyPdf(string text, int pageCount = 1)
+    {
+        using var bitmap = new SKBitmap(1_200, 1_600);
+        using (var canvas = new SKCanvas(bitmap))
+        using (var font = new SKFont(SKTypeface.Default, 52))
+        using (var paint = new SKPaint { Color = SKColors.Black, IsAntialias = true })
+        {
+            canvas.Clear(SKColors.White);
+            canvas.DrawText(text, 80, 180, font, paint);
+            canvas.DrawText("This page contains raster pixels, not a PDF text layer.", 80, 280, font, paint);
+        }
+
+        using var stream = new MemoryStream();
+        using (var document = SKDocument.CreatePdf(stream))
+        {
+            for (var pageIndex = 0; pageIndex < pageCount; pageIndex++)
+            {
+                var page = document.BeginPage(600, 800);
+                page.DrawBitmap(bitmap, new SKRect(0, 0, 600, 800));
+                document.EndPage();
+            }
+            document.Close();
+        }
+
+        return stream.ToArray();
+    }
+
+    private static byte[] CreateMixedPdf()
+    {
+        using var stream = new MemoryStream();
+        using var document = SKDocument.CreatePdf(stream);
+        using var font = new SKFont(SKTypeface.Default, 28);
+        using var paint = new SKPaint { Color = SKColors.Black, IsAntialias = true };
+
+        var textPage = document.BeginPage(600, 800);
+        textPage.DrawText(
+            "This first page has useful selectable embedded text for PdfPig extraction.",
+            40,
+            100,
+            font,
+            paint);
+        document.EndPage();
+
+        using var bitmap = new SKBitmap(1_200, 1_600);
+        using (var bitmapCanvas = new SKCanvas(bitmap))
+        {
+            bitmapCanvas.Clear(SKColors.White);
+            bitmapCanvas.DrawText("SCANNED SECOND PAGE", 80, 180, font, paint);
+        }
+
+        var imagePage = document.BeginPage(600, 800);
+        imagePage.DrawBitmap(bitmap, new SKRect(0, 0, 600, 800));
+        document.EndPage();
+        document.Close();
+        return stream.ToArray();
+    }
+
+    private sealed class StubPdfOcrExtractor(PdfOcrResult result) : IPdfOcrExtractor
+    {
+        public IReadOnlyList<int> LastPageIndexes { get; private set; }
+
+        public PdfOcrResult Extract(byte[] pdf, IReadOnlyList<int> pageIndexes)
+        {
+            LastPageIndexes = pageIndexes.ToList();
+            return result;
+        }
+    }
+
+    private sealed class ThrowingPdfOcrExtractor(Exception exception) : IPdfOcrExtractor
+    {
+        public PdfOcrResult Extract(byte[] pdf, IReadOnlyList<int> pageIndexes) =>
+            throw exception;
     }
 }

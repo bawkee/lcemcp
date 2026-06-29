@@ -27,6 +27,15 @@ internal sealed class ConfigStore
             Version = GetInt(table, "version", 1)
         };
 
+        if (table.TryGetValue("ocr", out var ocrValue)
+            && ocrValue is TomlTable ocr)
+        {
+            config.Ocr.Enabled = GetBool(ocr, "enabled", false);
+            config.Ocr.AutoDownloadLanguagePacks = GetBool(ocr, "auto_download_language_packs", true);
+            config.Ocr.FallbackScript = GetString(ocr, "fallback_script", "Latin");
+            config.Ocr.Languages.AddRange(GetStringArray(ocr, "languages"));
+        }
+
         if (table.TryGetValue("account", out var accountsValue)
             && accountsValue is TomlTableArray accounts)
         {
@@ -60,6 +69,14 @@ internal sealed class ConfigStore
         var builder = new StringBuilder();
         builder.AppendLine("# lcemcp local config. Passwords are stored in the OS credential store.");
         builder.AppendLine($"version = {config.Version}");
+        builder.AppendLine();
+        builder.AppendLine("[ocr]");
+        builder.AppendLine($"enabled = {config.Ocr.Enabled.ToString().ToLowerInvariant()}");
+        builder.AppendLine($"auto_download_language_packs = {config.Ocr.AutoDownloadLanguagePacks.ToString().ToLowerInvariant()}");
+        AppendString(builder, "fallback_script", config.Ocr.FallbackScript);
+        builder.Append("languages = [")
+            .Append(string.Join(", ", config.Ocr.Languages.Select(TomlString)))
+            .AppendLine("]");
         builder.AppendLine();
 
         foreach (var account in config.Accounts.OrderBy(account => account.Id, StringComparer.OrdinalIgnoreCase))
@@ -110,6 +127,22 @@ internal sealed class ConfigStore
     {
         return table.TryGetValue(name, out var value) && value is bool boolValue ? boolValue : defaultValue;
     }
+
+    private static IReadOnlyList<string> GetStringArray(TomlTable table, string name)
+    {
+        if (!table.TryGetValue(name, out var value) || value is not TomlArray array)
+            return [];
+
+        return array
+            .OfType<string>()
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Select(item => item.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string TomlString(string value) =>
+        $"\"{EscapeTomlString(value ?? "")}\"";
 
     private static string EscapeTomlString(string value)
     {

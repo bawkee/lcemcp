@@ -37,6 +37,8 @@ public sealed class McpStdioServerTests
         Assert.Equal("2025-11-25", initialize["result"]["protocolVersion"].GetValue<string>());
         Assert.Contains("email_list_accounts", toolNames);
         Assert.Contains("email_get_setup_status", toolNames);
+        Assert.Contains("email_list_ocr_languages", toolNames);
+        Assert.Contains("email_set_ocr_config", toolNames);
         Assert.Contains("email_discover_folders", toolNames);
         Assert.Contains("email_estimate_sync", toolNames);
         Assert.Contains("email_list_folders", toolNames);
@@ -52,6 +54,126 @@ public sealed class McpStdioServerTests
         Assert.Contains("does not delete cached messages", setFolderSyncTool["description"].GetValue<string>());
         Assert.DoesNotContain("lcemcp MCP stdio server started", output.ToString());
         Assert.Contains("lcemcp MCP stdio server started", error.ToString());
+    }
+
+    [Fact]
+    public async Task EmailOcrConfigToolsListCatalogAndPersistLanguageUpdates()
+    {
+        using var temp = TempWorkspace.Create();
+        var configStore = new ConfigStore(temp.Paths);
+        configStore.Save(new AppConfig());
+        var database = new EmailDatabase(temp.Paths);
+        var output = new StringWriter();
+        var error = new StringWriter();
+        var input = new StringReader("""
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_list_ocr_languages","arguments":{}}}
+            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"email_set_ocr_config","arguments":{"enabled":true,"languages":["ENG","srp_latn"],"fallback_script":"Cyrillic"}}}
+            """);
+        var server = new McpStdioServer(configStore, database, input, output, error);
+
+        await server.RunAsync(CancellationToken.None);
+
+        var lines = OutputLines(output);
+        var catalog = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
+        var languageCodes = catalog["language_codes"].AsArray().Select(value => value.GetValue<string>()).ToArray();
+        var scriptModels = catalog["script_models"].AsArray().Select(value => value.GetValue<string>()).ToArray();
+        var update = JsonNode.Parse(lines[2]).AsObject()["result"]["structuredContent"].AsObject();
+        var current = update["current_config"].AsObject();
+        var saved = configStore.Load().Ocr;
+        var auditRows = ReadStrings(
+            temp.Paths.DatabasePath,
+            "SELECT tool_name || '|' || action_type || '|' || result_summary FROM audit_log ORDER BY id;");
+
+        Assert.Contains("eng", languageCodes);
+        Assert.Contains("srp_latn", languageCodes);
+        Assert.Contains("Latin", scriptModels);
+        Assert.Contains("Cyrillic", scriptModels);
+        Assert.Equal("updated", update["status"].GetValue<string>());
+        Assert.True(update["updated"].GetValue<bool>());
+        Assert.False(update["restart_required"].GetValue<bool>());
+        Assert.True(current["enabled"].GetValue<bool>());
+        Assert.Equal("configured_languages", current["mode"].GetValue<string>());
+        Assert.Equal(["eng", "srp_latn"], current["languages"].AsArray().Select(value => value.GetValue<string>()).ToArray());
+        Assert.True(current["auto_download_language_packs"].GetValue<bool>());
+        Assert.True(saved.Enabled);
+        Assert.True(saved.AutoDownloadLanguagePacks);
+        Assert.Equal("Cyrillic", saved.FallbackScript);
+        Assert.Equal(["eng", "srp_latn"], saved.Languages);
+        Assert.Contains(auditRows, row => row.StartsWith("email_list_ocr_languages|read|languages=", StringComparison.Ordinal));
+        Assert.Contains("email_set_ocr_config|config|status=updated enabled=true mode=configured_languages", auditRows);
+    }
+
+    [Fact]
+    public async Task EmailSetOcrConfigSupportsAutoScriptModeWithOfflineWarnings()
+    {
+        using var temp = TempWorkspace.Create();
+        var configStore = new ConfigStore(temp.Paths);
+        configStore.Save(new AppConfig());
+        var database = new EmailDatabase(temp.Paths);
+        var output = new StringWriter();
+        var error = new StringWriter();
+        var input = new StringReader("""
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_set_ocr_config","arguments":{"enabled":true,"languages":[],"fallback_script":"Cyrillic","auto_download_language_packs":false}}}
+            """);
+        var server = new McpStdioServer(configStore, database, input, output, error);
+
+        await server.RunAsync(CancellationToken.None);
+
+        var lines = OutputLines(output);
+        var structured = JsonNode.Parse(lines[1]).AsObject()["result"]["structuredContent"].AsObject();
+        var current = structured["current_config"].AsObject();
+        var expectedModels = current["expected_models"].AsArray().Select(value => value.GetValue<string>()).ToArray();
+        var missingModels = current["missing_cached_models"].AsArray().Select(value => value.GetValue<string>()).ToArray();
+        var warnings = structured["warnings"].AsArray().Select(value => value.GetValue<string>()).ToArray();
+        var saved = configStore.Load().Ocr;
+
+        Assert.Equal("auto_script", current["mode"].GetValue<string>());
+        Assert.False(current["auto_download_language_packs"].GetValue<bool>());
+        Assert.False(current["offline_cache_ready"].GetValue<bool>());
+        Assert.Equal(["osd", "Cyrillic"], expectedModels);
+        Assert.Equal(["osd", "Cyrillic"], missingModels);
+        Assert.Contains(warnings, warning => warning.Contains("Automatic OCR model downloads are disabled", StringComparison.Ordinal));
+        Assert.True(saved.Enabled);
+        Assert.False(saved.AutoDownloadLanguagePacks);
+        Assert.Empty(saved.Languages);
+    }
+
+    [Fact]
+    public async Task EmailSetOcrConfigRejectsUnknownLanguageWithoutSaving()
+    {
+        using var temp = TempWorkspace.Create();
+        var configStore = new ConfigStore(temp.Paths);
+        configStore.Save(new AppConfig());
+        var database = new EmailDatabase(temp.Paths);
+        var output = new StringWriter();
+        var error = new StringWriter();
+        var input = new StringReader("""
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_set_ocr_config","arguments":{"enabled":true,"languages":["not_a_real_tesseract_code"]}}}
+            """);
+        var server = new McpStdioServer(configStore, database, input, output, error);
+
+        await server.RunAsync(CancellationToken.None);
+
+        var lines = OutputLines(output);
+        var result = JsonNode.Parse(lines[1]).AsObject()["result"].AsObject();
+        var structured = result["structuredContent"].AsObject();
+        var saved = configStore.Load().Ocr;
+        var auditRows = ReadStrings(
+            temp.Paths.DatabasePath,
+            "SELECT tool_name || '|' || action_type || '|' || result_summary FROM audit_log ORDER BY id;");
+
+        Assert.True(result["isError"].GetValue<bool>());
+        Assert.Equal("failed", structured["status"].GetValue<string>());
+        Assert.Equal("unsupported_ocr_language", structured["error_code"].GetValue<string>());
+        Assert.False(saved.Enabled);
+        Assert.Empty(saved.Languages);
+        Assert.Contains("email_set_ocr_config|config|status=failed error_code=unsupported_ocr_language", auditRows);
     }
 
     [Fact]

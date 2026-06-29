@@ -3,6 +3,7 @@ namespace LceMcp;
 internal sealed class AppConfig
 {
     public int Version { get; set; } = 1;
+    public OcrConfig Ocr { get; set; } = new();
     public List<AccountConfig> Accounts { get; } = [];
 
     public AccountConfig FindAccount(string idOrEmail)

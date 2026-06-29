@@ -10,10 +10,12 @@ internal sealed class ImapBodySync
     private readonly EmailDatabase _database;
     private readonly AttachmentProcessor _attachmentProcessor;
 
-    public ImapBodySync(EmailDatabase database)
+    public ImapBodySync(EmailDatabase database, OcrConfig ocrConfig = null)
     {
         _database = database;
-        _attachmentProcessor = new(new AttachmentObjectStore(database.Paths));
+        _attachmentProcessor = new(
+            new AttachmentObjectStore(database.Paths),
+            ocrConfig: ocrConfig);
     }
 
     public async Task<BodyAccountSyncResult> SyncAccountAsync(

@@ -10,11 +10,12 @@ internal sealed class AttachmentExtractionRunner
 
     public AttachmentExtractionRunner(
         EmailDatabase database,
-        Func<AttachmentExtractionInput, AttachmentExtractionOutput> terminalExtractor = null)
+        Func<AttachmentExtractionInput, AttachmentExtractionOutput> terminalExtractor = null,
+        OcrConfig ocrConfig = null)
     {
         _database = database;
         _objectStore = new(database.Paths);
-        _processor = new(_objectStore, terminalExtractor);
+        _processor = new(_objectStore, terminalExtractor, ocrConfig: ocrConfig);
     }
 
     public AttachmentRetryResult RetryExplicit(
@@ -58,7 +59,11 @@ internal sealed class AttachmentExtractionRunner
         foreach (var attachmentId in attachmentIds)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var claim = _database.ClaimAttachmentExtraction(attachmentId, triggerKind, clientName, now);
+            var itemTriggerKind = triggerKind == "automatic_retry"
+                && _database.IsPdfOcrUpgradeCandidate(attachmentId)
+                ? "extractor_upgrade"
+                : triggerKind;
+            var claim = _database.ClaimAttachmentExtraction(attachmentId, itemTriggerKind, clientName, now);
             if (claim is null)
             {
                 results.Add(new(attachmentId, "skipped", null, "Attachment is not claimable."));

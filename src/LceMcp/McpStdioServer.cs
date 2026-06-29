@@ -197,6 +197,26 @@ internal sealed class McpStdioServer
                     readOnly: true,
                     idempotent: true),
                 ToolDefinition(
+                    "email_list_ocr_languages",
+                    "OCR Languages",
+                    "List supported Tesseract OCR language codes and script models from lcemcp's pinned official tessdata_fast revision, plus the current local OCR config. Use this before changing OCR languages.",
+                    ObjectSchema(new()),
+                    readOnly: true,
+                    idempotent: true),
+                ToolDefinition(
+                    "email_set_ocr_config",
+                    "Email OCR Config",
+                    "Persistently update local scanned-PDF OCR configuration. This only edits lcemcp config.toml; it does not contact mail providers, does not start OCR, and does not delete cached text. Omit fields to leave them unchanged. Set languages to [] for automatic script detection. Automatic language-pack downloads should normally stay enabled unless the user wants offline/preseeded models.",
+                    ObjectSchema(new()
+                    {
+                        ["enabled"] = NullableBoolSchema("Optional. Enable or disable scanned-PDF OCR."),
+                        ["languages"] = StringArraySchema("Optional Tesseract language codes from email_list_ocr_languages. Use [] to switch to automatic script detection. Omit or null to leave unchanged."),
+                        ["fallback_script"] = NullableStringSchema("Optional script model to use when automatic script detection cannot decide, such as Latin or Cyrillic."),
+                        ["auto_download_language_packs"] = NullableBoolSchema("Optional offline policy. Normally true: lazily fetch missing models from lcemcp's pinned official tessdata_fast revision. false requires models to be preseeded in the local OCR cache.")
+                    }),
+                    readOnly: false,
+                    idempotent: true),
+                ToolDefinition(
                     "email_discover_folders",
                     "Email Discover Folders",
                     "Connect to configured mail providers, discover folders, and persist local folder metadata without syncing messages.",
@@ -408,6 +428,8 @@ internal sealed class McpStdioServer
         {
             "email_list_accounts" => ExecuteListAccounts(arguments),
             "email_get_setup_status" => ExecuteGetSetupStatus(arguments),
+            "email_list_ocr_languages" => ExecuteListOcrLanguages(arguments),
+            "email_set_ocr_config" => ExecuteSetOcrConfig(arguments),
             "email_discover_folders" => ExecuteDiscoverFolders(arguments, cancellationToken),
             "email_estimate_sync" => ExecuteEstimateSync(arguments),
             "email_list_folders" => ExecuteListFolders(arguments),
@@ -484,13 +506,160 @@ internal sealed class McpStdioServer
             : values.OfType<JsonObject>().All(value => value["setup_status"]?.GetValue<string>() == "setup_complete")
                 ? "setup_complete"
                 : "needs_attention";
+        if (topStatus == "setup_complete" && OcrConfigValidator.Validate(config.Ocr).Count > 0)
+            topStatus = "needs_attention";
         var payload = new JsonObject
         {
             ["status"] = topStatus,
-            ["accounts"] = values
+            ["accounts"] = values,
+            ["ocr"] = BuildOcrStatusJson(config.Ocr)
         };
 
         return new(payload, "read", $"accounts={FormatAccountFilters(accountFilters)}", $"status={topStatus} accounts={values.Count}");
+    }
+
+    private ToolExecution ExecuteListOcrLanguages(JsonElement arguments)
+    {
+        EnsureArgumentObject(arguments, "email_list_ocr_languages");
+        ValidateAllowedArguments(arguments, "_meta");
+
+        var config = _configStore.Load();
+        var languages = TesseractLanguagePackStore.ListSupportedLanguages();
+        var scripts = OcrScriptModels.ListSupported();
+        var payload = new JsonObject
+        {
+            ["current_config"] = BuildOcrStatusJson(config.Ocr),
+            ["language_codes"] = ToJsonArray(languages),
+            ["script_models"] = ToJsonArray(scripts),
+            ["limits"] = new JsonObject
+            {
+                ["max_configured_languages"] = 4,
+                ["empty_languages_mode"] = "auto_script_detection"
+            },
+            ["examples"] = new JsonObject
+            {
+                ["english"] = "eng",
+                ["serbian_cyrillic"] = "srp",
+                ["serbian_latin"] = "srp_latn",
+                ["auto_script_detection"] = new JsonArray()
+            },
+            ["source"] = new JsonObject
+            {
+                ["repository"] = TesseractLanguagePackStore.RepositoryUrl,
+                ["commit"] = TesseractLanguagePackStore.TessdataCommit,
+                ["download_policy"] = "fixed_app_owned_urls_only"
+            },
+            ["guidance"] = "Prefer configured language codes when the likely corpus is known. Use an empty language list only when the language is unknown; that mode downloads osd plus one broad script model. Leave auto_download_language_packs enabled unless the user explicitly wants offline/preseeded OCR models."
+        };
+
+        return new(payload, "read", "catalog=ocr_languages", $"languages={languages.Count} scripts={scripts.Count}");
+    }
+
+    private ToolExecution ExecuteSetOcrConfig(JsonElement arguments)
+    {
+        EnsureArgumentObject(arguments, "email_set_ocr_config");
+        ValidateAllowedArguments(
+            arguments,
+            "enabled",
+            "languages",
+            "fallback_script",
+            "auto_download_language_packs",
+            "_meta");
+
+        var enabled = ReadOptionalNullableBool(arguments, "enabled");
+        var autoDownload = ReadOptionalNullableBool(arguments, "auto_download_language_packs");
+        var fallbackScript = ReadOptionalString(arguments, "fallback_script");
+        var languages = ReadOptionalStringArrayIfPresent(arguments, "languages");
+        var argumentsSummary =
+            $"enabled={FormatOptionalBool(enabled)}, languages={FormatOptionalList(languages)}, fallback_script={FormatOptionalConfigValue(fallbackScript)}, auto_download_language_packs={FormatOptionalBool(autoDownload)}";
+
+        var config = _configStore.Load();
+        var before = SnapshotOcrConfig(config.Ocr);
+        var candidate = CloneOcrConfig(config.Ocr);
+
+        if (enabled.HasValue)
+            candidate.Enabled = enabled.Value;
+
+        if (autoDownload.HasValue)
+            candidate.AutoDownloadLanguagePacks = autoDownload.Value;
+
+        if (fallbackScript is not null)
+        {
+            try
+            {
+                candidate.FallbackScript = OcrScriptModels.Normalize(fallbackScript);
+            }
+            catch (AttachmentExtractionException ex)
+            {
+                return OcrConfigRejected(
+                    argumentsSummary,
+                    "unsupported_ocr_script",
+                    ex.Message,
+                    config.Ocr);
+            }
+        }
+
+        if (languages is not null)
+        {
+            var normalizedLanguages = new List<string>();
+            foreach (var language in languages)
+            {
+                try
+                {
+                    var normalized = TesseractLanguagePackStore.NormalizeLanguageCode(language);
+                    if (!normalizedLanguages.Contains(normalized, StringComparer.OrdinalIgnoreCase))
+                        normalizedLanguages.Add(normalized);
+                }
+                catch (AttachmentExtractionException ex)
+                {
+                    return OcrConfigRejected(
+                        argumentsSummary,
+                        "unsupported_ocr_language",
+                        ex.Message,
+                        config.Ocr);
+                }
+            }
+
+            candidate.Languages.Clear();
+            candidate.Languages.AddRange(normalizedLanguages);
+        }
+
+        var validationErrors = OcrConfigValidator.Validate(candidate);
+        if (validationErrors.Count > 0)
+        {
+            return OcrConfigRejected(
+                argumentsSummary,
+                "invalid_ocr_config",
+                string.Join("; ", validationErrors),
+                config.Ocr);
+        }
+
+        var changed = !OcrConfigEquals(before, SnapshotOcrConfig(candidate));
+        if (changed)
+        {
+            config.Ocr = candidate;
+            _configStore.Save(config);
+        }
+
+        var warnings = BuildOcrConfigWarnings(candidate);
+        var payload = new JsonObject
+        {
+            ["status"] = changed ? "updated" : "unchanged",
+            ["updated"] = changed,
+            ["restart_required"] = false,
+            ["takes_effect"] = "next_sync_retry_or_extraction",
+            ["current_config"] = BuildOcrStatusJson(candidate),
+            ["warnings"] = ToJsonArray(warnings),
+            ["message"] = changed
+                ? "OCR config was updated. Already-running sync or extraction work keeps its starting config snapshot; the new settings apply to the next email_sync_now, retry, or extraction run."
+                : "OCR config already matched the requested settings."
+        };
+
+        return new(
+            payload,
+            "config",
+            argumentsSummary,
+            $"status={(changed ? "updated" : "unchanged")} enabled={candidate.Enabled.ToString().ToLowerInvariant()} mode={(candidate.Languages.Count == 0 ? "auto_script" : "configured_languages")}");
     }
 
     private ToolExecution ExecuteDiscoverFolders(JsonElement arguments, CancellationToken cancellationToken)
@@ -1198,7 +1367,9 @@ internal sealed class McpStdioServer
             && (request.AccountFilters.Count == 0 || request.ErrorCodes.Count == 0))
             throw new JsonRpcError(-32602, "email_retry_attachment_extraction requires attachment_ids, or both accounts and error_codes.");
 
-        var result = new AttachmentExtractionRunner(_database).RetryExplicit(
+        var result = new AttachmentExtractionRunner(
+            _database,
+            ocrConfig: _configStore.Load().Ocr).RetryExplicit(
             request,
             _clientName,
             cancellationToken);
@@ -1256,8 +1427,12 @@ internal sealed class McpStdioServer
             RetryFailedDownloads: ReadOptionalBool(arguments, "retry_failed_downloads", defaultValue: false),
             WaitForCompletion: ReadOptionalBool(arguments, "wait_for_completion", defaultValue: false));
         var config = _configStore.Load();
-        var accounts = SelectAccounts(config, request.Accounts, enabledOnly: true);
         var argumentsSummary = $"accounts={FormatAccountFilters(request.Accounts)}, folder={FormatOptional(request.Folder)}, full={request.Full.ToString().ToLowerInvariant()}, max_per_folder={request.MaxPerFolder}, retry_failed_downloads={request.RetryFailedDownloads.ToString().ToLowerInvariant()}";
+        var ocrErrors = OcrConfigValidator.Validate(config.Ocr);
+        if (ocrErrors.Count > 0)
+            return SyncRejected(argumentsSummary, $"OCR config is invalid: {string.Join("; ", ocrErrors)}");
+
+        var accounts = SelectAccounts(config, request.Accounts, enabledOnly: true);
 
         if (accounts.Count == 0)
         {
@@ -1593,6 +1768,13 @@ internal sealed class McpStdioServer
         SyncRunStartResult syncRun,
         CancellationToken cancellationToken)
     {
+        var ocrConfig = _configStore.Load().Ocr;
+        if (ocrConfig.Enabled)
+        {
+            foreach (var work in works)
+                _database.QueuePdfOcrUpgradeCandidates(work.Account.Id);
+        }
+
         if (request.RetryFailedDownloads)
         {
             foreach (var work in works)
@@ -1615,7 +1797,9 @@ internal sealed class McpStdioServer
 
         foreach (var work in works)
         {
-            var retries = new AttachmentExtractionRunner(_database).ProcessDue(
+            var retries = new AttachmentExtractionRunner(
+                _database,
+                ocrConfig: ocrConfig).ProcessDue(
                 work.Account.Id,
                 limit: 50,
                 cancellationToken);
@@ -1625,7 +1809,7 @@ internal sealed class McpStdioServer
                 .Where(item => item.Status == "failed")
                 .Select(item => $"{work.Account.Id}/attachment {item.AttachmentId}: {item.ErrorCode}"));
 
-            var result = await new ImapBodySync(_database).SyncAccountAsync(
+            var result = await new ImapBodySync(_database, ocrConfig).SyncAccountAsync(
                 work.Account,
                 work.Password,
                 request.Folder,
@@ -1772,6 +1956,133 @@ internal sealed class McpStdioServer
             ["default_history_source"] = "config.toml"
         };
     }
+
+    private JsonObject BuildOcrStatusJson(OcrConfig config)
+    {
+        var cachedModels = new TesseractLanguagePackStore(
+            _database.Paths,
+            config.AutoDownloadLanguagePacks).ListCachedModels();
+        var expectedModels = ExpectedOcrModels(config);
+        var cachedModelSet = cachedModels.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var missingCachedModels = expectedModels
+            .Where(model => !cachedModelSet.Contains(model))
+            .ToList();
+        var errors = OcrConfigValidator.Validate(config);
+        return new()
+        {
+            ["enabled"] = config.Enabled,
+            ["config_valid"] = errors.Count == 0,
+            ["config_errors"] = ToJsonArray(errors),
+            ["auto_download_language_packs"] = config.AutoDownloadLanguagePacks,
+            ["mode"] = config.Languages.Count == 0 ? "auto_script" : "configured_languages",
+            ["languages"] = ToJsonArray(config.Languages),
+            ["fallback_script"] = config.FallbackScript,
+            ["expected_models"] = ToJsonArray(expectedModels),
+            ["cached_models"] = ToJsonArray(cachedModels),
+            ["missing_cached_models"] = ToJsonArray(missingCachedModels),
+            ["offline_cache_ready"] = !config.Enabled
+                || config.AutoDownloadLanguagePacks
+                || missingCachedModels.Count == 0
+        };
+    }
+
+    private ToolExecution OcrConfigRejected(
+        string argumentsSummary,
+        string errorCode,
+        string message,
+        OcrConfig config)
+    {
+        var payload = new JsonObject
+        {
+            ["status"] = "failed",
+            ["updated"] = false,
+            ["error_code"] = errorCode,
+            ["message"] = message,
+            ["current_config"] = BuildOcrStatusJson(config)
+        };
+
+        return new(payload, "config", argumentsSummary, $"status=failed error_code={errorCode}", IsError: true);
+    }
+
+    private IReadOnlyList<string> BuildOcrConfigWarnings(OcrConfig config)
+    {
+        if (!config.Enabled)
+            return [];
+
+        var warnings = new List<string>();
+        if (config.Languages.Count == 0)
+            warnings.Add("OCR is in automatic script-detection mode. This is useful when languages are unknown, but script models can be larger and less tailored than configured language models.");
+
+        if (!config.AutoDownloadLanguagePacks)
+        {
+            var cachedModels = new TesseractLanguagePackStore(
+                _database.Paths,
+                allowDownloads: false).ListCachedModels();
+            var cachedModelSet = cachedModels.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var missingCachedModels = ExpectedOcrModels(config)
+                .Where(model => !cachedModelSet.Contains(model))
+                .ToList();
+            if (missingCachedModels.Count > 0)
+            {
+                warnings.Add(
+                    "Automatic OCR model downloads are disabled, and these expected models are not cached: "
+                    + string.Join(", ", missingCachedModels)
+                    + ". Future OCR extraction will fail until the models are preseeded or downloads are re-enabled.");
+            }
+        }
+
+        return warnings;
+    }
+
+    private static IReadOnlyList<string> ExpectedOcrModels(OcrConfig config)
+    {
+        if (config is null || !config.Enabled)
+            return [];
+
+        var languages = config.Languages
+            .Where(language => !string.IsNullOrWhiteSpace(language))
+            .Select(language => TesseractLanguagePackStore.IsValidLanguageCode(language)
+                ? TesseractLanguagePackStore.NormalizeLanguageCode(language)
+                : language.Trim().ToLowerInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (languages.Count > 0)
+            return languages;
+
+        try
+        {
+            return ["osd", OcrScriptModels.Normalize(config.FallbackScript)];
+        }
+        catch (AttachmentExtractionException)
+        {
+            return ["osd", config.FallbackScript ?? ""];
+        }
+    }
+
+    private static OcrConfigSnapshot SnapshotOcrConfig(OcrConfig config) =>
+        new(
+            config.Enabled,
+            config.AutoDownloadLanguagePacks,
+            config.FallbackScript,
+            config.Languages.ToArray());
+
+    private static OcrConfig CloneOcrConfig(OcrConfig config)
+    {
+        var clone = new OcrConfig
+        {
+            Enabled = config.Enabled,
+            AutoDownloadLanguagePacks = config.AutoDownloadLanguagePacks,
+            FallbackScript = config.FallbackScript
+        };
+        clone.Languages.AddRange(config.Languages);
+        return clone;
+    }
+
+    private static bool OcrConfigEquals(OcrConfigSnapshot left, OcrConfigSnapshot right) =>
+        left.Enabled == right.Enabled
+        && left.AutoDownloadLanguagePacks == right.AutoDownloadLanguagePacks
+        && string.Equals(left.FallbackScript, right.FallbackScript, StringComparison.Ordinal)
+        && left.Languages.SequenceEqual(right.Languages, StringComparer.Ordinal);
 
     private JsonObject ToDiscoveryFolderJson(StoredFolder folder) =>
         new()
@@ -2236,6 +2547,30 @@ internal sealed class McpStdioServer
         return values;
     }
 
+    private static IReadOnlyList<string> ReadOptionalStringArrayIfPresent(JsonElement element, string name)
+    {
+        if (element.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
+            || !element.TryGetProperty(name, out var value)
+            || value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            return null;
+
+        if (value.ValueKind != JsonValueKind.Array)
+            throw new JsonRpcError(-32602, $"{name} must be an array of strings, null, or omitted.");
+
+        var values = new List<string>();
+        foreach (var item in value.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String)
+                throw new JsonRpcError(-32602, $"{name} must contain only strings.");
+
+            var text = item.GetString();
+            if (!string.IsNullOrWhiteSpace(text))
+                values.Add(text.Trim());
+        }
+
+        return values;
+    }
+
     private static string ReadOptionalString(JsonElement element, string name)
     {
         if (element.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
@@ -2602,6 +2937,17 @@ internal sealed class McpStdioServer
     private static string FormatOptional(string value) =>
         string.IsNullOrWhiteSpace(value) ? "all" : value;
 
+    private static string FormatOptionalConfigValue(string value) =>
+        string.IsNullOrWhiteSpace(value) ? "unchanged" : value;
+
+    private static string FormatOptionalBool(bool? value) =>
+        value.HasValue ? value.Value.ToString().ToLowerInvariant() : "unchanged";
+
+    private static string FormatOptionalList(IReadOnlyList<string> values) =>
+        values is null
+            ? "unchanged"
+            : values.Count == 0 ? "[]" : string.Join(",", values);
+
     private static bool IsActiveForAccount(SyncRunSnapshot run, AccountConfig account)
     {
         if (run is null)
@@ -2673,6 +3019,12 @@ internal sealed class McpStdioServer
         int MaxPerFolder,
         bool RetryFailedDownloads,
         bool WaitForCompletion);
+
+    private sealed record OcrConfigSnapshot(
+        bool Enabled,
+        bool AutoDownloadLanguagePacks,
+        string FallbackScript,
+        IReadOnlyList<string> Languages);
 
     private sealed record SyncAccountWork(
         AccountConfig Account,

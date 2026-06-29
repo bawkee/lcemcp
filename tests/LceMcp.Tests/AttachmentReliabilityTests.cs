@@ -10,6 +10,90 @@ namespace LceMcp.Tests;
 public sealed class AttachmentReliabilityTests
 {
     [Fact]
+    public void OcrUpgradeQueueReextractsOldPdfAndReplacesStaleFtsText()
+    {
+        using var temp = TempWorkspace.Create();
+        var (database, messageId) = CreateMessage(temp);
+        var stored = new AttachmentObjectStore(temp.Paths).Store([1, 2, 3, 4]);
+        var initial = new AttachmentContent(
+            "email_part",
+            "2",
+            "scan.pdf",
+            "scan.pdf",
+            null,
+            "application/pdf",
+            "application/pdf",
+            stored.SizeBytes,
+            null,
+            stored.SizeBytes,
+            stored.ContentHash,
+            stored.StorageKey,
+            false,
+            0,
+            "stored",
+            null,
+            "done",
+            null,
+            null,
+            "obsolete scanned phrase",
+            "PdfPig+Tesseract(Latin)",
+            [],
+            ExtractorVersion: "1");
+        database.UpsertMessageBody(Body(messageId, initial));
+
+        Assert.Equal(1, database.QueuePdfOcrUpgradeCandidates());
+        var attachmentId = Assert.Single(database.ReadDueAttachmentExtractionIds("yahoo", 10));
+        var result = new AttachmentExtractionRunner(
+            database,
+            _ => new("replacement OCR phrase", "test-upgrade"))
+            .ProcessDue("yahoo", 10);
+        var text = database.ReadAttachmentText(attachmentId);
+
+        Assert.Equal(1, result.SucceededCount);
+        Assert.Equal("replacement OCR phrase", text.ExtractedText);
+        Assert.DoesNotContain("obsolete", text.CombinedText);
+        Assert.Equal(0, ScalarInt(
+            temp.Paths.DatabasePath,
+            "SELECT COUNT(*) FROM attachments_fts WHERE attachments_fts MATCH 'obsolete';"));
+        Assert.Equal(1, ScalarInt(
+            temp.Paths.DatabasePath,
+            "SELECT COUNT(*) FROM attachments_fts WHERE attachments_fts MATCH 'replacement';"));
+        Assert.Equal("extractor_upgrade", ScalarString(
+            temp.Paths.DatabasePath,
+            $"SELECT trigger_kind FROM attachment_extraction_attempts WHERE attachment_id = {attachmentId} ORDER BY id DESC LIMIT 1;"));
+        Assert.Equal(0, database.QueuePdfOcrUpgradeCandidates());
+
+        Execute(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE attachments
+            SET
+                extraction_status = 'failed',
+                extraction_error_code = 'ocr_disabled',
+                extractor_version = '{AttachmentProcessor.ProcessorVersion}'
+            WHERE id = {attachmentId};
+            """);
+        Assert.Equal(1, database.QueuePdfOcrUpgradeCandidates());
+        Assert.True(database.IsPdfOcrUpgradeCandidate(attachmentId));
+
+        Execute(
+            temp.Paths.DatabasePath,
+            $"""
+            UPDATE attachments
+            SET
+                extraction_status = 'done',
+                extraction_error_code = NULL,
+                extraction_error = NULL,
+                extraction_next_attempt_at = NULL,
+                extractor = 'PdfPig+Tesseract(eng+srp+srp_latn; {PdfOcrExtractor.ExtractorVersion})',
+                extractor_version = '{AttachmentProcessor.ProcessorVersion}',
+                ocr_text_available = 1
+            WHERE id = {attachmentId};
+            """);
+        Assert.Equal(0, database.QueuePdfOcrUpgradeCandidates());
+    }
+
+    [Fact]
     public void UnsupportedTypeUsesTerminalFailureLifecycleAndDoesNotBlockReadiness()
     {
         using var temp = TempWorkspace.Create();

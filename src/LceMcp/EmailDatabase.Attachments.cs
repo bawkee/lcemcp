@@ -137,6 +137,80 @@ internal sealed partial class EmailDatabase
         return ids;
     }
 
+    public int QueuePdfOcrUpgradeCandidates(string accountFilter = null)
+    {
+        EnsureInitialized();
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE attachments
+            SET
+                extraction_status = 'pending',
+                extraction_next_attempt_at = NULL,
+                extraction_completed_at = NULL,
+                extraction_error_code = NULL,
+                extraction_error = NULL,
+                extractor_version = CASE
+                    WHEN extraction_error_code = 'ocr_disabled' THEN 'ocr-disabled'
+                    ELSE extractor_version
+                END,
+                updated_at = $updatedAt
+            WHERE storage_key IS NOT NULL
+              AND is_container = 0
+              AND (
+                  (
+                      extraction_status IN ('done', 'empty')
+                      AND COALESCE(extractor_version, '') <> $processorVersion
+                  )
+                  OR (
+                      extraction_status = 'failed'
+                      AND extraction_error_code = 'ocr_disabled'
+                  )
+              )
+              AND (
+                  sniffed_mime_type = 'application/pdf'
+                  OR lower(filename) LIKE '%.pdf'
+              )
+              AND (
+                  $accountFilter IS NULL
+                  OR message_id IN (
+                      SELECT m.id
+                      FROM messages m
+                      JOIN accounts acc ON acc.id = m.account_id
+                      WHERE acc.name = $accountFilter COLLATE NOCASE
+                         OR acc.email_address = $accountFilter COLLATE NOCASE
+                  )
+              );
+            """;
+        AddParameter(command, "$processorVersion", AttachmentProcessor.ProcessorVersion);
+        AddParameter(command, "$accountFilter", string.IsNullOrWhiteSpace(accountFilter) ? null : accountFilter.Trim());
+        AddParameter(command, "$updatedAt", DateTimeOffset.UtcNow.ToString("O"));
+        return command.ExecuteNonQuery();
+    }
+
+    public bool IsPdfOcrUpgradeCandidate(int attachmentId)
+    {
+        EnsureInitialized();
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM attachments
+                WHERE id = $attachmentId
+                  AND extraction_status IN ('pending', 'retry_wait')
+                  AND COALESCE(extractor_version, '') <> $processorVersion
+                  AND (
+                      sniffed_mime_type = 'application/pdf'
+                      OR lower(filename) LIKE '%.pdf'
+                  )
+            );
+            """;
+        AddParameter(command, "$attachmentId", attachmentId);
+        AddParameter(command, "$processorVersion", AttachmentProcessor.ProcessorVersion);
+        return Convert.ToInt32(command.ExecuteScalar()) == 1;
+    }
+
     public AttachmentExtractionClaim ClaimAttachmentExtraction(
         int attachmentId,
         string triggerKind,
@@ -152,7 +226,7 @@ internal sealed partial class EmailDatabase
         if (attachment is null || string.IsNullOrWhiteSpace(attachment.StorageKey))
             return null;
 
-        var explicitRetry = triggerKind is "explicit_retry" or "extractor_upgrade";
+        var explicitRetry = triggerKind == "explicit_retry";
         if (!CanClaimAttachment(connection, transaction, attachmentId, explicitRetry, claimTime))
             return null;
 

@@ -7,6 +7,8 @@ internal sealed class AppPaths
     public string DatabasePath => Path.Combine(ConfigDirectory, "email.db");
     public string AttachmentsDirectory => Path.Combine(ConfigDirectory, "attachments");
     public string LogsDirectory => Path.Combine(ConfigDirectory, "logs");
+    public string OcrDirectory => Path.Combine(ConfigDirectory, "ocr");
+    public string TessdataDirectory => Path.Combine(OcrDirectory, "tessdata");
 
     private AppPaths(string configDirectory)
     {
@@ -18,6 +20,7 @@ internal sealed class AppPaths
         Directory.CreateDirectory(ConfigDirectory);
         Directory.CreateDirectory(AttachmentsDirectory);
         Directory.CreateDirectory(LogsDirectory);
+        Directory.CreateDirectory(TessdataDirectory);
     }
 
     public static AppPaths FromEnvironment()

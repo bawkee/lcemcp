@@ -19,7 +19,8 @@ internal sealed class AttachmentProcessor
     private const long MaxArchiveEntryBytes = 25L * 1024 * 1024;
     private const long MaxArchiveTotalUncompressedBytes = 100L * 1024 * 1024;
     private const double MaxArchiveCompressionRatio = 100d;
-    internal const string ProcessorVersion = "1";
+    private const int MinUsefulPdfPageCharacters = 24;
+    internal const string ProcessorVersion = "2";
     // Terminal means a leaf document such as PDF/DOCX/TXT, as opposed to a ZIP
     // container. The process-wide gate prevents multiple timed-out, non-cancelable
     // library calls from accumulating; a timed-out task retains the gate until it exits.
@@ -29,15 +30,23 @@ internal sealed class AttachmentProcessor
     private readonly AttachmentObjectStore _objectStore;
     private readonly Func<AttachmentExtractionInput, AttachmentExtractionOutput> _terminalExtractor;
     private readonly TimeSpan _extractionTimeout;
+    private readonly OcrConfig _ocrConfig;
+    private readonly IPdfOcrExtractor _pdfOcrExtractor;
 
     public AttachmentProcessor(
         AttachmentObjectStore objectStore,
         Func<AttachmentExtractionInput, AttachmentExtractionOutput> terminalExtractor = null,
-        TimeSpan? extractionTimeout = null)
+        TimeSpan? extractionTimeout = null,
+        OcrConfig ocrConfig = null,
+        IPdfOcrExtractor pdfOcrExtractor = null)
     {
         _objectStore = objectStore;
         _terminalExtractor = terminalExtractor;
-        _extractionTimeout = extractionTimeout ?? DefaultExtractionTimeout;
+        _ocrConfig = ocrConfig ?? new();
+        _extractionTimeout = extractionTimeout
+            ?? (_ocrConfig.Enabled ? TimeSpan.FromMinutes(2) : DefaultExtractionTimeout);
+        _pdfOcrExtractor = pdfOcrExtractor
+            ?? (_ocrConfig.Enabled ? new PdfOcrExtractor(objectStore.Paths, _ocrConfig) : null);
     }
 
     public AttachmentContent ProcessEmailAttachment(
@@ -290,9 +299,10 @@ internal sealed class AttachmentProcessor
 
         var extraction = ExtractTerminalText(safeFilename, sniffedMimeType, Content);
         var extractedText = BlankToNull(extraction.Text);
+        var ocrText = BlankToNull(extraction.OcrText);
         var extractionStatus = extraction.Status;
 
-        if (extractionStatus == "done" && extractedText is null)
+        if (extractionStatus == "done" && extractedText is null && ocrText is null)
             extractionStatus = "empty";
 
         return Node(
@@ -319,7 +329,8 @@ internal sealed class AttachmentProcessor
             Children: [],
             ExtractionErrorCode: extraction.ErrorCode,
             ExtractorVersion: extraction.ExtractorVersion,
-            Exception: extraction.Exception);
+            Exception: extraction.Exception,
+            OcrText: ocrText);
     }
 
     private AttachmentContent ProcessZipContainer(
@@ -641,7 +652,8 @@ internal sealed class AttachmentProcessor
         string ExtractionErrorCode = null,
         string ExtractorVersion = null,
         Exception Exception = null,
-        string DownloadErrorCode = null)
+        string DownloadErrorCode = null,
+        string OcrText = null)
     {
         return new(
             SourceKind,
@@ -663,7 +675,7 @@ internal sealed class AttachmentProcessor
             ExtractionStatus,
             ExtractionError,
             ExtractedText,
-            OcrText: null,
+            OcrText,
             Extractor,
             Children ?? [],
             ExtractionErrorCode,
@@ -752,15 +764,54 @@ internal sealed class AttachmentProcessor
         }
     }
 
-    private static TerminalExtraction ExtractPdf(byte[] content)
+    private TerminalExtraction ExtractPdf(byte[] content)
     {
         using var document = PdfDocument.Open(content);
         var builder = new StringBuilder();
+        var ocrCandidatePages = new List<int>();
+        var pageIndex = 0;
 
         foreach (var page in document.GetPages())
+        {
             AppendBounded(builder, page.Text);
+            if (IsPdfOcrCandidate(page.Text))
+                ocrCandidatePages.Add(pageIndex);
+            pageIndex++;
+        }
 
-        return Success(builder.ToString(), "PdfPig");
+        var embeddedText = NormalizeText(builder.ToString());
+        if (ocrCandidatePages.Count == 0)
+            return Success(embeddedText, "PdfPig");
+
+        if (!_ocrConfig.Enabled)
+        {
+            return Failure(
+                "ocr_disabled",
+                "The PDF needs OCR, but OCR is disabled in config.toml.",
+                text: embeddedText,
+                extractor: "PdfPig");
+        }
+
+        var ocr = _pdfOcrExtractor.Extract(content, ocrCandidatePages);
+        var extractor = string.IsNullOrWhiteSpace(ocr.ExtractorVersion)
+            ? $"PdfPig+Tesseract({ocr.Model})"
+            : $"PdfPig+Tesseract({ocr.Model}; {ocr.ExtractorVersion})";
+        return Success(
+            embeddedText,
+            extractor,
+            ProcessorVersion,
+            NormalizeText(ocr.Text));
+    }
+
+    private static bool IsPdfOcrCandidate(string pageText)
+    {
+        if (string.IsNullOrWhiteSpace(pageText))
+            return true;
+
+        var meaningful = pageText.Count(char.IsLetterOrDigit);
+        var suspicious = pageText.Count(ch => ch == '\uFFFD' || char.IsControl(ch) && !char.IsWhiteSpace(ch));
+        return meaningful < MinUsefulPdfPageCharacters
+            || suspicious > 0 && suspicious * 4 > Math.Max(1, meaningful);
     }
 
     private static TerminalExtraction ExtractDocx(byte[] content)
@@ -979,20 +1030,24 @@ internal sealed class AttachmentProcessor
     private static TerminalExtraction Success(
         string text,
         string extractor,
-        string extractorVersion = ProcessorVersion) =>
-        new("done", text, null, null, extractor, extractorVersion, null);
+        string extractorVersion = ProcessorVersion,
+        string ocrText = null) =>
+        new("done", text, ocrText, null, null, extractor, extractorVersion, null);
 
     private static TerminalExtraction Failure(
         string errorCode,
         string error,
-        Exception exception = null) =>
-        new("failed", null, error, errorCode, null, ProcessorVersion, exception);
+        Exception exception = null,
+        string text = null,
+        string extractor = null) =>
+        new("failed", text, null, error, errorCode, extractor, ProcessorVersion, exception);
 
     // Result of extracting one non-container ("terminal") document. Archive trees
     // use AttachmentContent instead because they can produce child attachment nodes.
     private sealed record TerminalExtraction(
         string Status,
         string Text,
+        string OcrText,
         string Error,
         string ErrorCode,
         string Extractor,
