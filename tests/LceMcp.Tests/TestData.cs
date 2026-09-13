@@ -6,13 +6,15 @@ internal static class TestData
         string id = "yahoo",
         string email = "person@yahoo.com",
         string imapHost = "imap.mail.yahoo.com",
-        string imapSecurity = "ssl") =>
+        string imapSecurity = "ssl",
+        string provider = "yahoo",
+        string displayName = "Yahoo") =>
         new()
         {
             Id = id,
-            DisplayName = "Yahoo",
+            DisplayName = displayName,
             EmailAddress = email,
-            Provider = "yahoo",
+            Provider = provider,
             Username = email,
             ImapHost = imapHost,
             ImapPort = 993,

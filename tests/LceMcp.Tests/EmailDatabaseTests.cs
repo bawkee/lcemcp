@@ -185,6 +185,35 @@ public sealed class EmailDatabaseTests
     }
 
     [Fact]
+    public void GmailFolderRolesEnableCompleteDefaultScopeWithoutCustomLabels()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account(
+            id: "gmail",
+            email: "person@gmail.com",
+            imapHost: GmailPreset.ImapHost,
+            provider: "gmail",
+            displayName: "Gmail"));
+
+        database.UpsertFolders(accountId, [
+            TestData.Folder("INBOX", role: "inbox", attributes: @"\Inbox"),
+            TestData.Folder("[Gmail]/All Mail", role: "all_mail", attributes: @"\All"),
+            TestData.Folder("[Gmail]/Sent Mail", role: "sent", attributes: @"\Sent"),
+            TestData.Folder("[Gmail]/Trash", role: "trash", attributes: @"\Trash"),
+            TestData.Folder("Receipts", role: "custom")
+        ]);
+
+        var folders = database.ReadFolders("gmail");
+
+        Assert.True(folders.Single(folder => folder.Path == "INBOX").SyncEnabled);
+        Assert.True(folders.Single(folder => folder.Path == "[Gmail]/All Mail").SyncEnabled);
+        Assert.True(folders.Single(folder => folder.Path == "[Gmail]/Sent Mail").SyncEnabled);
+        Assert.False(folders.Single(folder => folder.Path == "[Gmail]/Trash").SyncEnabled);
+        Assert.False(folders.Single(folder => folder.Path == "Receipts").SyncEnabled);
+    }
+
+    [Fact]
     public void ReadSyncFoldersAllowsExplicitDisabledSelectableFolder()
     {
         using var temp = TempWorkspace.Create();
@@ -276,6 +305,35 @@ public sealed class EmailDatabaseTests
 
         Assert.Equal(1, status.MessageCount);
         Assert.Equal(2, status.MessageLocationCount);
+    }
+
+    [Fact]
+    public void PendingBodyTargetsUseOneLocationPerCanonicalMessageAcrossFolders()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("A", role: "inbox"),
+            TestData.Folder("B", role: "all_mail")
+        ]);
+        var folderA = database.ReadFolders("yahoo").Single(folder => folder.Path == "A");
+        var folderB = database.ReadFolders("yahoo").Single(folder => folder.Path == "B");
+
+        database.UpsertMessageMetadataBatch(accountId, folderA.Id, [
+            TestData.Message("200", "gmail:shared", "shared@example.com")
+        ], """{"batch":1}""", 200);
+        database.UpsertMessageMetadataBatch(accountId, folderB.Id, [
+            TestData.Message("300", "gmail:shared", "shared@example.com"),
+            TestData.Message("199", "gmail:unique", "unique@example.com")
+        ], """{"batch":2}""", 300);
+
+        var targets = database.ReadPendingBodySyncTargets("yahoo", folderFilter: null, maxPerFolder: 1);
+
+        Assert.Equal(2, targets.Count);
+        Assert.Equal(2, targets.Select(target => target.MessageId).Distinct().Count());
+        Assert.Equal(["A", "B"], targets.Select(target => target.FolderPath).ToArray());
+        Assert.Equal(["200", "199"], targets.Select(target => target.ProviderUid).ToArray());
     }
 
     [Fact]

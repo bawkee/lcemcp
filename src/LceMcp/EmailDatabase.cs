@@ -363,6 +363,7 @@ internal sealed partial class EmailDatabase
 
         using var connection = OpenConnection();
         var targets = new List<BodySyncTarget>();
+        var selectedMessageIds = new HashSet<int>();
         var limit = maxPerFolder > 0 ? maxPerFolder : int.MaxValue;
 
         foreach (var folder in folders)
@@ -392,24 +393,28 @@ internal sealed partial class EmailDatabase
                 ORDER BY CASE WHEN m.body_attempts = 0 THEN 0 ELSE 1 END,
                          COALESCE(m.body_next_attempt_at, ''),
                          COALESCE(m.date_sent, m.date_received, '') DESC,
-                         CAST(ml.provider_uid AS INTEGER) DESC
-                LIMIT $limit;
+                         CAST(ml.provider_uid AS INTEGER) DESC;
                 """;
             AddParameter(command, "$folderId", folder.Id);
             AddParameter(command, "$now", DateTimeOffset.UtcNow.ToString("O"));
-            AddParameter(command, "$limit", limit);
 
             using var reader = command.ExecuteReader();
-            while (reader.Read())
+            var selectedInFolder = 0;
+            while (reader.Read() && selectedInFolder < limit)
             {
+                var messageId = reader.GetInt32(reader.GetOrdinal("message_id"));
+                if (!selectedMessageIds.Add(messageId))
+                    continue;
+
                 targets.Add(new(
-                    MessageId: reader.GetInt32(reader.GetOrdinal("message_id")),
+                    MessageId: messageId,
                     FolderId: reader.GetInt32(reader.GetOrdinal("folder_id")),
                     FolderPath: reader.GetString(reader.GetOrdinal("folder_path")),
                     ProviderUid: reader.GetString(reader.GetOrdinal("provider_uid")),
                     Subject: GetNullableString(reader, "subject"),
                     HasAttachments: reader.GetInt32(reader.GetOrdinal("has_attachments")) != 0,
                     SizeBytes: GetNullableInt64(reader, "size_bytes")));
+                selectedInFolder++;
             }
         }
 

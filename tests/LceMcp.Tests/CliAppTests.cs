@@ -100,6 +100,43 @@ public sealed class CliAppTests
     }
 
     [Fact]
+    public async Task SetupGmailWritesImapPresetWithoutCredential()
+    {
+        AccountConfig account = null;
+        DatabaseStatus databaseStatus = null;
+
+        var output = await RunCliAsync(
+            [
+                "setup-gmail",
+                "--email",
+                "person@gmail.com",
+                "--history-days",
+                "45",
+                "--skip-password"
+            ],
+            temp =>
+            {
+                account = Assert.Single(new ConfigStore(temp.Paths).Load().Accounts);
+                databaseStatus = new EmailDatabase(temp.Paths).GetStatus();
+            });
+
+        Assert.Equal("gmail", account.Id);
+        Assert.Equal("Gmail", account.DisplayName);
+        Assert.Equal("person@gmail.com", account.EmailAddress);
+        Assert.Equal("gmail", account.Provider);
+        Assert.Equal("person@gmail.com", account.Username);
+        Assert.Equal(GmailPreset.ImapHost, account.ImapHost);
+        Assert.Equal(GmailPreset.ImapPort, account.ImapPort);
+        Assert.Equal("ssl", account.ImapSecurity);
+        Assert.Equal(45, account.HistoryDays);
+        Assert.Equal("lcemcp/imap/gmail", account.CredentialRef);
+        Assert.True(account.Enabled);
+        Assert.Equal(1, databaseStatus.AccountCount);
+        Assert.Contains("Saved account 'gmail'", output);
+        Assert.Contains("imap-test --account gmail --limit 5", output);
+    }
+
+    [Fact]
     public async Task AttachmentFailureCommandsListAndRetryKnownFailure()
     {
         await ConsoleGate.WaitAsync();
@@ -168,7 +205,12 @@ public sealed class CliAppTests
         }
     }
 
-    private static async Task<string> RunCliAsync(params string[] args)
+    private static Task<string> RunCliAsync(params string[] args) =>
+        RunCliAsync(args, inspect: null);
+
+    private static async Task<string> RunCliAsync(
+        string[] args,
+        Action<TempWorkspace> inspect)
     {
         await ConsoleGate.WaitAsync();
 
@@ -191,6 +233,7 @@ public sealed class CliAppTests
             var exitCode = await CliApp.RunAsync(args, CancellationToken.None);
 
             Assert.Equal(0, exitCode);
+            inspect?.Invoke(temp);
             return output.ToString();
         }
         finally

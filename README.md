@@ -8,12 +8,15 @@ Most IMAP MCPs act like thin remote mail wrappers: search a provider, fetch a fe
 - Use SQLite FTS5 and metadata filters before involving the AI, returning compact hit-centered snippets instead of whole inbox dumps.
 - Keep stable local IDs for messages, threads, folders, and attachments so agents can cite and retrieve evidence selectively.
 - Treat MCP as a permission boundary: no raw SQL, no raw filesystem access, no destructive mail actions by default, and audited tool calls once MCP lands.
-- Stay provider-agnostic where possible through IMAP/SMTP, while handling provider quirks like Yahoo folder names and app passwords.
+- Stay provider-agnostic where possible through IMAP/SMTP, while handling provider quirks like Gmail labels, stable IDs, and provider app passwords.
 
-The project is early. Right now the working slice is a Yahoo IMAP probe with local TOML account config and Windows Credential Manager password storage. SQLite storage, local search, and MCP tools are still being built.
+The working slice supports Yahoo and Gmail app-password IMAP accounts, a durable
+SQLite/FTS cache, bounded metadata/body/attachment sync, local search, and
+read-only MCP tools. Passwords are stored in Windows Credential Manager.
 
 ```powershell
 dotnet run --project src/LceMcp -- setup-yahoo --email you@yahoo.com --name Yahoo
+dotnet run --project src/LceMcp -- setup-gmail --email you@gmail.com --name Gmail
 dotnet run --project src/LceMcp -- status
 dotnet run --project src/LceMcp -- accounts
 dotnet run --project src/LceMcp -- credential-test --account yahoo
@@ -22,6 +25,13 @@ dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund pro
 ```
 
 Config currently defaults to `%APPDATA%\lcemcp\config.toml`.
+
+For Gmail, use the full Gmail address as the username and a Google app password,
+not the normal account password. `setup-gmail` accepts Google's displayed
+grouping spaces and stores the normalized secret only in Windows Credential
+Manager. Gmail's labels are discovered as IMAP folders; Inbox, Sent, and All
+Mail are enabled in the default sync scope, while Trash and custom labels are
+not.
 
 ## Scanned PDF OCR
 

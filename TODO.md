@@ -527,7 +527,38 @@ Historical checkpoints:
 - Completed on 2026-06-20: Added MCP stdio tests for initialize/tools-list, stdout/stderr separation, `email_get_sync_status` structured readiness output, and audit logging. `dotnet test lcemcp.slnx` passed with 25 tests.
 - Completed on 2026-06-20: Expanded MCP tests to cover the full exposed tool catalog plus ready-index `email_search` and `email_get_message`, including affected-message audit ids. `dotnet test lcemcp.slnx` passed with 26 tests.
 
-## 12. Later Milestones
+## 12. Gmail App-Password IMAP Support
+
+Status: implementation and the first live Gmail validation completed on 2026-07-05.
+
+Implementation checkpoint:
+
+- Added `setup-gmail` with the `imap.gmail.com:993` SSL preset, full-address username default, provider-scoped account ID, and Windows Credential Manager storage using the existing `lcemcp/imap/<account>` target convention.
+- Refactored Yahoo and Gmail onboarding through one small provider-preset setup path so config persistence, account ID allocation, credential storage, and next-step guidance stay consistent.
+- Gmail app-password input now removes Google's grouping whitespace before storage. Credential updates apply the same Gmail-only normalization, while other provider secrets remain unchanged.
+- Confirmed that the existing sync core already requests Gmail message IDs, thread IDs, and labels when `X-GM-EXT-1` is advertised. Canonical message matching by provider message key and separate message locations already provide the required cross-label deduplication model.
+- Kept the existing special-use defaults: Gmail Inbox, Sent, and All Mail are enabled after discovery for complete archived-mail coverage plus folder-role search; Trash and custom labels remain disabled unless selected explicitly.
+- Gmail's `[Gmail]` hierarchy container advertises `NonExistent` rather than `NoSelect`. Folder discovery now treats either attribute as non-selectable, avoiding an invalid `STATUS [Gmail]` request and misleading folder state.
+- Body target selection now chooses only one provider location per canonical message across the selected folders. It continues scanning each folder until its unique-message cap is filled, so Gmail's Inbox/All Mail overlap no longer causes duplicate body downloads within one sync run.
+- SMTP remains intentionally out of this slice. The app is read-only and has no SMTP account fields; Gmail SMTP should land with the disabled-by-default draft/send milestone.
+- Updated CLI help and README onboarding guidance. Empty-account CLI errors now point to either Yahoo or Gmail setup.
+
+Test result:
+
+- `dotnet test lcemcp.slnx --no-restore /p:UseSharedCompilation=false` passed with 97 tests after the live follow-up fixes.
+- `dotnet format lcemcp.slnx --verify-no-changes --no-restore` and `git diff --check` passed before this TODO-only checkpoint edit.
+- An isolated `setup-gmail --email smoke.user@gmail.com --history-days 7 --skip-password` smoke test persisted a valid Gmail config and database account. `accounts` reported `imap.gmail.com:993/ssl`, provider `gmail`, the full-address username, and the expected missing credential status.
+- Live authentication succeeded after the stored app password was refreshed. Gmail advertised `GMailExt1`, `SpecialUse`, `ListExtended`, `ListStatus`, `UidPlus`, `CondStore`, `ESearch`, `Move`, and the expected baseline capabilities.
+- Live discovery returned 10 folders. Inbox, All Mail, and Sent Mail had the expected special-use roles; Bin, Drafts, and Spam were recognized; Important, Starred, and the account's custom label remained outside the default sync scope. A follow-up discovery after the `NonExistent` fix reported `[Gmail]` as non-selectable with no status warning.
+- A bounded three-day metadata sync matched 12 Inbox and 12 All Mail locations with zero missing summaries. SQLite contained 12 canonical Gmail messages, 24 locations, and Gmail message/thread keys on all 12 canonical rows, proving live cross-label deduplication.
+- Body sync indexed all 12 canonical messages with zero failures. A subsequent uncapped body sync selected zero work.
+- Repeating the same metadata sync left the cache at 12 messages and 24 locations. A partial local FTS smoke search reported 12 bodies, 12 search documents, 12 FTS rows, zero pending bodies, and zero results for a random token. Readiness correctly remained `not_synced` because the account's configured 90-day window has not been backfilled.
+
+Next work:
+
+- Run the first uncapped 90-day Gmail metadata/body backfill when the user wants the complete configured search window.
+
+## 13. Later Milestones
 
 These are intentionally after read-only local search works.
 
@@ -537,4 +568,4 @@ Next work:
 - Local admin UI.
 - Draft/send support, disabled by default.
 - SQLCipher or other database encryption support.
-- Better provider presets, including Gmail and Microsoft OAuth.
+- Better provider presets, including Microsoft OAuth and custom IMAP.

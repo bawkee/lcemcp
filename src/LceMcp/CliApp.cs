@@ -8,6 +8,20 @@ internal static class CliApp
     {
         WriteIndented = true
     };
+    private static readonly ImapSetupPreset YahooSetup = new(
+        Provider: "yahoo",
+        DisplayName: "Yahoo",
+        DefaultAccountId: "yahoo",
+        ImapHost: YahooPreset.ImapHost,
+        ImapPort: YahooPreset.ImapPort,
+        PasswordGuidance: "Yahoo usually requires an app password for third-party IMAP clients.");
+    private static readonly ImapSetupPreset GmailSetup = new(
+        Provider: "gmail",
+        DisplayName: "Gmail",
+        DefaultAccountId: "gmail",
+        ImapHost: GmailPreset.ImapHost,
+        ImapPort: GmailPreset.ImapPort,
+        PasswordGuidance: "Gmail requires an app password for this password-based setup. Paste it with or without Google's grouping spaces.");
 
     public static async Task<int> RunAsync(string[] args, CancellationToken cancellationToken)
     {
@@ -26,7 +40,8 @@ internal static class CliApp
 
         return command switch
         {
-            "setup-yahoo" => await SetupYahooAsync(configStore, credentialStore, database, options, cancellationToken),
+            "setup-yahoo" => SetupImapAccount(configStore, credentialStore, database, options, YahooSetup, cancellationToken),
+            "setup-gmail" => SetupImapAccount(configStore, credentialStore, database, options, GmailSetup, cancellationToken),
             "status" => Status(configStore, database),
             "accounts" => ListAccounts(configStore, credentialStore),
             "discover-folders" => await DiscoverFoldersAsync(configStore, credentialStore, database, options, cancellationToken),
@@ -48,27 +63,28 @@ internal static class CliApp
         };
     }
 
-    private static async Task<int> SetupYahooAsync(
+    private static int SetupImapAccount(
         ConfigStore configStore,
         WindowsCredentialStore credentialStore,
         EmailDatabase database,
         CommandOptions options,
+        ImapSetupPreset preset,
         CancellationToken cancellationToken)
     {
         var email = options.GetRequired("--email").Trim();
-        var displayName = options.Get("--name") ?? "Yahoo";
+        var displayName = options.Get("--name") ?? preset.DisplayName;
         var username = options.Get("--username") ?? email;
         var historyDays = options.GetInt("--history-days", 90);
 
         if (historyDays < 1)
-            throw new CliException("--history-days must be at least 1 for this first probe.", 2);
+            throw new CliException("--history-days must be at least 1.", 2);
 
         var config = configStore.Load();
         var existing = config.FindAccountByEmail(email);
         var requestedId = options.Get("--id");
         var accountId = !string.IsNullOrWhiteSpace(requestedId)
             ? Slugify(requestedId)
-            : existing?.Id ?? NextAvailableId(config, "yahoo", email);
+            : existing?.Id ?? NextAvailableId(config, preset.DefaultAccountId, email);
 
         var credentialRef = WindowsCredentialStore.BuildImapTarget(accountId);
         var account = new AccountConfig
@@ -76,10 +92,10 @@ internal static class CliApp
             Id = accountId,
             DisplayName = displayName.Trim(),
             EmailAddress = email,
-            Provider = "yahoo",
+            Provider = preset.Provider,
             Username = username.Trim(),
-            ImapHost = YahooPreset.ImapHost,
-            ImapPort = YahooPreset.ImapPort,
+            ImapHost = preset.ImapHost,
+            ImapPort = preset.ImapPort,
             ImapSecurity = "ssl",
             HistoryDays = historyDays,
             AttachmentPolicy = "metadata_only",
@@ -89,7 +105,7 @@ internal static class CliApp
 
         if (!options.Has("--skip-password"))
         {
-            Console.WriteLine("Yahoo usually requires an app password for third-party IMAP clients.");
+            Console.WriteLine(preset.PasswordGuidance);
             var password = options.Has("--password-stdin")
                 ? ReadPasswordFromStdin()
                 : ConsoleSecretReader.ReadSecret("Password/app password: ");
@@ -97,6 +113,7 @@ internal static class CliApp
             if (string.IsNullOrWhiteSpace(password))
                 throw new CliException("No password was provided; config was not changed.", 2);
 
+            password = CredentialSecretNormalizer.Normalize(preset.Provider, password);
             credentialStore.Write(credentialRef, username, password);
             Console.WriteLine($"Stored IMAP credential in Windows Credential Manager: {credentialRef}");
         }
@@ -901,6 +918,7 @@ internal static class CliApp
         if (string.IsNullOrWhiteSpace(password))
             throw new CliException("No password was provided; credential was not changed.", 2);
 
+        password = CredentialSecretNormalizer.Normalize(account.Provider, password);
         credentialStore.Write(account.CredentialRef, account.Username, password);
         Console.WriteLine($"Updated IMAP credential in Windows Credential Manager: {account.CredentialRef}");
         return 0;
@@ -985,7 +1003,7 @@ internal static class CliApp
             return config.Accounts[0];
 
         if (config.Accounts.Count == 0)
-            throw new CliException("No accounts configured. Run 'setup-yahoo' first.", 2);
+            throw new CliException("No accounts configured. Run 'setup-yahoo' or 'setup-gmail' first.", 2);
 
         throw new CliException("Multiple accounts are configured; pass --account <id-or-email>.", 2);
     }
@@ -1001,7 +1019,7 @@ internal static class CliApp
             .ToList();
 
         if (accounts.Count == 0)
-            throw new CliException("No enabled accounts configured. Run 'setup-yahoo' first.", 2);
+            throw new CliException("No enabled accounts configured. Run 'setup-yahoo' or 'setup-gmail' first.", 2);
 
         return accounts;
     }
@@ -1073,6 +1091,14 @@ internal static class CliApp
     {
         public IReadOnlyList<string> CommandLine => [Command, .. Args];
     }
+
+    private sealed record ImapSetupPreset(
+        string Provider,
+        string DisplayName,
+        string DefaultAccountId,
+        string ImapHost,
+        int ImapPort,
+        string PasswordGuidance);
 
     private static bool IsHelp(string arg) =>
         arg.Equals("-h", StringComparison.OrdinalIgnoreCase)
@@ -1429,6 +1455,7 @@ internal static class CliApp
 
         Commands:
           setup-yahoo       Configure a Yahoo IMAP account and store its password in Windows Credential Manager.
+          setup-gmail       Configure a Gmail IMAP account and store its app password in Windows Credential Manager.
           status            Initialize local storage if needed and print config/database status.
           accounts          List configured accounts and whether their credential is present.
           discover-folders  Connect to IMAP, discover folders, and persist account/folder metadata locally.
@@ -1448,6 +1475,7 @@ internal static class CliApp
 
         Examples:
           dotnet run --project src/LceMcp -- setup-yahoo --email you@yahoo.com --name Yahoo
+          dotnet run --project src/LceMcp -- setup-gmail --email you@gmail.com --name Gmail
           dotnet run --project src/LceMcp -- status
           dotnet run --project src/LceMcp -- accounts
           dotnet run --project src/LceMcp -- discover-folders --account yahoo
@@ -1468,10 +1496,10 @@ internal static class CliApp
           dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund processed" --limit 5
           dotnet run --project src/LceMcp -- imap-test --account yahoo --limit 3 --fetch-first-body
 
-        setup-yahoo options:
-          --email <email>          Required. Full Yahoo email address.
-          --name <name>            Display name. Default: Yahoo.
-          --id <id>                Stable local account id. Default: yahoo, or a unique email-derived id.
+        setup-yahoo/setup-gmail options:
+          --email <email>          Required. Full account email address.
+          --name <name>            Display name. Default: Yahoo or Gmail.
+          --id <id>                Stable local account id. Default: provider name, or a unique email-derived id.
           --username <username>    IMAP username. Default: email.
           --history-days <days>    Stored default requested sync window. Default: 90.
           --password-stdin         Read password/app password from stdin instead of prompting.

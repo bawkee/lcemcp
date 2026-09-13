@@ -84,7 +84,7 @@ internal sealed class ImapFolderDiscovery
         IMailFolder folder,
         CancellationToken cancellationToken)
     {
-        var selectable = !folder.Attributes.HasFlag(FolderAttributes.NoSelect);
+        var selectable = IsSelectable(folder.Attributes);
         string uidValidity = null;
         int? messageCount = null;
         int? recentCount = null;
@@ -124,6 +124,10 @@ internal sealed class ImapFolderDiscovery
             RecentCount: recentCount,
             StatusError: statusError);
     }
+
+    internal static bool IsSelectable(FolderAttributes attributes) =>
+        !attributes.HasFlag(FolderAttributes.NoSelect)
+        && !attributes.HasFlag(FolderAttributes.NonExistent);
 
     private static string FormatDelimiter(char delimiter)
     {
