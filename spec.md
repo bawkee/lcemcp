@@ -227,15 +227,7 @@ DOCX: Open XML SDK or DocumentFormat.OpenXml
 CSV/TXT/HTML: built-in/simple parsers
 ```
 
-Keep OCR optional. Tesseract and language packs are useful, but they are not lightweight.
-Do not bundle every language model. Cache models under the app data directory
-and fetch them lazily from a pinned commit of Tesseract's official
-`tessdata_fast` repository. Prefer configured language codes when the corpus is
-known. Otherwise use Tesseract OSD to detect the script and download one broad
-script model; exact language detection cannot reliably precede OCR because an
-image-only page has no text to classify. Treat disabled automatic language-pack
-downloads as an explicit offline/preseeded-model policy, not as the normal user
-path.
+Keep OCR optional. Tesseract and language packs are useful, but they are not lightweight. Do not bundle every language model. Cache models under the app data directory and fetch them lazily from a pinned commit of Tesseract's official `tessdata_fast` repository. Prefer configured language codes when the corpus is known. Otherwise use Tesseract OSD to detect the script and download one broad script model; exact language detection cannot reliably precede OCR because an image-only page has no text to classify. Treat disabled automatic language-pack downloads as an explicit offline/preseeded-model policy, not as the normal user path.
 
 ---
 
@@ -1645,11 +1637,7 @@ rendered page encodings are capped at 25 MiB
 OCR-enabled terminal extraction has a two-minute caller timeout
 ```
 
-`ocr_disabled`, missing-model, renderer/worker unavailable, timeout, corrupt or
-encrypted PDF, and OCR safety-limit results use the normal attachment
-attempt/failure lifecycle. Enabling OCR queues successfully processed PDFs from
-older extractor versions and prior `ocr_disabled` failures for one
-`extractor_upgrade` pass.
+`ocr_disabled`, missing-model, renderer/worker unavailable, timeout, corrupt or encrypted PDF, and OCR safety-limit results use the normal attachment attempt/failure lifecycle. Enabling OCR queues successfully processed PDFs from older extractor versions and prior `ocr_disabled` failures for one `extractor_upgrade` pass.
 
 ### 15.3 Image OCR
 
@@ -1692,9 +1680,7 @@ max_archive_compression_ratio
 archive_extraction_timeout_seconds
 ```
 
-Entry-count, total-uncompressed-size, and timeout budgets apply to the complete
-recursively expanded tree rooted at one email attachment. Nested containers must
-share the root budget rather than resetting these limits at each ZIP level.
+Entry-count, total-uncompressed-size, and timeout budgets apply to the complete recursively expanded tree rooted at one email attachment. Nested containers must share the root budget rather than resetting these limits at each ZIP level.
 
 Archive entries must never write directly to caller-controlled paths. Normalize separators, reject absolute paths and `..` traversal, preserve the original entry name for display, and expose a safe `display_path` such as `statements.zip!/2026-06/statement.pdf`.
 

@@ -28,3 +28,4 @@
 - Do not expose raw SQL, raw filesystem access, destructive mail actions, or raw attachment export through MCP tools by default.
 - Log MCP calls when MCP support lands, and keep logs compatible with stdio transport by writing diagnostics to stderr.
 - When committing, write a short lowercase subject in the project's existing style (verb-led like `fixed`/`added`/`updated`/`improved`, or a scope name like `gmail app-password imap support` or `pdf ocr`), and always add a commit body that describes the change more widely: what changed, why, and any notable tradeoffs or follow-ups — not just a subject line.
+- Do not use fixed-width wrapping when writing Markdown files. Write each prose paragraph and each list item as one line instead of capping lines at a column width; keep code fences, tables, and preformatted blocks verbatim.

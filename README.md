@@ -10,9 +10,7 @@ Most IMAP MCPs act like thin remote mail wrappers: search a provider, fetch a fe
 - Treat MCP as a permission boundary: no raw SQL, no raw filesystem access, no destructive mail actions by default, and audited tool calls once MCP lands.
 - Stay provider-agnostic where possible through IMAP/SMTP, while handling provider quirks like Gmail labels, stable IDs, and provider app passwords.
 
-The working slice supports Yahoo and Gmail app-password IMAP accounts, a durable
-SQLite/FTS cache, bounded metadata/body/attachment sync, local search, and
-read-only MCP tools. Passwords are stored in Windows Credential Manager.
+The working slice supports Yahoo and Gmail app-password IMAP accounts, a durable SQLite/FTS cache, bounded metadata/body/attachment sync, local search, and read-only MCP tools. Passwords are stored in Windows Credential Manager.
 
 ```powershell
 dotnet run --project src/LceMcp -- setup-yahoo --email you@yahoo.com --name Yahoo
@@ -26,12 +24,7 @@ dotnet run --project src/LceMcp -- imap-test --account yahoo --query "refund pro
 
 Config currently defaults to `%APPDATA%\lcemcp\config.toml`.
 
-For Gmail, use the full Gmail address as the username and a Google app password,
-not the normal account password. `setup-gmail` accepts Google's displayed
-grouping spaces and stores the normalized secret only in Windows Credential
-Manager. Gmail's labels are discovered as IMAP folders; Inbox, Sent, and All
-Mail are enabled in the default sync scope, while Trash and custom labels are
-not.
+For Gmail, use the full Gmail address as the username and a Google app password, not the normal account password. `setup-gmail` accepts Google's displayed grouping spaces and stores the normalized secret only in Windows Credential Manager. Gmail's labels are discovered as IMAP folders; Inbox, Sent, and All Mail are enabled in the default sync scope, while Trash and custom labels are not.
 
 ## Scanned PDF OCR
 
@@ -45,33 +38,13 @@ fallback_script = "Latin"
 languages = ["eng", "srp", "srp_latn"]
 ```
 
-If `languages` is set, lcemcp lazily downloads only those Tesseract language
-models. This is the recommended mode when the likely languages are known.
-An empty list enables automatic script detection: lcemcp first downloads
-Tesseract's `osd` model, detects Latin/Cyrillic/Arabic/etc., and then downloads
-one matching script model. Script models are broader but can be much larger
-(the current Latin fast model is roughly 89 MB).
+If `languages` is set, lcemcp lazily downloads only those Tesseract language models. This is the recommended mode when the likely languages are known. An empty list enables automatic script detection: lcemcp first downloads Tesseract's `osd` model, detects Latin/Cyrillic/Arabic/etc., and then downloads one matching script model. Script models are broader but can be much larger (the current Latin fast model is roughly 89 MB).
 
-Models come only from a pinned commit of Tesseract's official
-[`tessdata_fast`](https://github.com/tesseract-ocr/tessdata_fast) repository and
-are cached under the app data directory. Set
-`auto_download_language_packs = false` to require models to be placed in the
-`ocr/tessdata` cache manually; most users should leave it enabled. The download
-request reveals the selected language or script model to GitHub, but no PDF,
-image, extracted text, or email metadata leaves the machine. `status` reports
-the OCR mode and cached models.
+Models come only from a pinned commit of Tesseract's official [`tessdata_fast`](https://github.com/tesseract-ocr/tessdata_fast) repository and are cached under the app data directory. Set `auto_download_language_packs = false` to require models to be placed in the `ocr/tessdata` cache manually; most users should leave it enabled. The download request reveals the selected language or script model to GitHub, but no PDF, image, extracted text, or email metadata leaves the machine. `status` reports the OCR mode and cached models.
 
-MCP clients can call `email_list_ocr_languages` to inspect supported codes from
-the pinned tessdata revision, then `email_set_ocr_config` to update OCR config.
-OCR config changes do not require an MCP server restart; they apply to the next
-sync, retry, or extraction run. Already-running work keeps the config snapshot
-it started with.
+MCP clients can call `email_list_ocr_languages` to inspect supported codes from the pinned tessdata revision, then `email_set_ocr_config` to update OCR config. OCR config changes do not require an MCP server restart; they apply to the next sync, retry, or extraction run. Already-running work keeps the config snapshot it started with.
 
-Image-only, tiny-text, and suspicious-text PDF pages are rendered at 200 DPI
-and OCRed with bounded page, pixel, attachment-size, and timeout limits.
-Embedded text and OCR text share the normal attachment search, snippet, and
-`email_get_attachment_text` paths. Standalone image attachment OCR is not
-implemented yet.
+Image-only, tiny-text, and suspicious-text PDF pages are rendered at 200 DPI and OCRed with bounded page, pixel, attachment-size, and timeout limits. Embedded text and OCR text share the normal attachment search, snippet, and `email_get_attachment_text` paths. Standalone image attachment OCR is not implemented yet.
 
 ## Safer Agent Install Prompt
 
