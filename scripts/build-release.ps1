@@ -41,7 +41,7 @@ Write-Host "Output:     $outputFullPath"
 
 if (-not $SkipTests) {
     Write-Host "Running tests..."
-    dotnet test $solution -c $Configuration /p:UseSharedCompilation=false
+    dotnet test $solution -c $Configuration /p:UseSharedCompilation=false -m:16
 }
 
 if (Test-Path $outputFullPath) {
@@ -62,7 +62,14 @@ dotnet publish $project `
     /p:EnableCompressionInSingleFile=true `
     /p:DebugType=None `
     /p:DebugSymbols=false `
-    /p:UseSharedCompilation=false
+    /p:UseSharedCompilation=false `
+    -m:16
+
+# Native packages (e.g. SkiaSharp.NativeAssets.Win32) ship libSkiaSharp.pdb next to
+# their DLL. The single-file bundler embeds only the DLL, so the PDB is copied
+# verbatim into the output as debug-only dead weight. Drop any *.pdb so the
+# artifact stays a single self-contained file.
+Get-ChildItem -Path $outputFullPath -Filter "*.pdb" -File | Remove-Item -Force
 
 $exeName = if ($RuntimeIdentifier.StartsWith("win-", [System.StringComparison]::OrdinalIgnoreCase)) {
     "LceMcp.exe"

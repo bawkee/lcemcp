@@ -302,6 +302,12 @@ Packaging result on 2026-06-24:
 - Added `mcp-config --client codex` so the executable can print the exact Codex TOML block for the running package path. `help` now advertises this install helper so an agent can discover it by running the exe. Rebuilt the single-file artifact and verified `mcp-config`, `help`, and MCP `initialize`/`tools-list` against `artifacts\lcemcp\LceMcp.exe`.
 - Added a short README copy/paste prompt for safer agent-mediated audit/install. The prompt tells agents to clone to temp, make a sanitized source/build-only review copy, strip comments, inspect for suspicious behavior and MCP/secret boundaries, build with `scripts/build-release.ps1`, print `mcp-config --client codex`, and only edit Codex config after user approval.
 
+Release artifact follow-up on 2026-09-13:
+
+- `dotnet publish` leaked the native `libSkiaSharp.pdb` (83 MB, from the `SkiaSharp.NativeAssets.Win32` package) into `artifacts\lcemcp` because the single-file bundler embeds only the DLL. `scripts/build-release.ps1` now deletes any `*.pdb` from the output after publish, so the release artifact is strictly one self-contained exe again.
+- Build script now passes `-m:16` (16 parallel jobs) to both `dotnet test` and `dotnet publish`.
+- Rebuilt with the patched script: 100 Release tests passed, `artifacts\lcemcp\LceMcp.exe` published (SHA256 `380F3671662B0E21271C2B1189B226B5F91D2002F26A340C6841C1E8F96571D6`), no PDB in the output, and `mcp-config --client codex` smoke-tested against the new artifact.
+
 Freshness result on 2026-06-24:
 
 - Added `email_search` freshness output so harnesses can distinguish "local index is ready" from "local cache is current enough for this question." Search responses now include `freshness.source=local_cache`, `response_generated_at`, conservative `search_scope_as_of`, intuitive `last_sync_performed_at`, oldest/newest scoped sync timestamps, `cache_age_seconds`, requested date bounds, requested upper bound, and `requested_range_extends_beyond_cache`.
