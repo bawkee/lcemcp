@@ -2951,6 +2951,17 @@ internal sealed partial class EmailDatabase
             ? (int?)null
             : Math.Max(0, Convert.ToInt32(Math.Floor((now - oldest.Value).TotalSeconds)));
 
+        bool? lowerBoundBelowCache = null;
+        if (!string.IsNullOrWhiteSpace(request.DateFrom))
+        {
+            var requiredSinceDays = folders
+                .Select(folder => RequiredSinceDays(folder, request))
+                .DefaultIfEmpty(0)
+                .Max();
+            lowerBoundBelowCache = folders.Count == 0
+                || folders.Any(folder => !FolderCoversSinceDays(folder, requiredSinceDays));
+        }
+
         return new(
             ResponseGeneratedAt: now.ToString("O"),
             SearchScopeAsOf: FormatUtc(oldest),
@@ -2960,8 +2971,9 @@ internal sealed partial class EmailDatabase
             CacheAgeSeconds: cacheAgeSeconds,
             RequestedDateFrom: BlankToNull(request.DateFrom),
             RequestedDateTo: BlankToNull(request.DateTo),
-            RequestedUpperBound: FormatUtc(requestedUpperBound),
-            RequestedRangeExtendsBeyondCache: oldest is null || requestedUpperBound > oldest.Value);
+            CacheReachesBackDays: CacheReachesBackDays(folders),
+            RequestedLowerBoundBelowCache: lowerBoundBelowCache,
+            RequestedUpperBoundNewerThanCache: newest is null || requestedUpperBound > newest.Value);
     }
 
     private static DateTimeOffset? ParseUtc(string value) =>
@@ -2971,6 +2983,47 @@ internal sealed partial class EmailDatabase
 
     private static string FormatUtc(DateTimeOffset? value) =>
         value?.ToUniversalTime().ToString("O");
+
+    // Low-water mark of the actual synced metadata window across the scoped
+    // folders: how far back every scoped folder is guaranteed to have synced.
+    // 0 means full history; null means at least one scoped folder has no
+    // successful metadata sync to measure.
+    private static int? CacheReachesBackDays(IReadOnlyList<MessageSearchFolderState> folders)
+    {
+        var finiteWindows = new List<int>();
+
+        foreach (var folder in folders)
+        {
+            var state = ParseMetadataSyncState(folder.StateJson);
+            if (state is null || string.IsNullOrWhiteSpace(folder.LastSuccessAt))
+                return null;
+
+            if (state.SinceDays != 0)
+                finiteWindows.Add(state.SinceDays);
+        }
+
+        return finiteWindows.Count == 0 ? 0 : finiteWindows.Min();
+    }
+
+    // Whether a folder's actual synced metadata window covers a requested
+    // lower bound that is `requiredSinceDays` old.
+    private static bool FolderCoversSinceDays(MessageSearchFolderState folder, int requiredSinceDays)
+    {
+        var state = ParseMetadataSyncState(folder.StateJson);
+        return state is not null
+            && (state.SinceDays == 0 || state.SinceDays >= Math.Max(1, requiredSinceDays));
+    }
+
+    private static bool IsFullHistoryMetadataSync(MessageSearchFolderState folder)
+    {
+        var state = ParseMetadataSyncState(folder.StateJson);
+        return state is not null && state.SinceDays == 0;
+    }
+
+    private static string FormatSyncedWindow(int? reachBackDays) =>
+        reachBackDays is null ? "an unknown depth"
+        : reachBackDays == 0 ? "full history"
+        : $"{reachBackDays} day(s)";
 
     private static string BuildCoverageNote(
         IReadOnlyList<MessageSearchFolderState> folders,
@@ -2983,7 +3036,12 @@ internal sealed partial class EmailDatabase
         if (string.IsNullOrWhiteSpace(request.DateFrom)
             && !string.IsNullOrWhiteSpace(request.DateTo))
         {
-            return "The requested date range has no lower bound, so complete coverage requires an uncapped full-history metadata sync.";
+            if (folders.All(folder => IsFullHistoryMetadataSync(folder)))
+                return null;
+
+            return string.Format(
+                "The requested date range has no lower bound, so complete coverage requires full-history metadata; the local cache currently covers about {0}.",
+                FormatSyncedWindow(CacheReachesBackDays(folders)));
         }
 
         var requiredSinceDays = folders
@@ -2992,9 +3050,12 @@ internal sealed partial class EmailDatabase
             .Max();
 
         if (!string.IsNullOrWhiteSpace(request.DateFrom)
-            && folders.Any(folder => RequiredSinceDays(folder, request) > folder.HistoryDays))
+            && folders.Any(folder => !FolderCoversSinceDays(folder, requiredSinceDays)))
         {
-            return $"The requested date range reaches back about {requiredSinceDays} day(s), beyond at least one configured account history window; sync must cover that wider range before results are complete.";
+            return string.Format(
+                "The requested date range starts about {0} day(s) ago, beyond the cached metadata window of about {1} for one or more selected folders; sync must cover that wider range before those older messages can be searched.",
+                requiredSinceDays,
+                FormatSyncedWindow(CacheReachesBackDays(folders)));
         }
 
         if (completeFolderCount < folders.Count)

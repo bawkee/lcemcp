@@ -47,8 +47,9 @@ internal sealed record SearchFreshness(
     int? CacheAgeSeconds,
     string RequestedDateFrom,
     string RequestedDateTo,
-    string RequestedUpperBound,
-    bool RequestedRangeExtendsBeyondCache);
+    int? CacheReachesBackDays = null,
+    bool? RequestedLowerBoundBelowCache = null,
+    bool? RequestedUpperBoundNewerThanCache = null);
 
 internal sealed record SyncRunSnapshot(
     string Id,

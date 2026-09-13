@@ -1268,7 +1268,9 @@ internal static class CliApp
         Console.WriteLine(
             $"Search freshness: source=local_cache as_of={FormatOptional(freshness.SearchScopeAsOf)} "
             + $"last_sync={FormatOptional(freshness.LastSyncPerformedAt)} age_seconds={FormatOptional(freshness.CacheAgeSeconds)} "
-            + $"extends_beyond_cache={freshness.RequestedRangeExtendsBeyondCache.ToString().ToLowerInvariant()}");
+            + $"reaches_back_days={FormatOptional(freshness.CacheReachesBackDays)} "
+            + $"lower_below_cache={FormatOptional(freshness.RequestedLowerBoundBelowCache)} "
+            + $"upper_newer_than_cache={FormatOptional(freshness.RequestedUpperBoundNewerThanCache)}");
     }
 
     private static async Task<SyncRunStartResult> WaitForSyncRunLeaseAsync(

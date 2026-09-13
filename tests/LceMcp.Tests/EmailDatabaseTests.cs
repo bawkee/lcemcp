@@ -1132,6 +1132,124 @@ public sealed class EmailDatabaseTests
     }
 
     [Fact]
+    public void CoverageNoteIsSilentWhenActualSyncedWindowCoversRequestedRange()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        // Cache actually reaches back 700 days, far beyond the 30-day config.
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(
+                providerUid: "100",
+                providerMessageKey: "emailid:deep-cache",
+                messageIdHeader: "deep-cache@example.com",
+                dateSent: DateTimeOffset.UtcNow.AddDays(-10).ToString("O"))
+        ], SyncStateJson(sinceDays: 700), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Indexed body",
+            HtmlText: null,
+            NormalizedText: "Indexed body",
+            Recipients: []));
+
+        var readiness = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            DateFrom: EmailSearchDateParser.NormalizeLowerBound(DateTimeOffset.UtcNow.AddDays(-32).ToString("yyyy-MM-dd"))));
+
+        Assert.True(readiness.SearchReady);
+        Assert.True(readiness.MetadataComplete);
+        Assert.Null(readiness.CoverageNote);
+        Assert.Equal(700, readiness.Freshness.CacheReachesBackDays);
+        Assert.False(readiness.Freshness.RequestedLowerBoundBelowCache);
+        Assert.True(readiness.Freshness.RequestedUpperBoundNewerThanCache);
+    }
+
+    [Fact]
+    public void CoverageNoteFiresOnlyWhenRequestedRangeExceedsActualSyncedWindow()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(providerUid: "100", providerMessageKey: "emailid:shallow-cache", messageIdHeader: "shallow-cache@example.com")
+        ], SyncStateJson(sinceDays: 30), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Indexed body",
+            HtmlText: null,
+            NormalizedText: "Indexed body",
+            Recipients: []));
+
+        var readiness = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            DateFrom: EmailSearchDateParser.NormalizeLowerBound(DateTimeOffset.UtcNow.AddDays(-60).ToString("yyyy-MM-dd"))));
+
+        Assert.False(readiness.SearchReady);
+        Assert.False(readiness.MetadataComplete);
+        Assert.NotNull(readiness.CoverageNote);
+        Assert.Contains("beyond", readiness.CoverageNote, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("30 day(s)", readiness.CoverageNote, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(30, readiness.Freshness.CacheReachesBackDays);
+        Assert.True(readiness.Freshness.RequestedLowerBoundBelowCache);
+    }
+
+    [Fact]
+    public void NoLowerBoundRequestReportsActualSyncedWindow()
+    {
+        using var temp = TempWorkspace.Create();
+        var database = new EmailDatabase(temp.Paths);
+        var accountId = database.UpsertConfiguredAccount(TestData.Account());
+        database.UpsertFolders(accountId, [
+            TestData.Folder("Inbox", role: "inbox")
+        ]);
+        var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+
+        database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
+            TestData.Message(providerUid: "100", providerMessageKey: "emailid:unbounded", messageIdHeader: "unbounded@example.com")
+        ], SyncStateJson(sinceDays: 700), 100);
+        var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
+        database.UpsertMessageBody(new(
+            MessageId: messageId,
+            PlainText: "Indexed body",
+            HtmlText: null,
+            NormalizedText: "Indexed body",
+            Recipients: []));
+
+        var readiness = database.GetMessageSearchReadiness(new(
+            AccountFilters: ["yahoo"],
+            FromEmail: null,
+            FolderRoles: ["inbox"],
+            HasAttachment: null,
+            DateTo: EmailSearchDateParser.NormalizeUpperBound(DateTimeOffset.UtcNow.ToString("yyyy-MM-dd"))));
+
+        Assert.False(readiness.SearchReady);
+        Assert.False(readiness.MetadataComplete);
+        Assert.NotNull(readiness.CoverageNote);
+        Assert.Contains("no lower bound", readiness.CoverageNote, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("700 day(s)", readiness.CoverageNote, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(700, readiness.Freshness.CacheReachesBackDays);
+        Assert.Null(readiness.Freshness.RequestedLowerBoundBelowCache);
+    }
+
+    [Fact]
     public void MetadataSyncWindowAutoExpandsFromLastUncappedSuccess()
     {
         using var temp = TempWorkspace.Create();

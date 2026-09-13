@@ -460,6 +460,7 @@ public sealed class McpStdioServerTests
             TestData.Folder("Inbox", role: "inbox")
         ]);
         var inbox = database.ReadFolders("yahoo").Single(folder => folder.Path == "Inbox");
+        var messageDate = DateTimeOffset.UtcNow.AddDays(-2);
 
         database.UpsertMessageMetadataBatch(accountId, inbox.Id, [
             TestData.Message(
@@ -467,7 +468,7 @@ public sealed class McpStdioServerTests
                 providerMessageKey: "emailid:date-only",
                 messageIdHeader: "date-only@example.com",
                 subject: "Date only browse",
-                dateSent: "2026-06-19T10:00:00.0000000+00:00")
+                dateSent: messageDate.ToString("O"))
         ], SyncStateJson(sinceDays: 30, matchedCount: 1, selectedCount: 1, fetchedCount: 1), 100);
         var messageId = ReadInts(temp.Paths.DatabasePath, "SELECT id FROM messages;").Single();
         database.UpsertMessageBody(new(
@@ -482,8 +483,9 @@ public sealed class McpStdioServerTests
         var input = new StringReader("""
             {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}
             {"jsonrpc":"2.0","method":"notifications/initialized"}
-            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_search","arguments":{"accounts":["yahoo"],"date_from":"2026-06-19","date_to":"2026-06-19","limit":5}}}
-            """);
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_search","arguments":{"accounts":["yahoo"],"date_from":"__DATE__","date_to":"__DATE__","limit":5}}}
+            """
+            .Replace("__DATE__", messageDate.ToString("yyyy-MM-dd")));
         var server = new McpStdioServer(configStore, database, input, output, error);
 
         await server.RunAsync(CancellationToken.None);
@@ -599,7 +601,12 @@ public sealed class McpStdioServerTests
         Assert.True(freshness["cache_age_seconds"].GetValue<int>() >= 0);
         Assert.Equal(dateFrom, freshness["requested_date_from"].GetValue<string>());
         Assert.Equal(dateTo, freshness["requested_date_to"].GetValue<string>());
-        Assert.True(freshness["requested_range_extends_beyond_cache"].GetValue<bool>());
+        // The 30-day synced window covers the 1-day-old lower bound, so depth is
+        // covered; only the upper edge (now) is newer than the newest sync.
+        Assert.Equal(30, freshness["cache_reaches_back_days"].GetValue<int>());
+        Assert.False(freshness["requested_lower_bound_below_cache"].GetValue<bool>());
+        Assert.True(freshness["requested_upper_bound_newer_than_cache"].GetValue<bool>());
+        Assert.DoesNotContain("requested_range_extends_beyond_cache", lines[1]);
     }
 
     [Fact]

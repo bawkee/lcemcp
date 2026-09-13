@@ -473,6 +473,7 @@ internal sealed class McpStdioServer
                 ["provider_preset"] = account.Provider,
                 ["enabled"] = account.Enabled,
                 ["history_days"] = account.HistoryDays,
+                ["synced_window_days"] = NumberOrNull(readiness.Freshness?.CacheReachesBackDays),
                 ["last_success_at"] = StringOrNull(summary?.LastSuccessAt),
                 ["last_error_at"] = StringOrNull(summary?.LastErrorAt),
                 ["last_error"] = StringOrNull(summary?.LastError),
@@ -1580,7 +1581,8 @@ internal sealed class McpStdioServer
                 ["history_days"] = account.HistoryDays,
                 ["history_source"] = "config.toml",
                 ["message_search_ready"] = readiness.SearchReady,
-                ["attachment_search_ready"] = readiness.AttachmentSearchIndexComplete
+                ["attachment_search_ready"] = readiness.AttachmentSearchIndexComplete,
+                ["synced_window_days"] = NumberOrNull(readiness.Freshness?.CacheReachesBackDays)
             },
             ["readiness"] = ToReadinessJson(readiness),
             ["sync_progress"] = IsActiveForAccount(activeSyncRun, account)
@@ -2377,10 +2379,11 @@ internal sealed class McpStdioServer
             ["oldest_scoped_sync_at"] = StringOrNull(freshness?.OldestScopedSyncAt),
             ["newest_scoped_sync_at"] = StringOrNull(freshness?.NewestScopedSyncAt),
             ["cache_age_seconds"] = NumberOrNull(freshness?.CacheAgeSeconds),
+            ["cache_reaches_back_days"] = NumberOrNull(freshness?.CacheReachesBackDays),
             ["requested_date_from"] = StringOrNull(freshness?.RequestedDateFrom),
             ["requested_date_to"] = StringOrNull(freshness?.RequestedDateTo),
-            ["requested_upper_bound"] = StringOrNull(freshness?.RequestedUpperBound),
-            ["requested_range_extends_beyond_cache"] = freshness is null ? null : freshness.RequestedRangeExtendsBeyondCache
+            ["requested_lower_bound_below_cache"] = freshness is null ? null : freshness.RequestedLowerBoundBelowCache,
+            ["requested_upper_bound_newer_than_cache"] = freshness is null ? null : freshness.RequestedUpperBoundNewerThanCache
         };
 
     private static MessageSearchReadiness EmptyReadiness(SyncRunSnapshot activeSyncRun, EmailSearchRequest request)
@@ -2395,8 +2398,9 @@ internal sealed class McpStdioServer
             CacheAgeSeconds: null,
             RequestedDateFrom: request.DateFrom,
             RequestedDateTo: request.DateTo,
-            RequestedUpperBound: request.DateTo ?? now.ToString("O"),
-            RequestedRangeExtendsBeyondCache: true);
+            CacheReachesBackDays: null,
+            RequestedLowerBoundBelowCache: string.IsNullOrWhiteSpace(request.DateFrom) ? null : true,
+            RequestedUpperBoundNewerThanCache: true);
 
         return new(
             SearchReady: false,

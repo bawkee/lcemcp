@@ -569,3 +569,38 @@ Next work:
 - Draft/send support, disabled by default.
 - SQLCipher or other database encryption support.
 - Better provider presets, including Microsoft OAuth and custom IMAP.
+
+## 14. Coverage-Reporting Bug Investigation (2026-09-13)
+
+User report: a harness LLM said "the current range doesn't cover that far" for a "month ago" search even though the live cache reaches back 700 days. Investigation reproduced the misleading reporting through the real `artifacts\lcemcp\LceMcp.exe` MCP server against a read-only snapshot of the live DB (no writes to the real DB; copies made via SQLite backup API).
+
+Facts from the live DB (`C:\Users\bojan\AppData\Roaming\lcemcp\email.db`):
+
+- Last sync 2026-09-04, uncapped (`max_per_folder=0`) with `effective_since_days=700` for all 7 sync-enabled folders.
+- 4786 messages, 4786 bodies, 4786 search docs, 4786 FTS rows; 0 pending bodies; message readiness complete for any query up to ~700 days.
+- Oldest cached message dates back to 2009 — "a month ago" is trivially covered.
+
+Root causes (all in the reporting surface, not the data):
+
+1. `EmailDatabase.BuildCoverageNote` (EmailDatabase.cs ~2975-3008) compares the requested `date_from` to `folder.HistoryDays` (configured `config.toml` value: Yahoo 30, Gmail 90) instead of the actual synced window in `sync_state.state_json` (`since_days`/`effective_since_days` = 700). Any query older than 30 days (Yahoo) emits `coverage_note: "The requested date range reaches back about N day(s), beyond at least one configured account history window; sync must cover that wider range before results are complete."` — emitted even on `status: ready` responses that return full results. This is the sentence the LLM echoed.
+2. `EmailDatabase.BuildSearchFreshness` (EmailDatabase.cs ~2937-2965): `requested_range_extends_beyond_cache = oldest is null || (date_to ?? now) > oldest_successful_sync`. With `date_to` omitted (the common LLM case), it is `now > last sync`, i.e. true on every call no matter how deep the cache is; it is a staleness test mislabeled as a range-coverage test. Reproduced `true` in 8/8 probe scenarios, including a plain text query with no dates.
+3. `EmailDatabase.RequiredSinceDays` (~3010-3025) returns 0 when only `date_to` is supplied, and `IsFolderMetadataComplete` treats 0 as requiring `since_days == 0` full-history sync — so `date_to`-only browse queries are always `not_synced` with "requires an uncapped full-history metadata sync" even though the cache holds 700 days.
+4. `email_get_sync_status` only exposes the configured `history_days` (30 for Yahoo) as a "window"; it never exposes the actual synced coverage, so the LLM's only numeric window signal is the small configured value.
+
+Fix direction (not yet implemented):
+
+- Compute coverage notes and the depth axis from the actual synced window (`state.since_days/effective_since_days`) rather than configured `history_days`.
+- Split freshness (staleness vs the last sync) from historical depth (does the cache reach back to `date_from`), name/report them separately, and never report "range extends beyond cache" for the depth axis when `date_to` is unset.
+- Do not emit a "sync must cover a wider range" note on a `ready` response; that is self-refuting.
+- Surface actual coverage per account/folder in `email_get_sync_status` (including `effective_since_days`).
+
+Fix implemented and verified on 2026-09-13:
+
+- `BuildCoverageNote` now judges depth against the actual synced metadata window from `sync_state` (`state.since_days`/`effective_since_days`), not the configured `history_days`. A 32-day request against a 700-day cache emits no coverage note; an 800-day request still reports not_synced with an accurate "beyond the cached metadata window of about 700 day(s)" note. The no-lower-bound (`date_to`-only) note now reports actual reach-back ("the local cache currently covers about 700 day(s)") instead of a bare "requires full-history sync".
+- `SearchFreshness` was reworked: removed the misleading `requested_upper_bound` and `requested_range_extends_beyond_cache` fields (the latter was `(date_to ?? now) > oldest_sync`, true on every call). Added `cache_reaches_back_days` (low-water actual synced window, 0 = full history), `requested_lower_bound_below_cache` (depth: true only when `date_from` predates the actual window; null when no lower bound), and `requested_upper_bound_newer_than_cache` (honest staleness: requested upper edge vs newest sync). CLI freshness line updated to match.
+- `email_get_sync_status.search_ready_scope` and `email_list_accounts` now expose `synced_window_days` (actual coverage, e.g. 700) alongside the configured `history_days` (30/90), so clients can stop inferring depth from config.
+- Test suite: 100 tests pass (97 prior + 3 new regressions for covered-month, beyond-window, and no-lower-bound note/freshness behavior; MCP freshness test updated to new fields). Also fixed a pre-existing clock-dependent test time bomb (`EmailSearchAllowsDateOnlyRequestWithoutQuery` searched fixed date 2026-06-19, which drifted beyond the 30-day window once the machine clock passed mid-July; it now uses relative dates and failed identically on the pristine tree before the fix).
+- Release artifact rebuilt at `artifacts\lcemcp\LceMcp.exe` (SHA256 `2F75417E3FF906B47A4C2B90D3CA6969B054D0125E391F314795F7DC4A53F840`).
+- Live end-to-end probe against a snapshot of the real DB (700-day cache): month/3-month/1-week/filter-only queries now return clean `ready` responses with no coverage note, `cache_reaches_back_days: 700`, `requested_lower_bound_below_cache: false`; date_to-only reports the actual reach-back; 800-day queries stay not_synced with an accurate note; the old `requested_range_extends_beyond_cache`/`requested_upper_bound` keys are gone.
+
+Probe artifacts live under `%TEMP%\lcemcp_sim\*` and `%TEMP%\lcemcp_investigate\`.
