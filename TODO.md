@@ -610,3 +610,23 @@ Fix implemented and verified on 2026-09-13:
 - Live end-to-end probe against a snapshot of the real DB (700-day cache): month/3-month/1-week/filter-only queries now return clean `ready` responses with no coverage note, `cache_reaches_back_days: 700`, `requested_lower_bound_below_cache: false`; date_to-only reports the actual reach-back; 800-day queries stay not_synced with an accurate note; the old `requested_range_extends_beyond_cache`/`requested_upper_bound` keys are gone.
 
 Probe artifacts live under `%TEMP%\lcemcp_sim\*` and `%TEMP%\lcemcp_investigate\`.
+
+## 15. Missing-Email Investigation: sync-coverage hole, not a search bug (2026-09-13, follow-up to §14)
+
+User report (codex terra): the tool "couldn't find" one incoming email and its attachment — "RE: Izvod sa predplačniške kartice" from Bosiljka Šket (OTP banka), Tue 2025-12-23 08:30 local. Reproduced end-to-end through the real `artifacts\lcemcp\LceMcp.exe` (search CLI, imap-test, sync, live DB read-only inspection).
+
+What happened:
+
+- The message was never in the local cache before today. Exhaustive pre-backfill checks (subject/from/date-window on both accounts, plus `search` runs mirroring the LLM's exact queries) returned 0; the audit log confirms the codex session's searches for it all returned 0 or not_synced. Root cause: a sync-coverage hole. Every `email_sync_now` in that session was `full=false` with no `since_days` (Yahoo default `history_days=30`), so the Dec-2025 Inbox slice was never fetched; the cache's 2025-12 window contained only Sent items.
+- The message was IMAP-visible all along. `sync --account yahoo --folder Inbox --since-days 0 --max-per-folder 0 --batch-size 100` enumerated the full visible Inbox (10,001 messages; earliest cached Inbox message 2021-08-12) and immediately cached message id 5132: "RE: Izvod sa predplačniške kartice", bosiljka.sket@otpbanka.si, 2025-12-23T07:30:19Z, has_attachments=1 (provider_uid 282477; IMAP bodystructure: 1 attachment, 1,680,431 bytes = the "promet o kartici" spreadsheet per the fetched body). Same run cached 5115 ("Samodejni odgovor: Izvod sa predplačniške kartice", auto-reply 12 s after the 2025-12-19 outgoing 2821). `imap-test --fetch-first-body` fetches the real message content ("u prilogu šaljem promet o kartici").
+- The Yahoo 10k-per-folder IMAP window is real (live SELECT reports 10000) but was NOT the blocker; the visible window reaches back ~5 years, so Dec-2025 was inside it. The blocker was default window + per-folder caps only.
+- The same table already existed in the cache as attachment 513 (message 2824 = the user's same-day 2025-12-23 forward of the statement+invoices to GAMA): `Bojan Sala promet predplačniška VISA Sala Software doo.zip!/…xlsx`, extraction done via DocumentFormat.OpenXml (2316 chars). That is why the first LLM answer could summarize the table while the original message stayed invisible.
+
+Connections to §14, and a gap it leaves open:
+
+- §14's "actual synced window = 700 days" came from `sync_state` metadata, but that window did NOT hold for Inbox content: only a recent slice of Inbox had actually been fetched (caps/windows), while Sent/Archive were deep. So the state-based depth signal can still overstate real per-folder coverage when a big folder was sync-capped. Worth validating the reported window against what was actually fetched (e.g., per-folder min/max UIDs or dates) so `email_get_sync_status` cannot claim deep coverage for a shallow folder.
+- After a metadata backfill, the body index is left incomplete by design (~8,639 pending bodies over the visible Inbox; content search stays not_synced/partial until `sync-bodies` drains, newest-first, so very old messages land last). There is no per-message body fetch trigger today (`email_get_message` only reads the cache; `imap-test` only prints). Consider `sync-bodies --message-id`/MCP equivalent so single old messages can be completed without draining thousands of bodies.
+
+Secondary finding:
+
+- `account.attachment_policy = "metadata_only"` is parsed and persisted (AccountConfig/ConfigStore/CliApp) but never consumed anywhere — attachments are always downloaded/stored/extracted regardless. Dead config; implement or remove.
